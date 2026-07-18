@@ -22,6 +22,10 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         manifest_only: bool,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long)]
+        include_defaults: bool,
     },
     /// Build a raw MODE2/2352 image from an editable project.
     Build {
@@ -31,6 +35,8 @@ enum Command {
         image: Option<PathBuf>,
         #[arg(long, default_value = ".")]
         data_dir: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 
@@ -41,9 +47,20 @@ fn main() -> Result<()> {
             manifest,
             data_dir,
             manifest_only,
+            overwrite,
+            include_defaults,
         } => {
             let manifest = manifest.unwrap_or_else(|| image.with_extension("yaml"));
-            let report = gcdgold::extract(&image, &manifest, &data_dir, manifest_only)?;
+            let report = gcdgold::extract_with_options(
+                &image,
+                &manifest,
+                &data_dir,
+                gcdgold::ExtractOptions {
+                    manifest_only,
+                    overwrite,
+                    include_defaults,
+                },
+            )?;
             println!(
                 "extracted {} sectors; source sha1 {}; manifest {}",
                 report.sectors,
@@ -55,16 +72,71 @@ fn main() -> Result<()> {
             manifest,
             image,
             data_dir,
+            overwrite,
         } => {
             let image = image.unwrap_or_else(|| manifest.with_extension("bin"));
-            let report = gcdgold::build(&manifest, &image, &data_dir)?;
-            println!(
-                "built {} sectors; sha1 {}; matches source: {}",
-                report.sectors,
-                report.sha1,
-                if report.matches_source { "yes" } else { "no" }
-            );
+            let report = gcdgold::build(&manifest, &image, &data_dir, overwrite)?;
+            println!("built {} sectors; sha1 {}", report.sectors, report.sha1);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overwrite_flag_is_accepted_by_both_commands() {
+        let extract =
+            Cli::try_parse_from(["gcdgold", "extract", "--image", "disc.bin", "--overwrite"])
+                .unwrap();
+        assert!(matches!(
+            extract.command,
+            Command::Extract {
+                overwrite: true,
+                ..
+            }
+        ));
+
+        let build =
+            Cli::try_parse_from(["gcdgold", "build", "--manifest", "disc.yaml", "--overwrite"])
+                .unwrap();
+        assert!(matches!(
+            build.command,
+            Command::Build {
+                overwrite: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn include_defaults_flag_is_accepted_only_by_extract() {
+        let extract = Cli::try_parse_from([
+            "gcdgold",
+            "extract",
+            "--image",
+            "disc.bin",
+            "--include-defaults",
+        ])
+        .unwrap();
+        assert!(matches!(
+            extract.command,
+            Command::Extract {
+                include_defaults: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "gcdgold",
+                "build",
+                "--manifest",
+                "disc.yaml",
+                "--include-defaults",
+            ])
+            .is_err()
+        );
+    }
 }

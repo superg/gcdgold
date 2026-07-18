@@ -2,8 +2,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::manifest::{DirectoryMetadata, Entry, EntryDefaults, EntryKind, Iso9660, PrimaryVolume};
+use crate::manifest::{Entry, Iso9660, PrimaryVolume};
 use crate::raw_cd::LOGICAL_BLOCK_SIZE;
+
+const VOLUME_SET_SIZE: u16 = 1;
+const VOLUME_SEQUENCE_NUMBER: u16 = 1;
+const ISO_LOGICAL_BLOCK_SIZE: u16 = 2048;
+const FILE_STRUCTURE_VERSION: u8 = 1;
+const FILE_VERSION: u8 = 1;
+const DIRECTORY_FLAG: u8 = 2;
+const FILE_SYSTEM_USE: [u8; 14] = [0, 0, 0, 0, 0x0d, 0x55, b'X', b'A', 0, 0, 0, 0, 0, 0];
+const DIRECTORY_SYSTEM_USE: [u8; 14] = [0, 0, 0, 0, 0x8d, 0x55, b'X', b'A', 0, 0, 0, 0, 0, 0];
+const APPLICATION_USE_START: usize = 883;
+const APPLICATION_USE_END: usize = 1395;
+const CD_XA_SIGNATURE_OFFSET: usize = 1024 - APPLICATION_USE_START;
+pub const ROOT_PATH: &str = ".";
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -43,24 +56,17 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         "expected volume terminator at LBA 17"
     );
     let pvd = parse_pvd(pvd_block)?;
-    ensure!(
-        pvd.logical_block_size == 2048,
-        "unsupported logical block size"
-    );
     let root_record = parse_record(&pvd_block[156..])?;
+    validate_standard_record_fields(&root_record, true, false)?;
     let root_records = read_directory(blocks, root_record.extent, root_record.length)?;
     ensure!(root_records.len() >= 2, "root directory lacks dot records");
     let dot = &root_records[0];
-    let root = DirectoryMetadata {
-        recording_time_hex: hex::encode(dot.recording_time),
-        flags: dot.flags,
-        file_unit_size: dot.file_unit_size,
-        interleave_gap_size: dot.interleave_gap_size,
-        volume_sequence_number: dot.volume_sequence_number,
-        system_use_hex: hex::encode(&dot.system_use),
+    let root = Entry {
+        path: ROOT_PATH.to_owned(),
+        recording_time: parse_recording_time(dot.recording_time)?,
     };
 
-    let mut entries = Vec::new();
+    let mut entries = vec![root];
     let mut files = Vec::new();
     let mut queue = VecDeque::from([(String::new(), root_record.extent, root_record.length)]);
     let mut seen_dirs = HashSet::new();
@@ -70,44 +76,34 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             "directory extent cycle at LBA {extent}"
         );
         let records = read_directory(blocks, extent, length)?;
+        ensure!(records.len() >= 2, "directory lacks dot records");
+        for record in &records {
+            validate_standard_record_fields(record, record.flags & DIRECTORY_FLAG != 0, true)?;
+        }
         for record in records.into_iter().skip(2) {
             let raw_name =
                 String::from_utf8(record.name.clone()).context("non-ASCII ISO identifier")?;
-            let is_dir = record.flags & 2 != 0;
-            let (name, version) = if is_dir {
-                (raw_name, 1)
+            let is_dir = record.flags & DIRECTORY_FLAG != 0;
+            let name = if is_dir {
+                raw_name
             } else {
                 let (name, version) = raw_name
                     .rsplit_once(';')
                     .context("file identifier has no version")?;
-                (
-                    name.to_owned(),
-                    version.parse::<u8>().context("invalid file version")?,
-                )
+                ensure!(
+                    version.parse::<u8>().context("invalid file version")? == FILE_VERSION,
+                    "unsupported file version"
+                );
+                name.to_owned()
             };
             let path = if parent.is_empty() {
                 name
             } else {
                 format!("{parent}/{name}")
             };
-            let kind = if is_dir {
-                EntryKind::Directory
-            } else {
-                EntryKind::File
-            };
             let entry = Entry {
                 path: path.clone(),
-                kind,
-                version,
-                recording_time_hex: Some(hex::encode(record.recording_time)),
-                flags: record.flags & !2,
-                file_unit_size: record.file_unit_size,
-                interleave_gap_size: record.interleave_gap_size,
-                volume_sequence_number: record.volume_sequence_number,
-                system_use_hex: Some(hex::encode(&record.system_use)),
-                data_order: None,
-                source_sha1: None,
-                source_length: Some(u64::from(record.length)),
+                recording_time: parse_recording_time(record.recording_time)?,
             };
             entries.push(entry);
             if is_dir {
@@ -124,41 +120,13 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
 
     let mut ordered = files.clone();
     ordered.sort_by_key(|file| file.extent);
-    let order_by_path: HashMap<_, _> = ordered
-        .iter()
-        .enumerate()
-        .map(|(index, file)| (file.path.as_str(), index as u32))
-        .collect();
-    for entry in &mut entries {
-        if entry.kind == EntryKind::File {
-            entry.data_order = order_by_path.get(entry.path.as_str()).copied();
-        }
-    }
+    let file_order = ordered.iter().map(|file| file.path.clone()).collect();
 
-    let first_file = entries.iter().find(|entry| entry.kind == EntryKind::File);
-    let first_dir = entries
-        .iter()
-        .find(|entry| entry.kind == EntryKind::Directory);
-    let defaults = EntryDefaults {
-        file_recording_time_hex: first_file
-            .and_then(|entry| entry.recording_time_hex.clone())
-            .unwrap_or_else(|| root.recording_time_hex.clone()),
-        directory_recording_time_hex: first_dir
-            .and_then(|entry| entry.recording_time_hex.clone())
-            .unwrap_or_else(|| root.recording_time_hex.clone()),
-        file_system_use_hex: first_file
-            .and_then(|entry| entry.system_use_hex.clone())
-            .unwrap_or_else(|| "000000000d555841000000000000".to_owned()),
-        directory_system_use_hex: first_dir
-            .and_then(|entry| entry.system_use_hex.clone())
-            .unwrap_or_else(|| root.system_use_hex.clone()),
-    };
     Ok(ParsedIso {
         manifest: Iso9660 {
             primary_volume: pvd,
-            root,
-            defaults,
             entries,
+            files: file_order,
         },
         files,
     })
@@ -167,8 +135,24 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
 fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
     ensure!(read_both_u32(block, 80)? > 0, "invalid volume size");
     ensure!(
-        read_both_u16(block, 128)? == 2048,
-        "invalid logical block size"
+        read_both_u16(block, 120)? == VOLUME_SET_SIZE,
+        "unsupported volume set size"
+    );
+    ensure!(
+        read_both_u16(block, 124)? == VOLUME_SEQUENCE_NUMBER,
+        "unsupported volume sequence number"
+    );
+    ensure!(
+        read_both_u16(block, 128)? == ISO_LOGICAL_BLOCK_SIZE,
+        "unsupported logical block size"
+    );
+    ensure!(
+        block[881] == FILE_STRUCTURE_VERSION,
+        "unsupported file structure version"
+    );
+    ensure!(
+        block[APPLICATION_USE_START..APPLICATION_USE_END] == standard_cd_xa_application_use(),
+        "unsupported PVD CD-XA application-use data"
     );
     Ok(PrimaryVolume {
         system_identifier: read_fixed(block, 8, 32)?,
@@ -180,16 +164,20 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
         copyright_file_identifier: read_fixed(block, 702, 37)?,
         abstract_file_identifier: read_fixed(block, 739, 37)?,
         bibliographic_file_identifier: read_fixed(block, 776, 37)?,
-        volume_set_size: read_both_u16(block, 120)?,
-        volume_sequence_number: read_both_u16(block, 124)?,
-        logical_block_size: read_both_u16(block, 128)?,
-        creation_time_hex: hex::encode(&block[813..830]),
-        modification_time_hex: hex::encode(&block[830..847]),
-        expiration_time_hex: hex::encode(&block[847..864]),
-        effective_time_hex: hex::encode(&block[864..881]),
-        file_structure_version: block[881],
-        application_use_hex: hex::encode(&block[883..1395]),
+        creation_time: parse_volume_time(&block[813..830]).context("invalid PVD creation time")?,
+        modification_time: parse_volume_time(&block[830..847])
+            .context("invalid PVD modification time")?,
+        expiration_time: parse_volume_time(&block[847..864])
+            .context("invalid PVD expiration time")?,
+        effective_time: parse_volume_time(&block[864..881])
+            .context("invalid PVD effective time")?,
     })
+}
+
+fn standard_cd_xa_application_use() -> [u8; APPLICATION_USE_END - APPLICATION_USE_START] {
+    let mut data = [0; APPLICATION_USE_END - APPLICATION_USE_START];
+    data[CD_XA_SIGNATURE_OFFSET..CD_XA_SIGNATURE_OFFSET + 8].copy_from_slice(b"CD-XA001");
+    data
 }
 
 fn read_directory(
@@ -253,6 +241,48 @@ fn parse_record(bytes: &[u8]) -> Result<Record> {
     })
 }
 
+fn validate_standard_record_fields(
+    record: &Record,
+    directory: bool,
+    uses_xa_system_use: bool,
+) -> Result<()> {
+    let expected_flags = if directory { DIRECTORY_FLAG } else { 0 };
+    ensure!(
+        record.flags == expected_flags,
+        "unsupported directory-record flags"
+    );
+    ensure!(
+        record.file_unit_size == 0,
+        "unsupported directory-record file unit size"
+    );
+    ensure!(
+        record.interleave_gap_size == 0,
+        "unsupported directory-record interleave gap size"
+    );
+    ensure!(
+        record.volume_sequence_number == VOLUME_SEQUENCE_NUMBER,
+        "unsupported directory-record volume sequence number"
+    );
+    let expected_system_use: &[u8] = if uses_xa_system_use {
+        standard_system_use(directory)
+    } else {
+        &[]
+    };
+    ensure!(
+        record.system_use == expected_system_use,
+        "unsupported directory-record XA system-use data"
+    );
+    Ok(())
+}
+
+fn standard_system_use(directory: bool) -> &'static [u8; 14] {
+    if directory {
+        &DIRECTORY_SYSTEM_USE
+    } else {
+        &FILE_SYSTEM_USE
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilePlacement {
     pub path: String,
@@ -266,6 +296,10 @@ pub struct Layout {
     pub blocks: Vec<[u8; LOGICAL_BLOCK_SIZE]>,
     pub files: Vec<FilePlacement>,
     pub volume_blocks: u32,
+}
+
+pub fn validate(iso: &Iso9660) -> Result<()> {
+    validate_entries(iso).map(drop)
 }
 
 #[derive(Debug, Clone)]
@@ -282,8 +316,8 @@ pub fn layout(
     file_data: &HashMap<String, Vec<u8>>,
     trailing: u32,
 ) -> Result<Layout> {
-    validate_entries(&iso.entries)?;
-    let directories = directory_order(&iso.entries)?;
+    let file_paths = validate_entries(iso)?;
+    let directories = directory_order(&iso.entries, &file_paths)?;
     let path_table_size: usize = directories
         .iter()
         .map(|(_, name, _)| 8 + name.len() + usize::from(name.len() % 2 == 1))
@@ -298,7 +332,7 @@ pub fn layout(
         .collect();
     let mut placements = Vec::with_capacity(directories.len());
     for (path, name, parent) in &directories {
-        let record_lengths = directory_record_lengths(path, iso, &entry_by_path)?;
+        let record_lengths = directory_record_lengths(path, iso, &file_paths);
         let blocks = packed_blocks(&record_lengths) as u32;
         placements.push(DirectoryPlacement {
             path: path.clone(),
@@ -310,37 +344,11 @@ pub fn layout(
         next_extent += blocks;
     }
 
-    let mut indexed_files = iso
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.kind == EntryKind::File)
-        .collect::<Vec<_>>();
-    let fallback_base = indexed_files
-        .iter()
-        .filter_map(|(_, entry)| entry.data_order)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    indexed_files.sort_by_key(|(index, entry)| {
-        (
-            entry.data_order.unwrap_or(fallback_base + *index as u32),
-            *index,
-        )
-    });
-    let mut seen_order = HashSet::new();
-    for (_, entry) in &indexed_files {
-        if let Some(order) = entry.data_order {
-            ensure!(
-                seen_order.insert(order),
-                "duplicate file data_order {order}"
-            );
-        }
-    }
-    let mut files = Vec::with_capacity(indexed_files.len());
-    for (_, entry) in indexed_files {
+    let mut files = Vec::with_capacity(iso.files.len());
+    for path in &iso.files {
+        let entry = entry_by_path[path.as_str()];
         let data = file_data
-            .get(&entry.path)
+            .get(path)
             .with_context(|| format!("missing file data for {}", entry.path))?;
         let blocks = u32::try_from(data.len().div_ceil(LOGICAL_BLOCK_SIZE))?;
         files.push(FilePlacement {
@@ -371,13 +379,13 @@ pub fn layout(
         18 + path_blocks * 3,
     ];
     blocks[16] = serialize_pvd(
-        &iso.primary_volume,
+        iso,
         volume_blocks,
         path_table_size as u32,
         pointers,
         placements[0].extent,
         placements[0].blocks * 2048,
-        &iso.root,
+        entry_by_path[ROOT_PATH],
     )?;
     blocks[17][0..7].copy_from_slice(b"\xffCD001\x01");
     write_path_tables(&mut blocks, &placements, pointers, path_blocks)?;
@@ -389,6 +397,7 @@ pub fn layout(
             &entry_by_path,
             &directory_by_path,
             &placement_by_path,
+            &file_paths,
         )?;
         for (index, chunk) in data.chunks_exact(LOGICAL_BLOCK_SIZE).enumerate() {
             blocks[usize::try_from(directory.extent)? + index].copy_from_slice(chunk);
@@ -401,28 +410,45 @@ pub fn layout(
     })
 }
 
-fn validate_entries(entries: &[Entry]) -> Result<()> {
+fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
+    let root = iso
+        .entries
+        .first()
+        .context("filesystem root must be the first entry")?;
+    ensure!(
+        root.path == ROOT_PATH,
+        "filesystem root must be the first entry with path ."
+    );
     let mut paths = HashSet::new();
-    let directory_paths: HashSet<_> = entries
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::Directory)
-        .map(|entry| entry.path.as_str())
-        .collect();
-    for entry in entries {
-        validate_path(&entry.path, entry.kind == EntryKind::File)?;
+    for entry in &iso.entries {
         ensure!(
             paths.insert(entry.path.as_str()),
             "duplicate ISO path {}",
             entry.path
         );
-        if let Some((parent, _)) = entry.path.rsplit_once('/') {
+    }
+    let mut file_paths = HashSet::new();
+    for path in &iso.files {
+        ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
+        ensure!(paths.contains(path.as_str()), "unknown file entry {path}");
+        ensure!(
+            file_paths.insert(path.as_str()),
+            "duplicate file entry {path}"
+        );
+    }
+    let directory_paths: HashSet<_> = paths.difference(&file_paths).copied().collect();
+    for (index, entry) in iso.entries.iter().enumerate() {
+        let is_file = file_paths.contains(entry.path.as_str());
+        if index != 0 {
+            validate_path(&entry.path, is_file)?;
+            let parent = parent_path(&entry.path);
             ensure!(
-                directory_paths.contains(parent),
+                directory_paths.contains(parent.as_str()),
                 "missing parent directory {parent}"
             );
         }
     }
-    Ok(())
+    Ok(file_paths)
 }
 
 fn validate_path(path: &str, is_file: bool) -> Result<()> {
@@ -460,16 +486,21 @@ fn valid_d_chars(value: &str) -> bool {
         .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-fn directory_order(entries: &[Entry]) -> Result<Vec<(String, String, usize)>> {
-    let mut result = vec![(String::new(), String::from("\0"), 0)];
-    let mut queue = VecDeque::from([String::new()]);
+fn directory_order(
+    entries: &[Entry],
+    file_paths: &HashSet<&str>,
+) -> Result<Vec<(String, String, usize)>> {
+    let mut result = vec![(ROOT_PATH.to_owned(), String::from("\0"), 0)];
+    let mut queue = VecDeque::from([ROOT_PATH.to_owned()]);
     while let Some(parent) = queue.pop_front() {
         let parent_index = result
             .iter()
             .position(|(path, _, _)| path == &parent)
             .context("missing directory parent")?;
         for entry in entries.iter().filter(|entry| {
-            entry.kind == EntryKind::Directory && parent_path(&entry.path) == parent
+            entry.path != ROOT_PATH
+                && !file_paths.contains(entry.path.as_str())
+                && parent_path(&entry.path) == parent
         }) {
             let name = file_name(&entry.path).to_owned();
             result.push((entry.path.clone(), name, parent_index));
@@ -478,9 +509,8 @@ fn directory_order(entries: &[Entry]) -> Result<Vec<(String, String, usize)>> {
     }
     let expected = entries
         .iter()
-        .filter(|entry| entry.kind == EntryKind::Directory)
-        .count()
-        + 1;
+        .filter(|entry| !file_paths.contains(entry.path.as_str()))
+        .count();
     ensure!(
         result.len() == expected,
         "unreachable directory in manifest"
@@ -488,35 +518,20 @@ fn directory_order(entries: &[Entry]) -> Result<Vec<(String, String, usize)>> {
     Ok(result)
 }
 
-fn directory_record_lengths(
-    path: &str,
-    iso: &Iso9660,
-    entries: &HashMap<&str, &Entry>,
-) -> Result<Vec<usize>> {
-    let self_sys = if path.is_empty() {
-        hex::decode(&iso.root.system_use_hex)?
-    } else {
-        entry_system_use(entries[path], iso)?
-    };
-    let parent = parent_path(path);
-    let parent_sys = if parent.is_empty() {
-        hex::decode(&iso.root.system_use_hex)?
-    } else {
-        entry_system_use(entries[parent.as_str()], iso)?
-    };
+fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str>) -> Vec<usize> {
     let mut lengths = vec![
-        record_size(1, self_sys.len()),
-        record_size(1, parent_sys.len()),
+        record_size(1, DIRECTORY_SYSTEM_USE.len()),
+        record_size(1, DIRECTORY_SYSTEM_USE.len()),
     ];
     for entry in iso
         .entries
         .iter()
-        .filter(|entry| parent_path(&entry.path) == path)
+        .filter(|entry| entry.path != ROOT_PATH && parent_path(&entry.path) == path)
     {
-        let name = identifier(entry);
-        lengths.push(record_size(name.len(), entry_system_use(entry, iso)?.len()));
+        let name = identifier(entry, file_paths.contains(entry.path.as_str()));
+        lengths.push(record_size(name.len(), FILE_SYSTEM_USE.len()));
     }
-    Ok(lengths)
+    lengths
 }
 
 fn packed_blocks(lengths: &[usize]) -> usize {
@@ -536,22 +551,23 @@ fn record_size(name_length: usize, system_use_length: usize) -> usize {
 }
 
 fn serialize_pvd(
-    pvd: &PrimaryVolume,
+    iso: &Iso9660,
     volume_blocks: u32,
     path_table_size: u32,
     pointers: [u32; 4],
     root_extent: u32,
     root_length: u32,
-    root: &DirectoryMetadata,
+    root: &Entry,
 ) -> Result<[u8; LOGICAL_BLOCK_SIZE]> {
+    let pvd = &iso.primary_volume;
     let mut block = [0_u8; LOGICAL_BLOCK_SIZE];
     block[0..7].copy_from_slice(b"\x01CD001\x01");
     write_fixed(&mut block, 8, 32, &pvd.system_identifier)?;
     write_fixed(&mut block, 40, 32, &pvd.volume_identifier)?;
     write_both_u32(&mut block, 80, volume_blocks);
-    write_both_u16(&mut block, 120, pvd.volume_set_size);
-    write_both_u16(&mut block, 124, pvd.volume_sequence_number);
-    write_both_u16(&mut block, 128, pvd.logical_block_size);
+    write_both_u16(&mut block, 120, VOLUME_SET_SIZE);
+    write_both_u16(&mut block, 124, VOLUME_SEQUENCE_NUMBER);
+    write_both_u16(&mut block, 128, ISO_LOGICAL_BLOCK_SIZE);
     write_both_u32(&mut block, 132, path_table_size);
     block[140..144].copy_from_slice(&pointers[0].to_le_bytes());
     block[144..148].copy_from_slice(&pointers[1].to_le_bytes());
@@ -560,11 +576,11 @@ fn serialize_pvd(
     let root_record = serialize_record(&Record {
         extent: root_extent,
         length: root_length,
-        recording_time: decode_array7(&root.recording_time_hex)?,
-        flags: root.flags | 2,
-        file_unit_size: root.file_unit_size,
-        interleave_gap_size: root.interleave_gap_size,
-        volume_sequence_number: root.volume_sequence_number,
+        recording_time: serialize_recording_time(&root.recording_time)?,
+        flags: DIRECTORY_FLAG,
+        file_unit_size: 0,
+        interleave_gap_size: 0,
+        volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
         name: vec![0],
         system_use: Vec::new(),
     })?;
@@ -577,12 +593,13 @@ fn serialize_pvd(
     write_fixed(&mut block, 702, 37, &pvd.copyright_file_identifier)?;
     write_fixed(&mut block, 739, 37, &pvd.abstract_file_identifier)?;
     write_fixed(&mut block, 776, 37, &pvd.bibliographic_file_identifier)?;
-    copy_hex_exact(&mut block[813..830], &pvd.creation_time_hex)?;
-    copy_hex_exact(&mut block[830..847], &pvd.modification_time_hex)?;
-    copy_hex_exact(&mut block[847..864], &pvd.expiration_time_hex)?;
-    copy_hex_exact(&mut block[864..881], &pvd.effective_time_hex)?;
-    block[881] = pvd.file_structure_version;
-    copy_hex_exact(&mut block[883..1395], &pvd.application_use_hex)?;
+    block[813..830].copy_from_slice(&serialize_volume_time(pvd.creation_time.as_deref())?);
+    block[830..847].copy_from_slice(&serialize_volume_time(pvd.modification_time.as_deref())?);
+    block[847..864].copy_from_slice(&serialize_volume_time(pvd.expiration_time.as_deref())?);
+    block[864..881].copy_from_slice(&serialize_volume_time(pvd.effective_time.as_deref())?);
+    block[881] = FILE_STRUCTURE_VERSION;
+    block[APPLICATION_USE_START..APPLICATION_USE_END]
+        .copy_from_slice(&standard_cd_xa_application_use());
     Ok(block)
 }
 
@@ -640,74 +657,21 @@ fn serialize_directory(
     entry_by_path: &HashMap<&str, &Entry>,
     directory_by_path: &HashMap<&str, &DirectoryPlacement>,
     file_by_path: &HashMap<&str, &FilePlacement>,
+    file_paths: &HashSet<&str>,
 ) -> Result<Vec<u8>> {
-    let metadata = if directory.path.is_empty() {
-        &iso.root
-    } else {
-        let entry = entry_by_path[directory.path.as_str()];
-        return serialize_directory_with_metadata(
-            directory,
-            directories,
-            iso,
-            entry_by_path,
-            directory_by_path,
-            file_by_path,
-            entry,
-        );
-    };
-    let synthetic = Entry {
-        path: String::new(),
-        kind: EntryKind::Directory,
-        version: 1,
-        recording_time_hex: Some(metadata.recording_time_hex.clone()),
-        flags: metadata.flags & !2,
-        file_unit_size: metadata.file_unit_size,
-        interleave_gap_size: metadata.interleave_gap_size,
-        volume_sequence_number: metadata.volume_sequence_number,
-        system_use_hex: Some(metadata.system_use_hex.clone()),
-        data_order: None,
-        source_sha1: None,
-        source_length: None,
-    };
-    serialize_directory_with_metadata(
-        directory,
-        directories,
-        iso,
-        entry_by_path,
-        directory_by_path,
-        file_by_path,
-        &synthetic,
-    )
-}
-
-fn serialize_directory_with_metadata(
-    directory: &DirectoryPlacement,
-    directories: &[DirectoryPlacement],
-    iso: &Iso9660,
-    entry_by_path: &HashMap<&str, &Entry>,
-    directory_by_path: &HashMap<&str, &DirectoryPlacement>,
-    file_by_path: &HashMap<&str, &FilePlacement>,
-    metadata: &Entry,
-) -> Result<Vec<u8>> {
+    let metadata = entry_by_path[directory.path.as_str()];
     let parent = &directories[directory.parent];
-    let parent_entry = if parent.path.is_empty() {
-        None
-    } else {
-        Some(entry_by_path[parent.path.as_str()])
-    };
+    let parent_entry = entry_by_path[parent.path.as_str()];
     let mut records = Vec::new();
     records.push(make_record(
         metadata,
-        iso,
         directory.extent,
         directory.blocks * 2048,
         vec![0],
         true,
     )?);
-    let parent_meta = parent_entry.unwrap_or(metadata);
     records.push(make_record(
-        parent_meta,
-        iso,
+        parent_entry,
         parent.extent,
         parent.blocks * 2048,
         vec![1],
@@ -716,25 +680,22 @@ fn serialize_directory_with_metadata(
     for entry in iso
         .entries
         .iter()
-        .filter(|entry| parent_path(&entry.path) == directory.path)
+        .filter(|entry| entry.path != ROOT_PATH && parent_path(&entry.path) == directory.path)
     {
-        let (extent, length) = match entry.kind {
-            EntryKind::Directory => {
-                let child = directory_by_path[entry.path.as_str()];
-                (child.extent, child.blocks * 2048)
-            }
-            EntryKind::File => {
-                let file = file_by_path[entry.path.as_str()];
-                (file.extent, u32::try_from(file.length)?)
-            }
+        let is_file = file_paths.contains(entry.path.as_str());
+        let (extent, length) = if is_file {
+            let file = file_by_path[entry.path.as_str()];
+            (file.extent, u32::try_from(file.length)?)
+        } else {
+            let child = directory_by_path[entry.path.as_str()];
+            (child.extent, child.blocks * 2048)
         };
         records.push(make_record(
             entry,
-            iso,
             extent,
             length,
-            identifier(entry).into_bytes(),
-            entry.kind == EntryKind::Directory,
+            identifier(entry, is_file).into_bytes(),
+            !is_file,
         )?);
     }
     let mut result = vec![0_u8; usize::try_from(directory.blocks)? * LOGICAL_BLOCK_SIZE];
@@ -752,7 +713,6 @@ fn serialize_directory_with_metadata(
 
 fn make_record(
     entry: &Entry,
-    iso: &Iso9660,
     extent: u32,
     length: u32,
     name: Vec<u8>,
@@ -761,23 +721,13 @@ fn make_record(
     serialize_record(&Record {
         extent,
         length,
-        recording_time: decode_array7(entry.recording_time_hex.as_deref().unwrap_or(
-            if directory {
-                &iso.defaults.directory_recording_time_hex
-            } else {
-                &iso.defaults.file_recording_time_hex
-            },
-        ))?,
-        flags: if directory {
-            entry.flags | 2
-        } else {
-            entry.flags & !2
-        },
-        file_unit_size: entry.file_unit_size,
-        interleave_gap_size: entry.interleave_gap_size,
-        volume_sequence_number: entry.volume_sequence_number,
+        recording_time: serialize_recording_time(&entry.recording_time)?,
+        flags: if directory { DIRECTORY_FLAG } else { 0 },
+        file_unit_size: 0,
+        interleave_gap_size: 0,
+        volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
         name,
-        system_use: entry_system_use(entry, iso)?,
+        system_use: standard_system_use(directory).to_vec(),
     })
 }
 
@@ -801,26 +751,22 @@ fn serialize_record(record: &Record) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn entry_system_use(entry: &Entry, iso: &Iso9660) -> Result<Vec<u8>> {
-    hex::decode(entry.system_use_hex.as_deref().unwrap_or(match entry.kind {
-        EntryKind::File => &iso.defaults.file_system_use_hex,
-        EntryKind::Directory => &iso.defaults.directory_system_use_hex,
-    }))
-    .context("invalid system-use hex")
-}
-
-fn identifier(entry: &Entry) -> String {
+fn identifier(entry: &Entry, is_file: bool) -> String {
     let name = file_name(&entry.path);
-    if entry.kind == EntryKind::File {
-        format!("{name};{}", entry.version)
+    if is_file {
+        format!("{name};{FILE_VERSION}")
     } else {
         name.to_owned()
     }
 }
 
 fn parent_path(path: &str) -> String {
-    path.rsplit_once('/')
-        .map_or_else(String::new, |(parent, _)| parent.to_owned())
+    if path == ROOT_PATH {
+        ROOT_PATH.to_owned()
+    } else {
+        path.rsplit_once('/')
+            .map_or_else(|| ROOT_PATH.to_owned(), |(parent, _)| parent.to_owned())
+    }
 }
 
 fn file_name(path: &str) -> &str {
@@ -866,27 +812,378 @@ fn write_both_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset + 4..offset + 8].copy_from_slice(&value.to_be_bytes());
 }
 
-fn decode_array7(value: &str) -> Result<[u8; 7]> {
-    let bytes = hex::decode(value).context("invalid recording-time hex")?;
-    ensure!(bytes.len() == 7, "recording time must contain seven bytes");
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("recording time must contain seven bytes"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VolumeTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    centisecond: u8,
+    offset_quarters: i8,
 }
 
-fn copy_hex_exact(target: &mut [u8], value: &str) -> Result<()> {
-    let bytes = hex::decode(value).context("invalid hex field")?;
+fn parse_recording_time(bytes: [u8; 7]) -> Result<String> {
+    let time = VolumeTime {
+        year: 1900 + u16::from(bytes[0]),
+        month: bytes[1],
+        day: bytes[2],
+        hour: bytes[3],
+        minute: bytes[4],
+        second: bytes[5],
+        centisecond: 0,
+        offset_quarters: i8::from_ne_bytes([bytes[6]]),
+    };
+    validate_volume_time(time).context("invalid directory recording time")?;
+    Ok(format_recording_time(time))
+}
+
+fn serialize_recording_time(value: &str) -> Result<[u8; 7]> {
     ensure!(
-        bytes.len() == target.len(),
-        "hex field has incorrect length"
+        value.is_ascii() && value.len() == 25 && matches!(value.as_bytes()[19], b'+' | b'-'),
+        "recording time must use YYYY-MM-DDTHH:MM:SS+HH:MM"
     );
-    target.copy_from_slice(&bytes);
+    let expanded = format!("{}.00{}", &value[..19], &value[19..]);
+    let time = parse_human_volume_time(&expanded).context("invalid directory recording time")?;
+    ensure!(
+        (1900..=2155).contains(&time.year),
+        "directory recording time year must be between 1900 and 2155"
+    );
+    Ok([
+        u8::try_from(time.year - 1900)?,
+        time.month,
+        time.day,
+        time.hour,
+        time.minute,
+        time.second,
+        time.offset_quarters.to_ne_bytes()[0],
+    ])
+}
+
+fn format_recording_time(time: VolumeTime) -> String {
+    let offset_minutes = i16::from(time.offset_quarters) * 15;
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let absolute_offset = offset_minutes.unsigned_abs();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+        time.year,
+        time.month,
+        time.day,
+        time.hour,
+        time.minute,
+        time.second,
+        absolute_offset / 60,
+        absolute_offset % 60
+    )
+}
+
+fn parse_volume_time(bytes: &[u8]) -> Result<Option<String>> {
+    ensure!(
+        bytes.len() == 17,
+        "volume time must contain seventeen bytes"
+    );
+    if &bytes[..16] == b"0000000000000000" && bytes[16] == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        bytes[..16].iter().all(u8::is_ascii_digit),
+        "volume time contains non-digit date bytes"
+    );
+    let time = VolumeTime {
+        year: parse_decimal(&bytes[0..4])?,
+        month: u8::try_from(parse_decimal(&bytes[4..6])?)?,
+        day: u8::try_from(parse_decimal(&bytes[6..8])?)?,
+        hour: u8::try_from(parse_decimal(&bytes[8..10])?)?,
+        minute: u8::try_from(parse_decimal(&bytes[10..12])?)?,
+        second: u8::try_from(parse_decimal(&bytes[12..14])?)?,
+        centisecond: u8::try_from(parse_decimal(&bytes[14..16])?)?,
+        offset_quarters: i8::from_ne_bytes([bytes[16]]),
+    };
+    validate_volume_time(time)?;
+    Ok(Some(format_volume_time(time)))
+}
+
+fn serialize_volume_time(value: Option<&str>) -> Result<[u8; 17]> {
+    let Some(value) = value else {
+        let mut bytes = [b'0'; 17];
+        bytes[16] = 0;
+        return Ok(bytes);
+    };
+    let time = parse_human_volume_time(value)?;
+    let digits = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}{:02}",
+        time.year, time.month, time.day, time.hour, time.minute, time.second, time.centisecond
+    );
+    let mut bytes = [0_u8; 17];
+    bytes[..16].copy_from_slice(digits.as_bytes());
+    bytes[16] = time.offset_quarters.to_ne_bytes()[0];
+    Ok(bytes)
+}
+
+fn parse_human_volume_time(value: &str) -> Result<VolumeTime> {
+    let bytes = value.as_bytes();
+    ensure!(
+        bytes.len() == 28
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'T'
+            && bytes[13] == b':'
+            && bytes[16] == b':'
+            && bytes[19] == b'.'
+            && matches!(bytes[22], b'+' | b'-')
+            && bytes[25] == b':',
+        "volume time must use YYYY-MM-DDTHH:MM:SS.cc+HH:MM"
+    );
+    for range in [
+        0..4,
+        5..7,
+        8..10,
+        11..13,
+        14..16,
+        17..19,
+        20..22,
+        23..25,
+        26..28,
+    ] {
+        ensure!(
+            bytes[range].iter().all(u8::is_ascii_digit),
+            "volume time contains a non-digit component"
+        );
+    }
+    let offset_hours = parse_decimal(&bytes[23..25])?;
+    let offset_minutes = parse_decimal(&bytes[26..28])?;
+    ensure!(offset_minutes < 60, "invalid volume time offset minutes");
+    let absolute_offset = offset_hours * 60 + offset_minutes;
+    ensure!(
+        absolute_offset.is_multiple_of(15),
+        "volume time offset must use fifteen-minute increments"
+    );
+    ensure!(
+        !(bytes[22] == b'-' && absolute_offset == 0),
+        "negative zero volume time offset is not canonical"
+    );
+    let signed_offset = if bytes[22] == b'-' {
+        -i16::try_from(absolute_offset)?
+    } else {
+        i16::try_from(absolute_offset)?
+    };
+    let offset_quarters = i8::try_from(signed_offset / 15)?;
+    let time = VolumeTime {
+        year: parse_decimal(&bytes[0..4])?,
+        month: u8::try_from(parse_decimal(&bytes[5..7])?)?,
+        day: u8::try_from(parse_decimal(&bytes[8..10])?)?,
+        hour: u8::try_from(parse_decimal(&bytes[11..13])?)?,
+        minute: u8::try_from(parse_decimal(&bytes[14..16])?)?,
+        second: u8::try_from(parse_decimal(&bytes[17..19])?)?,
+        centisecond: u8::try_from(parse_decimal(&bytes[20..22])?)?,
+        offset_quarters,
+    };
+    validate_volume_time(time)?;
+    Ok(time)
+}
+
+fn parse_decimal(bytes: &[u8]) -> Result<u16> {
+    bytes.iter().try_fold(0_u16, |value, byte| {
+        ensure!(byte.is_ascii_digit(), "decimal field contains a non-digit");
+        Ok(value * 10 + u16::from(byte - b'0'))
+    })
+}
+
+fn validate_volume_time(time: VolumeTime) -> Result<()> {
+    ensure!((1..=12).contains(&time.month), "invalid volume time month");
+    ensure!(
+        (1..=days_in_month(time.year, time.month)).contains(&time.day),
+        "invalid volume time day"
+    );
+    ensure!(time.hour < 24, "invalid volume time hour");
+    ensure!(time.minute < 60, "invalid volume time minute");
+    ensure!(time.second < 60, "invalid volume time second");
+    ensure!(time.centisecond < 100, "invalid volume time centisecond");
+    ensure!(
+        (-48..=52).contains(&time.offset_quarters),
+        "volume time offset is outside the ISO 9660 range"
+    );
     Ok(())
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
+        2 => 28,
+        _ => 31,
+    }
+}
+
+fn format_volume_time(time: VolumeTime) -> String {
+    let offset_minutes = i16::from(time.offset_quarters) * 15;
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let absolute_offset = offset_minutes.unsigned_abs();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:02}{sign}{:02}:{:02}",
+        time.year,
+        time.month,
+        time.day,
+        time.hour,
+        time.minute,
+        time.second,
+        time.centisecond,
+        absolute_offset / 60,
+        absolute_offset % 60
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(path: &str) -> Entry {
+        Entry {
+            path: path.to_owned(),
+            recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
+        }
+    }
+
+    fn test_iso(entries: Vec<Entry>, files: Vec<&str>) -> Iso9660 {
+        Iso9660 {
+            primary_volume: parse_pvd(&standard_pvd_block()).unwrap(),
+            entries,
+            files: files.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    fn standard_pvd_block() -> [u8; LOGICAL_BLOCK_SIZE] {
+        let mut block = [0_u8; LOGICAL_BLOCK_SIZE];
+        write_both_u32(&mut block, 80, 1);
+        write_both_u16(&mut block, 120, 1);
+        write_both_u16(&mut block, 124, 1);
+        write_both_u16(&mut block, 128, 2048);
+        for offset in [813, 830, 847, 864] {
+            block[offset..offset + 16].fill(b'0');
+        }
+        block[881] = 1;
+        block[1024..1032].copy_from_slice(b"CD-XA001");
+        block
+    }
+
+    #[test]
+    fn cd_xa_application_use_is_validated_and_generated() {
+        let source = standard_pvd_block();
+        let iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        let generated =
+            serialize_pvd(&iso, 20, 10, [18, 19, 20, 21], 22, 2048, &iso.entries[0]).unwrap();
+        assert_eq!(&generated[883..1395], &source[883..1395]);
+
+        let mut invalid = source;
+        invalid[1024] = b'X';
+        assert_eq!(
+            parse_pvd(&invalid).unwrap_err().to_string(),
+            "unsupported PVD CD-XA application-use data"
+        );
+    }
+
+    #[test]
+    fn fixed_primary_volume_values_are_validated() {
+        parse_pvd(&standard_pvd_block()).unwrap();
+
+        for (offset, value, expected) in [
+            (120, 2, "unsupported volume set size"),
+            (124, 2, "unsupported volume sequence number"),
+            (128, 1024, "unsupported logical block size"),
+        ] {
+            let mut block = standard_pvd_block();
+            write_both_u16(&mut block, offset, value);
+            assert_eq!(parse_pvd(&block).unwrap_err().to_string(), expected);
+        }
+
+        let mut block = standard_pvd_block();
+        block[881] = 2;
+        assert_eq!(
+            parse_pvd(&block).unwrap_err().to_string(),
+            "unsupported file structure version"
+        );
+    }
+
+    #[test]
+    fn volume_times_use_readable_centiseconds_and_quarter_hour_offsets() {
+        let creation: [u8; 17] = hex::decode("3030303030363136303934353531303024")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let readable = "0000-06-16T09:45:51.00+09:00";
+        assert_eq!(
+            parse_volume_time(&creation).unwrap().as_deref(),
+            Some(readable)
+        );
+        assert_eq!(serialize_volume_time(Some(readable)).unwrap(), creation);
+
+        let mut unspecified = [b'0'; 17];
+        unspecified[16] = 0;
+        assert_eq!(parse_volume_time(&unspecified).unwrap(), None);
+        assert_eq!(serialize_volume_time(None).unwrap(), unspecified);
+
+        let mut negative_offset = *b"2024022903040599\0";
+        negative_offset[16] = (-1_i8).to_ne_bytes()[0];
+        let readable = "2024-02-29T03:04:05.99-00:15";
+        assert_eq!(
+            parse_volume_time(&negative_offset).unwrap().as_deref(),
+            Some(readable)
+        );
+        assert_eq!(
+            serialize_volume_time(Some(readable)).unwrap(),
+            negative_offset
+        );
+    }
+
+    #[test]
+    fn volume_times_reject_invalid_or_lossy_values() {
+        for value in [
+            "2023-02-29T03:04:05.00+00:00",
+            "2024-01-01T24:00:00.00+00:00",
+            "2024-01-01T00:00:00.00+00:10",
+            "2024-01-01T00:00:00.00-00:00",
+            "2024-01-01 00:00:00.00+00:00",
+        ] {
+            assert!(
+                serialize_volume_time(Some(value)).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_recording_times_are_human_readable_and_exact() {
+        let root = [0x00, 0x06, 0x10, 0x09, 0x2d, 0x33, 0x24];
+        let readable = "1900-06-16T09:45:51+09:00";
+        assert_eq!(parse_recording_time(root).unwrap(), readable);
+        assert_eq!(serialize_recording_time(readable).unwrap(), root);
+
+        let file = [0x62, 0x03, 0x13, 0x0b, 0x3a, 0x24, 0x24];
+        let readable = "1998-03-19T11:58:36+09:00";
+        assert_eq!(parse_recording_time(file).unwrap(), readable);
+        assert_eq!(serialize_recording_time(readable).unwrap(), file);
+
+        let limit = [0xff, 12, 31, 23, 59, 59, (-1_i8).to_ne_bytes()[0]];
+        let readable = "2155-12-31T23:59:59-00:15";
+        assert_eq!(parse_recording_time(limit).unwrap(), readable);
+        assert_eq!(serialize_recording_time(readable).unwrap(), limit);
+    }
+
+    #[test]
+    fn directory_recording_times_reject_unrepresentable_values() {
+        for value in [
+            "1899-12-31T23:59:59+00:00",
+            "2156-01-01T00:00:00+00:00",
+            "2024-02-30T00:00:00+00:00",
+            "2024-01-01T00:00:00.00+00:00",
+            "2024-01-01T00:00:00+00:10",
+        ] {
+            assert!(serialize_recording_time(value).is_err(), "accepted {value}");
+        }
+    }
 
     #[test]
     fn record_with_odd_identifier_needs_no_padding_byte() {
@@ -900,5 +1197,67 @@ mod tests {
         assert!(validate_path("dir/file.bin", true).is_err());
         assert!(validate_path("../FILE.BIN", true).is_err());
         assert!(validate_path("TOO_LONG_NAME.BIN", true).is_err());
+    }
+
+    #[test]
+    fn files_list_declares_kind_and_physical_order() {
+        let root = test_entry(".");
+        let file = test_entry("FILE.BIN");
+        validate_entries(&test_iso(
+            vec![root.clone(), file.clone()],
+            vec!["FILE.BIN"],
+        ))
+        .unwrap();
+
+        assert!(validate_entries(&test_iso(vec![file.clone()], vec!["FILE.BIN"])).is_err());
+        assert!(
+            validate_entries(&test_iso(
+                vec![file.clone(), root.clone()],
+                vec!["FILE.BIN"]
+            ))
+            .is_err()
+        );
+        assert!(validate_entries(&test_iso(vec![root.clone()], vec!["."])).is_err());
+        assert!(validate_entries(&test_iso(vec![root.clone()], vec!["MISSING.BIN"])).is_err());
+        assert!(
+            validate_entries(&test_iso(vec![root, file], vec!["FILE.BIN", "FILE.BIN"],)).is_err()
+        );
+    }
+
+    #[test]
+    fn fixed_directory_record_fields_are_validated_and_generated() {
+        let mut record = Record {
+            extent: 0,
+            length: 0,
+            recording_time: [0, 1, 1, 0, 0, 0, 0],
+            flags: 0,
+            file_unit_size: 0,
+            interleave_gap_size: 0,
+            volume_sequence_number: 1,
+            name: b"FILE.BIN;1".to_vec(),
+            system_use: FILE_SYSTEM_USE.to_vec(),
+        };
+        validate_standard_record_fields(&record, false, true).unwrap();
+        record.flags = DIRECTORY_FLAG;
+        record.system_use = DIRECTORY_SYSTEM_USE.to_vec();
+        validate_standard_record_fields(&record, true, true).unwrap();
+
+        record.flags = 1;
+        assert!(validate_standard_record_fields(&record, false, true).is_err());
+        record.flags = 0;
+        record.system_use = FILE_SYSTEM_USE.to_vec();
+        record.file_unit_size = 1;
+        assert!(validate_standard_record_fields(&record, false, true).is_err());
+        record.file_unit_size = 0;
+        record.interleave_gap_size = 1;
+        assert!(validate_standard_record_fields(&record, false, true).is_err());
+        record.interleave_gap_size = 0;
+        record.volume_sequence_number = 2;
+        assert!(validate_standard_record_fields(&record, false, true).is_err());
+        record.volume_sequence_number = 1;
+        record.system_use[4] = 0;
+        assert!(validate_standard_record_fields(&record, false, true).is_err());
+
+        assert_eq!(identifier(&test_entry("FILE.BIN"), true), "FILE.BIN;1");
     }
 }
