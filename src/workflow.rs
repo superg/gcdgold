@@ -8,7 +8,8 @@ use sha1::{Digest, Sha1};
 
 use crate::iso9660;
 use crate::manifest::{
-    Form1Sectors, Manifest, SYSTEM_AREA_SECTORS, SystemArea, Track, TrackMode, serialize_manifest,
+    FileLayoutItem, Form1Sectors, Manifest, SYSTEM_AREA_SECTORS, SystemArea, Track, TrackMode,
+    XaAttributeFlag, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, RAW_SECTOR_SIZE, SectorWriter, XaSubheader, XaSubmode, format_msf,
@@ -43,6 +44,358 @@ const ISO_METADATA_SUBHEADER: XaSubheader = XaSubheader::with_submode(
         .union(XaSubmode::END_OF_FILE),
 );
 const FORM2_SUBHEADER: XaSubheader = XaSubheader::with_submode(XaSubmode::FORM2);
+const FORM2_PAYLOAD_SIZE: usize = 2324;
+const XA_SIDECAR_RECORD_SIZE: usize = 4 + FORM2_PAYLOAD_SIZE;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XaSidecarRecord {
+    subheader: XaSubheader,
+    payload: [u8; FORM2_PAYLOAD_SIZE],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XaExtentSector {
+    Form1(Box<XaForm1Sector>),
+    Form2(Box<XaSidecarRecord>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XaForm1Sector {
+    subheader: XaSubheader,
+    payload: [u8; LOGICAL_BLOCK_SIZE],
+}
+
+fn xa_audio_cadence(coding_info: u8) -> Result<u8> {
+    ensure!(
+        coding_info & !0x55 == 0,
+        "unsupported XA audio coding-info bits 0x{coding_info:02x}"
+    );
+    let mut cadence = 8_u8;
+    if coding_info & 0x01 == 0 {
+        cadence *= 2;
+    }
+    if coding_info & 0x04 != 0 {
+        cadence *= 2;
+    }
+    if coding_info & 0x10 != 0 {
+        cadence /= 2;
+    }
+    Ok(cadence)
+}
+
+fn encode_xa_sidecar_record(subheader: XaSubheader, payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        subheader
+            .submode
+            .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+        "XA sidecar record is not Form 2"
+    );
+    ensure!(
+        payload.len() == FORM2_PAYLOAD_SIZE,
+        "XA sidecar payload must be {FORM2_PAYLOAD_SIZE} bytes"
+    );
+    let mut result = Vec::with_capacity(XA_SIDECAR_RECORD_SIZE);
+    result.extend_from_slice(&<[u8; 4]>::from(subheader));
+    result.extend_from_slice(payload);
+    Ok(result)
+}
+
+fn parse_xa_sidecar(bytes: &[u8]) -> Result<Vec<XaSidecarRecord>> {
+    ensure!(
+        !bytes.is_empty() && bytes.len().is_multiple_of(XA_SIDECAR_RECORD_SIZE),
+        "XA sidecar size must be a nonzero multiple of {XA_SIDECAR_RECORD_SIZE} bytes"
+    );
+    bytes
+        .chunks_exact(XA_SIDECAR_RECORD_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let subheader = XaSubheader::from(<[u8; 4]>::try_from(&chunk[..4])?);
+            ensure!(
+                subheader
+                    .submode
+                    .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+                "XA sidecar record {index} is not Form 2"
+            );
+            xa_audio_cadence(subheader.coding_info)
+                .with_context(|| format!("invalid XA sidecar record {index}"))?;
+            Ok(XaSidecarRecord {
+                subheader,
+                payload: chunk[4..].try_into()?,
+            })
+        })
+        .collect()
+}
+
+fn multiplex_xa_extent(
+    form1: &[u8],
+    sidecar: &[u8],
+    file_number: u8,
+    form1_subheader: Option<XaSubheader>,
+) -> Result<Vec<XaExtentSector>> {
+    ensure!(
+        form1.len().is_multiple_of(LOGICAL_BLOCK_SIZE),
+        "interleaved Form 1 asset size must be a multiple of {LOGICAL_BLOCK_SIZE} bytes"
+    );
+    let records = parse_xa_sidecar(sidecar)?;
+    let cadence = xa_audio_cadence(records[0].subheader.coding_info)?;
+    let mut channels = records
+        .iter()
+        .map(|record| record.subheader.channel)
+        .collect::<Vec<_>>();
+    channels.sort_unstable();
+    channels.dedup();
+    ensure!(
+        channels.len() <= usize::from(cadence),
+        "XA sidecar has more active channels than cadence slots"
+    );
+    for (index, record) in records.iter().enumerate() {
+        ensure!(
+            record.subheader.file_number == file_number,
+            "XA sidecar record {index} has file number {}, expected {file_number}",
+            record.subheader.file_number
+        );
+        ensure!(
+            xa_audio_cadence(record.subheader.coding_info)? == cadence,
+            "XA sidecar mixes incompatible audio cadences"
+        );
+    }
+
+    let default_form1_subheader = XaSubheader {
+        file_number,
+        ..XaSubheader::default()
+    };
+    let form1_subheader = form1_subheader.unwrap_or(default_form1_subheader);
+    ensure!(
+        form1_subheader.file_number == file_number,
+        "Form 1 subheader file number does not match the directory record"
+    );
+    ensure!(
+        !form1_subheader
+            .submode
+            .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+        "Form 1 subheader cannot contain the form2 flag"
+    );
+
+    let form1_sectors = form1
+        .chunks_exact(LOGICAL_BLOCK_SIZE)
+        .map(|chunk| <[u8; LOGICAL_BLOCK_SIZE]>::try_from(chunk).expect("exact chunk"))
+        .collect::<Vec<_>>();
+    let padding_start = form1_sectors
+        .iter()
+        .rposition(|payload| payload.iter().any(|byte| *byte != 0))
+        .map_or(0, |index| index + 1);
+    let mut result = Vec::with_capacity(form1_sectors.len() + records.len());
+    let mut form1_index = 0;
+    let mut record_index = 0;
+    let mut slot = 0_usize;
+    let audio_start = usize::from(cadence) - channels.len();
+    let mut slot_channels = vec![None; usize::from(cadence)];
+    for (index, channel) in channels.into_iter().enumerate() {
+        slot_channels[audio_start + index] = Some(channel);
+    }
+    let mut ended_channels = Vec::new();
+    while form1_index < form1_sectors.len() || record_index < records.len() {
+        let expected_channel = slot_channels[slot].as_ref();
+        if records.get(record_index).is_some_and(|record| {
+            expected_channel.is_some_and(|channel| record.subheader.channel == *channel)
+        }) {
+            if records[record_index]
+                .subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::EndOfFile)
+            {
+                ended_channels.push(records[record_index].subheader.channel);
+            }
+            result.push(XaExtentSector::Form2(Box::new(
+                records[record_index].clone(),
+            )));
+            record_index += 1;
+        } else {
+            ensure!(
+                form1_index < form1_sectors.len(),
+                "XA sidecar channel sequence cannot be filled by the Form 1 asset"
+            );
+            let subheader = if form1_index >= padding_start {
+                default_form1_subheader
+            } else {
+                form1_subheader
+            };
+            result.push(XaExtentSector::Form1(Box::new(XaForm1Sector {
+                subheader,
+                payload: form1_sectors[form1_index],
+            })));
+            form1_index += 1;
+        }
+        slot = (slot + 1) % usize::from(cadence);
+        if slot == 0 {
+            for channel in ended_channels.drain(..) {
+                let assigned_slot = slot_channels
+                    .iter()
+                    .position(|candidate| *candidate == Some(channel))
+                    .with_context(|| {
+                        format!("XA channel {channel} has multiple end-of-file records")
+                    })?;
+                slot_channels[assigned_slot] = None;
+            }
+        }
+    }
+    if let Some(XaExtentSector::Form1(sector)) = result.last_mut() {
+        sector.subheader.submode = sector.subheader.submode.union(XaSubmode::END_OF_FILE);
+    }
+    Ok(result)
+}
+
+fn demultiplex_xa_extent(
+    sectors: &[crate::raw_cd::ParsedSector],
+    file_number: u8,
+    form2_edc: bool,
+) -> Result<(Vec<u8>, Vec<u8>, Option<XaSubheader>)> {
+    let cadence = sectors
+        .iter()
+        .find(|sector| sector.kind == Kind::Form2)
+        .map(|sector| xa_audio_cadence(sector.subheader.coding_info))
+        .transpose()?
+        .context("interleaved XA extent contains no Form 2 sectors")?;
+    let mut form1 = Vec::new();
+    let mut form1_subheaders = Vec::new();
+    let mut sidecar = Vec::new();
+    for (index, sector) in sectors.iter().enumerate() {
+        ensure!(
+            sector.subheader.file_number == file_number,
+            "interleaved XA sector {index} has file number {}, expected {file_number}",
+            sector.subheader.file_number
+        );
+        match sector.kind {
+            Kind::Form1 => {
+                form1.extend_from_slice(sector.payload());
+                form1_subheaders.push(sector.subheader);
+            }
+            Kind::Form2 => {
+                ensure!(
+                    xa_audio_cadence(sector.subheader.coding_info)? == cadence,
+                    "interleaved extent mixes incompatible XA audio cadences"
+                );
+                ensure!(
+                    sector_follows_form2_edc_policy(sector, form2_edc),
+                    "interleaved Form 2 sector {index} does not follow track Form 2 EDC policy"
+                );
+                sidecar.extend_from_slice(&encode_xa_sidecar_record(
+                    sector.subheader,
+                    sector.payload(),
+                )?);
+            }
+            Kind::XaGap => anyhow::bail!("XA gap inside interleaved extent at sector {index}"),
+        }
+    }
+    let form1_sectors = form1.chunks_exact(LOGICAL_BLOCK_SIZE).collect::<Vec<_>>();
+    let padding_start = form1_sectors
+        .iter()
+        .rposition(|payload| payload.iter().any(|byte| *byte != 0))
+        .map_or(0, |index| index + 1);
+    let default_subheader = XaSubheader {
+        file_number,
+        ..XaSubheader::default()
+    };
+    let mut normalized_form1_subheaders = form1_subheaders.clone();
+    if sectors
+        .last()
+        .is_some_and(|sector| sector.kind == Kind::Form1)
+        && let Some(subheader) = normalized_form1_subheaders.last_mut()
+    {
+        subheader.submode =
+            XaSubmode::from_bits(subheader.submode.bits() & !XaSubmode::END_OF_FILE.bits());
+    }
+    let form1_subheader = normalized_form1_subheaders
+        .first()
+        .copied()
+        .filter(|_| padding_start != 0)
+        .unwrap_or(default_subheader);
+    ensure!(
+        normalized_form1_subheaders[..padding_start]
+            .iter()
+            .all(|subheader| *subheader == form1_subheader),
+        "mixed XA extent uses multiple Form 1 data subheaders"
+    );
+    let stored_form1_subheader = (form1_subheader != default_subheader).then_some(form1_subheader);
+    let reconstructed = multiplex_xa_extent(&form1, &sidecar, file_number, stored_form1_subheader)?;
+    ensure!(
+        reconstructed.len() == sectors.len(),
+        "mixed XA cadence does not reproduce the source extent length"
+    );
+    for (index, (source, authored)) in sectors.iter().zip(&reconstructed).enumerate() {
+        match (source.kind, authored) {
+            (Kind::Form1, XaExtentSector::Form1(form1)) => ensure!(
+                source.subheader == form1.subheader,
+                "mixed XA Form 1 framing differs at sector {index}"
+            ),
+            (Kind::Form2, XaExtentSector::Form2(form2)) => ensure!(
+                source.subheader == form2.subheader && source.payload() == form2.payload,
+                "mixed XA Form 2 framing differs at sector {index}"
+            ),
+            _ => anyhow::bail!("mixed XA sector order differs at sector {index}"),
+        }
+    }
+    Ok((form1, sidecar, stored_form1_subheader))
+}
+
+fn sector_follows_form2_edc_policy(sector: &crate::raw_cd::ParsedSector, computed: bool) -> bool {
+    if computed {
+        sector.form2_edc_valid
+    } else {
+        !sector.form2_edc_valid && sector.bytes[2348..2352] == [0; 4]
+    }
+}
+
+fn entry_uses_xa_sidecar(entry: &crate::manifest::Entry) -> bool {
+    entry
+        .xa
+        .as_ref()
+        .and_then(|xa| xa.attributes)
+        .is_some_and(|attributes| {
+            attributes.contains(XaAttributeFlag::Interleaved)
+                || attributes.contains(XaAttributeFlag::Mode2Form2)
+        })
+}
+
+fn detect_file_layout(
+    sectors: &[crate::raw_cd::ParsedSector],
+    files: &[iso9660::ParsedFile],
+    form2_edc: bool,
+) -> Result<Vec<FileLayoutItem>> {
+    let mut files = files.to_vec();
+    files.sort_by_key(|file| file.extent);
+    let mut previous_end = 0_usize;
+    let mut layout = Vec::new();
+    for file in files {
+        let extent = usize::try_from(file.extent)?;
+        ensure!(
+            extent >= previous_end,
+            "overlapping or unordered file extents"
+        );
+        let mut start = extent;
+        while start > previous_end {
+            let sector = &sectors[start - 1];
+            if sector.kind != Kind::Form2
+                || sector.subheader != FORM2_SUBHEADER
+                || sector.payload().iter().any(|byte| *byte != 0)
+            {
+                break;
+            }
+            ensure!(
+                sector_follows_form2_edc_policy(sector, form2_edc),
+                "physical gap before {} does not follow track Form 2 EDC policy",
+                file.path
+            );
+            start -= 1;
+        }
+        if start < extent {
+            layout.push(FileLayoutItem::gap(u32::try_from(extent - start)?));
+        }
+        layout.push(FileLayoutItem::path(&file.path));
+        previous_end = extent + usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+    }
+    Ok(layout)
+}
 
 pub fn extract(
     image_path: &Path,
@@ -76,6 +429,13 @@ pub fn extract_with_options(
     let (start_frame, sectors) = parse_image(&image)?;
     ensure!(sectors.len() >= 23, "image is too small");
     let sector_count = u32::try_from(sectors.len())?;
+    let noncompliant_trailing_ecc = sectors.last().is_some_and(|sector| sector.noncompliant_ecc);
+    ensure!(
+        sectors[..sectors.len() - 1]
+            .iter()
+            .all(|sector| !sector.noncompliant_ecc),
+        "noncompliant ECC is supported only on the final track sector"
+    );
 
     let trailing_gap = sectors
         .iter()
@@ -89,19 +449,66 @@ pub fn extract_with_options(
         .iter()
         .map(|sector| sector.logical_block().try_into())
         .collect::<Result<Vec<[u8; LOGICAL_BLOCK_SIZE]>, _>>()?;
-    let parsed_iso = iso9660::parse(&blocks)?;
-    validate_iso_subheaders(&sectors, &parsed_iso.files, trailing_gap)?;
+    let mut parsed_iso = iso9660::parse(&blocks)?;
+    validate_iso_subheaders(&sectors, &parsed_iso, trailing_gap)?;
+    parsed_iso.manifest.files = detect_file_layout(&sectors, &parsed_iso.files, form2_edc)?;
     let mut extracted_files = HashMap::new();
     for file in &parsed_iso.files {
-        let data = read_extent(&blocks, file.extent, file.length)?;
-        extracted_files.insert(file.path.clone(), data);
+        let entry_index = parsed_iso
+            .manifest
+            .entries
+            .iter_mut()
+            .position(|entry| entry.path == file.path)
+            .context("parsed file has no manifest entry")?;
+        if entry_uses_xa_sidecar(&parsed_iso.manifest.entries[entry_index]) {
+            ensure!(
+                usize::try_from(file.length)?.is_multiple_of(LOGICAL_BLOCK_SIZE),
+                "interleaved extent length is not sector aligned for {}",
+                file.path
+            );
+            let start = usize::try_from(file.extent)?;
+            let count = usize::try_from(file.length)? / LOGICAL_BLOCK_SIZE;
+            ensure!(
+                start + count <= sectors.len(),
+                "interleaved extent is outside image"
+            );
+            let file_number = parsed_iso.manifest.entries[entry_index]
+                .xa
+                .as_ref()
+                .context("missing XA metadata")?
+                .file_number;
+            let (form1, sidecar, form1_subheader) =
+                demultiplex_xa_extent(&sectors[start..start + count], file_number, form2_edc)
+                    .with_context(|| format!("demultiplexing {}", file.path))?;
+            let sidecar_path = format!("{}.XA", file.path);
+            ensure!(
+                parsed_iso
+                    .manifest
+                    .entries
+                    .iter()
+                    .all(|candidate| candidate.path != sidecar_path),
+                "XA sidecar path collides with ISO entry {sidecar_path}"
+            );
+            let xa = parsed_iso.manifest.entries[entry_index]
+                .xa
+                .as_mut()
+                .expect("checked XA metadata");
+            xa.form1_subheader = form1_subheader;
+            xa.form2 = Some(sidecar_path.clone());
+            extracted_files.insert(file.path.clone(), form1);
+            extracted_files.insert(sidecar_path, sidecar);
+        } else {
+            let data = read_extent(&blocks, file.extent, file.length)?;
+            extracted_files.insert(file.path.clone(), data);
+        }
     }
     let manifest = Manifest {
         track: Track {
             mode: TrackMode::Mode2Xa,
             start_msf: format_msf(start_frame)?,
-            trailing_gap_sectors: u32::try_from(trailing_gap)?,
+            trailing_gap: u32::try_from(trailing_gap)?,
             form2_edc,
+            noncompliant_trailing_ecc,
         },
         system_area: SystemArea {
             path: system_name.clone(),
@@ -123,7 +530,12 @@ pub fn extract_with_options(
     );
 
     if !options.manifest_only {
-        let file_paths: HashSet<_> = manifest.iso9660.files.iter().map(String::as_str).collect();
+        let file_paths: HashSet<_> = manifest
+            .iso9660
+            .files
+            .iter()
+            .filter_map(FileLayoutItem::as_path)
+            .collect();
         validate_data_directory(data_dir)?;
         let system_path = safe_join(data_dir, &system_name)?;
         validate_output_file(&system_path, options.overwrite, "system output")?;
@@ -140,6 +552,11 @@ pub fn extract_with_options(
                 validate_output_directory(&output, options.overwrite, "extraction output")?;
             }
         }
+        for path in extracted_files.keys() {
+            let output = safe_join(data_dir, path)?;
+            validate_output_file(&output, options.overwrite, "extraction output")?;
+        }
+        create_output_parent(manifest_path, "manifest output")?;
         fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data directory {}", data_dir.display()))?;
         for entry in manifest
@@ -162,8 +579,13 @@ pub fn extract_with_options(
             .with_context(|| format!("writing {}", system_path.display()))?;
         for (path, data) in extracted_files {
             let output = safe_join(data_dir, &path)?;
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(&output, data).with_context(|| format!("writing {}", output.display()))?;
         }
+    } else {
+        create_output_parent(manifest_path, "manifest output")?;
     }
     let yaml = serialize_manifest(&manifest, options.include_defaults)?;
     fs::write(manifest_path, yaml)
@@ -214,10 +636,10 @@ fn extract_system_area(sectors: &[crate::raw_cd::ParsedSector]) -> Result<(Vec<u
     }
     let computed = sectors[form2_start..]
         .iter()
-        .all(|sector| sector.bytes[2348..2352] != [0, 0, 0, 0]);
+        .all(|sector| sector.form2_edc_valid);
     let zeroed = sectors[form2_start..]
         .iter()
-        .all(|sector| sector.bytes[2348..2352] == [0, 0, 0, 0]);
+        .all(|sector| sector_follows_form2_edc_policy(sector, false));
     ensure!(computed || zeroed, "mixed Form 2 EDC policy in system area");
     ensure!(
         sectors[..form2_start]
@@ -236,7 +658,7 @@ fn extract_system_area(sectors: &[crate::raw_cd::ParsedSector]) -> Result<(Vec<u
 
 fn validate_iso_subheaders(
     sectors: &[crate::raw_cd::ParsedSector],
-    files: &[iso9660::ParsedFile],
+    parsed_iso: &iso9660::ParsedIso,
     trailing_gap: usize,
 ) -> Result<()> {
     let content_end = sectors
@@ -244,14 +666,20 @@ fn validate_iso_subheaders(
         .checked_sub(trailing_gap)
         .context("trailing gap exceeds track size")?;
     let mut file_sector_info = HashMap::new();
-    for file in files {
+    for file in &parsed_iso.files {
         let blocks = usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+        let interleaved = parsed_iso
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == file.path)
+            .is_some_and(entry_uses_xa_sidecar);
         for block_index in 0..blocks {
             let lba = usize::try_from(file.extent)? + block_index;
             ensure!(lba < content_end, "file extent reaches outside ISO content");
             ensure!(
                 file_sector_info
-                    .insert(lba, block_index + 1 == blocks)
+                    .insert(lba, (block_index + 1 == blocks, interleaved))
                     .is_none(),
                 "overlapping file extents at LBA {lba}"
             );
@@ -261,7 +689,10 @@ fn validate_iso_subheaders(
     for (lba, sector) in sectors.iter().enumerate().take(content_end).skip(16) {
         let expected = if lba == 16 {
             PVD_SUBHEADER
-        } else if let Some(is_last) = file_sector_info.get(&lba) {
+        } else if let Some((is_last, interleaved)) = file_sector_info.get(&lba) {
+            if *interleaved {
+                continue;
+            }
             if *is_last {
                 ISO_METADATA_SUBHEADER
             } else {
@@ -270,6 +701,12 @@ fn validate_iso_subheaders(
         } else {
             ISO_METADATA_SUBHEADER
         };
+        if sector.kind == Kind::Form2
+            && sector.subheader == FORM2_SUBHEADER
+            && sector.payload().iter().all(|byte| *byte == 0)
+        {
+            continue;
+        }
         ensure!(
             sector.kind == Kind::Form1,
             "ISO sector at LBA {lba} is not Mode 2 XA Form 1"
@@ -320,18 +757,70 @@ pub fn build(
         .with_context(|| format!("reading system asset {}", system_path.display()))?;
     let form1_count = manifest.system_area.form1_sectors.resolve(system.len())?;
     let mut file_data = HashMap::new();
-    for file in &manifest.iso9660.files {
+    let mut file_lengths = HashMap::new();
+    let mut mixed_extents = HashMap::new();
+    let entries_by_path: HashMap<_, _> = manifest
+        .iso9660
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let iso_paths: HashSet<_> = manifest
+        .iso9660
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let mut sidecar_paths = HashSet::new();
+    for file in manifest
+        .iso9660
+        .files
+        .iter()
+        .filter_map(FileLayoutItem::as_path)
+    {
         let path = safe_join(data_dir, file)?;
         let data =
             fs::read(&path).with_context(|| format!("reading authored file {}", path.display()))?;
-        file_data.insert(file.clone(), data);
+        let entry = entries_by_path[file];
+        let sidecar_path = entry.xa.as_ref().and_then(|xa| xa.form2.as_deref());
+        ensure!(
+            entry_uses_xa_sidecar(entry) == sidecar_path.is_some(),
+            "interleaved XA entry {file} must specify exactly one Form 2 sidecar"
+        );
+        if let Some(sidecar_path) = sidecar_path {
+            ensure!(
+                sidecar_paths.insert(sidecar_path),
+                "duplicate XA sidecar path {sidecar_path}"
+            );
+            ensure!(
+                !iso_paths.contains(sidecar_path) && sidecar_path != manifest.system_area.path,
+                "XA sidecar path collides with another authored asset: {sidecar_path}"
+            );
+            let sidecar_host_path = safe_join(data_dir, sidecar_path)?;
+            let sidecar = fs::read(&sidecar_host_path)
+                .with_context(|| format!("reading XA sidecar {}", sidecar_host_path.display()))?;
+            let xa = entry.xa.as_ref().expect("XA sidecar metadata");
+            let sectors = multiplex_xa_extent(&data, &sidecar, xa.file_number, xa.form1_subheader)
+                .with_context(|| format!("multiplexing {file}"))?;
+            file_lengths.insert(
+                file.to_owned(),
+                u64::try_from(sectors.len())? * LOGICAL_BLOCK_SIZE as u64,
+            );
+            mixed_extents.insert(file.to_owned(), sectors);
+        } else {
+            file_lengths.insert(file.to_owned(), u64::try_from(data.len())?);
+        }
+        file_data.insert(file.to_owned(), data);
     }
     let mut layout = iso9660::layout(
         &manifest.iso9660,
-        &file_data,
-        manifest.track.trailing_gap_sectors,
+        &file_lengths,
+        manifest.track.trailing_gap,
     )?;
     for placement in &layout.files {
+        if mixed_extents.contains_key(&placement.path) {
+            continue;
+        }
         let data = &file_data[&placement.path];
         for block_index in 0..usize::try_from(placement.blocks)? {
             let source_start = block_index * LOGICAL_BLOCK_SIZE;
@@ -345,6 +834,10 @@ pub fn build(
     }
 
     let start_frame = parse_msf(&manifest.track.start_msf)?;
+    ensure!(
+        !manifest.track.noncompliant_trailing_ecc || manifest.track.trailing_gap != 0,
+        "noncompliant_trailing_ecc requires a trailing gap"
+    );
     let mut writer = SectorWriter::new();
     let mut raw = Vec::with_capacity(usize::try_from(layout.volume_blocks)? * RAW_SECTOR_SIZE);
     let padded_system_len = usize::from(form1_count) * LOGICAL_BLOCK_SIZE;
@@ -375,13 +868,53 @@ pub fn build(
     let mut file_sector_info = HashMap::new();
     for file in &layout.files {
         for block_index in 0..file.blocks {
-            file_sector_info.insert(file.extent + block_index, block_index + 1 == file.blocks);
+            file_sector_info.insert(
+                file.extent + block_index,
+                (
+                    file.path.as_str(),
+                    usize::try_from(block_index)?,
+                    block_index + 1 == file.blocks,
+                ),
+            );
         }
     }
     for lba in 16..u32::try_from(layout.blocks.len())? {
+        if layout
+            .gaps
+            .iter()
+            .any(|gap| lba >= gap.start && lba < gap.start + gap.sectors)
+        {
+            raw.extend_from_slice(&writer.form2(
+                start_frame + lba,
+                FORM2_SUBHEADER,
+                &[0; FORM2_PAYLOAD_SIZE],
+                manifest.track.form2_edc,
+            )?);
+            continue;
+        }
+        if let Some((path, block_index, _)) = file_sector_info.get(&lba)
+            && let Some(sectors) = mixed_extents.get(*path)
+        {
+            match &sectors[*block_index] {
+                XaExtentSector::Form1(form1) => {
+                    raw.extend_from_slice(&writer.form1(
+                        start_frame + lba,
+                        form1.subheader,
+                        &form1.payload,
+                    )?);
+                }
+                XaExtentSector::Form2(record) => raw.extend_from_slice(&writer.form2(
+                    start_frame + lba,
+                    record.subheader,
+                    &record.payload,
+                    manifest.track.form2_edc,
+                )?),
+            }
+            continue;
+        }
         let subheader = if lba == 16 {
             PVD_SUBHEADER
-        } else if let Some(is_last) = file_sector_info.get(&lba) {
+        } else if let Some((_, _, is_last)) = file_sector_info.get(&lba) {
             if *is_last {
                 ISO_METADATA_SUBHEADER
             } else {
@@ -397,10 +930,17 @@ pub fn build(
         )?);
     }
     for lba in u32::try_from(layout.blocks.len())?..layout.volume_blocks {
-        raw.extend_from_slice(&writer.xa_gap(start_frame + lba, XaSubheader::default())?);
+        let sector = if manifest.track.noncompliant_trailing_ecc && lba + 1 == layout.volume_blocks
+        {
+            writer.xa_gap_with_recorded_header_ecc(start_frame + lba, XaSubheader::default())?
+        } else {
+            writer.xa_gap(start_frame + lba, XaSubheader::default())?
+        };
+        raw.extend_from_slice(&sector);
     }
 
     let sha1 = sha1_hex(&raw);
+    create_output_parent(image_path, "image output")?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -444,6 +984,17 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
         "manifest path contains traversal or non-normal components: {relative}"
     );
     Ok(base.join(path))
+}
+
+fn create_output_parent(path: &Path, label: &str) -> Result<()> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating {label} directory {}", parent.display()))
 }
 
 fn validate_data_directory(path: &Path) -> Result<()> {
@@ -550,6 +1101,37 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("data/tyco_demo.bin")
     }
 
+    fn spyro_reference_image() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("data/spyro1.bin")
+    }
+
+    fn lemmings_reference_image() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin")
+    }
+
+    fn files_are_equal(left: &Path, right: &Path) -> bool {
+        use std::io::Read;
+
+        let mut left = fs::File::open(left).unwrap();
+        let mut right = fs::File::open(right).unwrap();
+        if left.metadata().unwrap().len() != right.metadata().unwrap().len() {
+            return false;
+        }
+        let mut left_buffer = [0_u8; 64 * 1024];
+        let mut right_buffer = [0_u8; 64 * 1024];
+        loop {
+            let left_count = left.read(&mut left_buffer).unwrap();
+            let right_count = right.read(&mut right_buffer).unwrap();
+            if left_count != right_count || left_buffer[..left_count] != right_buffer[..right_count]
+            {
+                return false;
+            }
+            if left_count == 0 {
+                return true;
+            }
+        }
+    }
+
     #[test]
     fn system_area_trims_only_trailing_zeroes() {
         let mut writer = SectorWriter::new();
@@ -595,6 +1177,217 @@ mod tests {
     }
 
     #[test]
+    fn psx_double_speed_xa_audio_cadence_is_derived_from_coding_info() {
+        assert_eq!(xa_audio_cadence(0x01).unwrap(), 8);
+        assert_eq!(xa_audio_cadence(0x00).unwrap(), 16);
+        assert_eq!(xa_audio_cadence(0x05).unwrap(), 16);
+        assert_eq!(xa_audio_cadence(0x04).unwrap(), 32);
+        assert_eq!(xa_audio_cadence(0x11).unwrap(), 4);
+        assert!(xa_audio_cadence(0x02).is_err());
+    }
+
+    #[test]
+    fn xa_sidecar_preserves_subheaders_and_form2_payloads() {
+        let subheader = XaSubheader {
+            file_number: 1,
+            channel: 7,
+            submode: XaSubmode::AUDIO
+                .union(XaSubmode::FORM2)
+                .union(XaSubmode::REALTIME)
+                .union(XaSubmode::END_OF_FILE),
+            coding_info: 1,
+        };
+        let payload = [0x5a; FORM2_PAYLOAD_SIZE];
+        let sidecar = encode_xa_sidecar_record(subheader, &payload).unwrap();
+        assert_eq!(sidecar.len(), XA_SIDECAR_RECORD_SIZE);
+
+        let records = parse_xa_sidecar(&sidecar).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].subheader, subheader);
+        assert_eq!(records[0].payload, payload);
+    }
+
+    #[test]
+    fn xa_multiplex_places_active_channels_in_trailing_cadence_slots() {
+        let form1 = vec![0x33; 6 * LOGICAL_BLOCK_SIZE];
+        let mut sidecar = Vec::new();
+        for channel in [0, 1] {
+            let subheader = XaSubheader {
+                file_number: 1,
+                channel,
+                submode: XaSubmode::AUDIO
+                    .union(XaSubmode::FORM2)
+                    .union(XaSubmode::REALTIME),
+                coding_info: 1,
+            };
+            sidecar.extend_from_slice(
+                &encode_xa_sidecar_record(subheader, &[channel; FORM2_PAYLOAD_SIZE]).unwrap(),
+            );
+        }
+
+        let sectors = multiplex_xa_extent(&form1, &sidecar, 1, None).unwrap();
+        assert_eq!(sectors.len(), 8);
+        assert!(
+            sectors[..6]
+                .iter()
+                .all(|sector| matches!(sector, XaExtentSector::Form1(_)))
+        );
+        assert!(matches!(sectors[6], XaExtentSector::Form2(_)));
+        assert!(matches!(sectors[7], XaExtentSector::Form2(_)));
+    }
+
+    #[test]
+    fn xa_channel_end_of_file_removes_it_from_later_cadence_groups() {
+        let form1 = vec![0x33; 13 * LOGICAL_BLOCK_SIZE];
+        let mut sidecar = Vec::new();
+        for (channel, end_of_file) in [(0, true), (1, false), (1, false)] {
+            let mut submode = XaSubmode::AUDIO
+                .union(XaSubmode::FORM2)
+                .union(XaSubmode::REALTIME);
+            if end_of_file {
+                submode = submode.union(XaSubmode::END_OF_FILE);
+            }
+            let subheader = XaSubheader {
+                file_number: 1,
+                channel,
+                submode,
+                coding_info: 1,
+            };
+            sidecar.extend_from_slice(
+                &encode_xa_sidecar_record(subheader, &[channel; FORM2_PAYLOAD_SIZE]).unwrap(),
+            );
+        }
+
+        let sectors = multiplex_xa_extent(&form1, &sidecar, 1, None).unwrap();
+        assert_eq!(sectors.len(), 16);
+        assert!(matches!(sectors[6], XaExtentSector::Form2(_)));
+        assert!(matches!(sectors[7], XaExtentSector::Form2(_)));
+        assert!(matches!(sectors[15], XaExtentSector::Form2(_)));
+    }
+
+    #[test]
+    fn ended_xa_channel_leaves_its_assigned_cadence_slot_empty() {
+        let form1 = vec![0x33; 11 * LOGICAL_BLOCK_SIZE];
+        let mut sidecar = Vec::new();
+        for (channel, end_of_file) in [(0, false), (1, true), (2, false), (0, false), (2, false)] {
+            let mut submode = XaSubmode::AUDIO
+                .union(XaSubmode::FORM2)
+                .union(XaSubmode::REALTIME);
+            if end_of_file {
+                submode = submode.union(XaSubmode::END_OF_FILE);
+            }
+            let subheader = XaSubheader {
+                file_number: 1,
+                channel,
+                submode,
+                coding_info: 1,
+            };
+            sidecar.extend_from_slice(
+                &encode_xa_sidecar_record(subheader, &[channel; FORM2_PAYLOAD_SIZE]).unwrap(),
+            );
+        }
+
+        let sectors = multiplex_xa_extent(&form1, &sidecar, 1, None).unwrap();
+        assert_eq!(sectors.len(), 16);
+        assert!(matches!(sectors[13], XaExtentSector::Form2(_)));
+        assert!(matches!(sectors[14], XaExtentSector::Form1(_)));
+        assert!(matches!(sectors[15], XaExtentSector::Form2(_)));
+    }
+
+    #[test]
+    fn mixed_xa_video_form1_subheader_is_discovered_from_the_extent() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin");
+        let mut source = fs::File::open(path).unwrap();
+        source
+            .seek(SeekFrom::Start((957 * RAW_SECTOR_SIZE) as u64))
+            .unwrap();
+        let mut raw = vec![0_u8; 8 * RAW_SECTOR_SIZE];
+        source.read_exact(&mut raw).unwrap();
+        let (_, sectors) = parse_image(&raw).unwrap();
+
+        let (form1, sidecar, form1_subheader) = demultiplex_xa_extent(&sectors, 1, false).unwrap();
+        assert_eq!(form1.len(), 7 * LOGICAL_BLOCK_SIZE);
+        assert_eq!(sidecar.len(), XA_SIDECAR_RECORD_SIZE);
+        assert_eq!(form1_subheader, Some([1, 1, 0x42, 0x80].into()));
+    }
+
+    #[test]
+    fn final_interleaved_form1_sector_carries_end_of_file() {
+        let form1 = vec![0_u8; 8 * LOGICAL_BLOCK_SIZE];
+        let subheader = XaSubheader {
+            file_number: 1,
+            submode: XaSubmode::AUDIO
+                .union(XaSubmode::FORM2)
+                .union(XaSubmode::REALTIME),
+            coding_info: 1,
+            ..XaSubheader::default()
+        };
+        let sidecar = encode_xa_sidecar_record(subheader, &[0; FORM2_PAYLOAD_SIZE]).unwrap();
+        let sectors = multiplex_xa_extent(&form1, &sidecar, 1, None).unwrap();
+        let XaExtentSector::Form1(final_sector) = sectors.last().unwrap() else {
+            panic!("expected final Form 1 sector");
+        };
+        assert_eq!(<[u8; 4]>::from(final_sector.subheader), [1, 0, 0x80, 0]);
+    }
+
+    #[test]
+    fn final_nonpadding_form1_eof_is_not_a_second_subheader_template() {
+        let form1 = vec![0x33_u8; 8 * LOGICAL_BLOCK_SIZE];
+        let form2_subheader = XaSubheader {
+            file_number: 1,
+            submode: XaSubmode::AUDIO
+                .union(XaSubmode::FORM2)
+                .union(XaSubmode::REALTIME),
+            coding_info: 1,
+            ..XaSubheader::default()
+        };
+        let sidecar =
+            encode_xa_sidecar_record(form2_subheader, &[0x44; FORM2_PAYLOAD_SIZE]).unwrap();
+        let authored = multiplex_xa_extent(&form1, &sidecar, 1, None).unwrap();
+        let mut writer = SectorWriter::new();
+        let mut raw = Vec::new();
+        for (index, sector) in authored.iter().enumerate() {
+            let frame = 150 + u32::try_from(index).unwrap();
+            match sector {
+                XaExtentSector::Form1(form1) => raw.extend_from_slice(
+                    &writer
+                        .form1(frame, form1.subheader, &form1.payload)
+                        .unwrap(),
+                ),
+                XaExtentSector::Form2(form2) => raw.extend_from_slice(
+                    &writer
+                        .form2(frame, form2.subheader, &form2.payload, false)
+                        .unwrap(),
+                ),
+            }
+        }
+        let (_, sectors) = parse_image(&raw).unwrap();
+
+        let (_, _, form1_subheader) = demultiplex_xa_extent(&sectors, 1, false).unwrap();
+        assert_eq!(form1_subheader, None);
+    }
+
+    #[test]
+    fn zero_form2_physical_gap_sector_is_reproducible() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/spyro1.bin");
+        let mut source = fs::File::open(path).unwrap();
+        source
+            .seek(SeekFrom::Start((24 * RAW_SECTOR_SIZE) as u64))
+            .unwrap();
+        let mut expected = [0_u8; RAW_SECTOR_SIZE];
+        source.read_exact(&mut expected).unwrap();
+
+        let actual = SectorWriter::new()
+            .form2(150 + 24, FORM2_SUBHEADER, &[0; FORM2_PAYLOAD_SIZE], true)
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn extraction_rejects_nonstandard_iso_subheaders() {
         let image = fs::read(reference_image()).unwrap();
         let (_, mut sectors) = parse_image(&image).unwrap();
@@ -605,7 +1398,7 @@ mod tests {
         let parsed_iso = iso9660::parse(&blocks).unwrap();
         sectors[16].subheader = FORM1_DATA_SUBHEADER;
 
-        let error = validate_iso_subheaders(&sectors, &parsed_iso.files, 150).unwrap_err();
+        let error = validate_iso_subheaders(&sectors, &parsed_iso, 150).unwrap_err();
         assert_eq!(
             error.to_string(),
             "ISO sector at LBA 16 uses a nonstandard XA subheader"
@@ -631,13 +1424,10 @@ mod tests {
         assert!(!yaml.contains("format_version"));
         assert!(!yaml.contains("sha1"));
         assert!(!yaml.lines().any(|line| line == "source:"));
+        assert!(!yaml.lines().any(|line| line.starts_with("track:")));
         assert!(!yaml.lines().any(|line| line.starts_with("  mode:")));
         assert!(!yaml.lines().any(|line| line.starts_with("  start_msf:")));
-        assert!(
-            !yaml
-                .lines()
-                .any(|line| line.starts_with("  trailing_gap_sectors:"))
-        );
+        assert!(!yaml.lines().any(|line| line.starts_with("  trailing_gap:")));
         assert!(
             !yaml
                 .lines()
@@ -673,7 +1463,7 @@ mod tests {
         assert!(!entries_yaml.contains("data_order:"));
         assert_eq!(
             files_yaml,
-            "  - MAIN.EXE\n  - MAINRSRC.BFF\n  - SYSTEM.CNF\n  - DUMMY.BIN\n"
+            "  - path: MAIN.EXE\n  - path: MAINRSRC.BFF\n  - path: SYSTEM.CNF\n  - path: DUMMY.BIN\n"
         );
         let system_area_yaml = yaml
             .split_once("system_area:\n")
@@ -721,7 +1511,11 @@ mod tests {
             1,
         );
         assert!(yaml_serde::from_str::<Manifest>(&legacy).is_err());
-        let legacy = yaml.replacen("track: {}", "track:\n  pvd_subheader: [0, 0, 9, 0]", 1);
+        let legacy = yaml.replacen(
+            "system_area:\n",
+            "track:\n  pvd_subheader: [0, 0, 9, 0]\nsystem_area:\n",
+            1,
+        );
         assert!(yaml_serde::from_str::<Manifest>(&legacy).is_err());
         for legacy_field in [
             "source_length: 24576",
@@ -807,6 +1601,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_creates_missing_manifest_parent_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("data/manifests/sample.yaml");
+
+        extract(&reference_image(), &manifest, project.path(), true, false).unwrap();
+
+        assert!(manifest.is_file());
+    }
+
+    #[test]
     fn include_defaults_writes_explicit_track_defaults() {
         let project = tempfile::tempdir().unwrap();
         let manifest = project.path().join("sample.yaml");
@@ -825,11 +1629,12 @@ mod tests {
         let yaml = fs::read_to_string(&manifest).unwrap();
         assert!(yaml.lines().any(|line| line == "  mode: 2xa"));
         assert!(yaml.lines().any(|line| line == "  start_msf: 00:02:00"));
+        assert!(yaml.lines().any(|line| line == "  trailing_gap: 150"));
+        assert!(yaml.lines().any(|line| line == "  form2_edc: true"));
         assert!(
             yaml.lines()
-                .any(|line| line == "  trailing_gap_sectors: 150")
+                .any(|line| line == "  noncompliant_trailing_ecc: false")
         );
-        assert!(yaml.lines().any(|line| line == "  form2_edc: true"));
         for empty_default in [
             "    volume_set_identifier: ''",
             "    data_preparer_identifier: ''",
@@ -866,7 +1671,8 @@ mod tests {
         ] {
             assert!(!primary_volume_yaml.contains(fixed_field));
         }
-        assert!(!yaml.contains("subheader"));
+        assert!(!yaml.contains("pvd_subheader"));
+        assert!(!yaml.contains("metadata_subheader"));
         assert!(!yaml.contains("file_end_submode"));
         assert!(!yaml.contains("raw_sector_size"));
         assert!(!yaml.lines().any(|line| line == "  root:"));
@@ -878,11 +1684,25 @@ mod tests {
             .split_once("  files:\n")
             .unwrap();
         assert!(entries_yaml.starts_with("  - path: .\n    recording_time:"));
+        assert_eq!(entries_yaml.matches("    xa:\n").count(), 5);
+        assert_eq!(entries_yaml.matches("      group_id: 0\n").count(), 5);
+        assert_eq!(entries_yaml.matches("      user_id: 0\n").count(), 5);
+        assert_eq!(entries_yaml.matches("      file_number: 0\n").count(), 5);
+        assert_eq!(
+            entries_yaml
+                .matches("      form1_subheader: null\n")
+                .count(),
+            5
+        );
+        assert_eq!(entries_yaml.matches("      form2: null\n").count(), 5);
+        assert!(
+            entries_yaml.contains("      attributes:\n      - mode2_form1\n      - directory\n")
+        );
         assert!(!entries_yaml.contains("kind:"));
         assert!(!entries_yaml.contains("data_order:"));
         assert_eq!(
             files_yaml,
-            "  - MAIN.EXE\n  - MAINRSRC.BFF\n  - SYSTEM.CNF\n  - DUMMY.BIN\n"
+            "  - path: MAIN.EXE\n  - path: MAINRSRC.BFF\n  - path: SYSTEM.CNF\n  - path: DUMMY.BIN\n"
         );
         let parsed: Manifest = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(parsed.track.mode, TrackMode::Mode2Xa);
@@ -1072,6 +1892,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_creates_missing_image_parent_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("sample.yaml");
+        extract(&reference_image(), &manifest, project.path(), false, false).unwrap();
+        let rebuilt = project.path().join("output/images/rebuilt.bin");
+
+        let report = build(&manifest, &rebuilt, project.path(), false).unwrap();
+
+        assert_eq!(report.sha1, "5b16aa056dee14eff92891c24ca7cf71d263077d");
+        assert!(rebuilt.is_file());
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_overwrite_rejects_symlink_destination() {
@@ -1136,6 +1969,73 @@ mod tests {
     }
 
     #[test]
+    fn untouched_interleaved_spyro_round_trip_is_byte_identical() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("spyro.yaml");
+        let extract_report = extract(
+            &spyro_reference_image(),
+            &manifest,
+            project.path(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(extract_report.sectors, 281_270);
+        assert_eq!(
+            extract_report.sha1,
+            "cf3ce6bedeb89dfbc40990336180f3b9b0f40d9f"
+        );
+        let yaml = fs::read_to_string(&manifest).unwrap();
+        assert!(yaml.contains("  - gap: 13\n  - path: WAD.WAD\n"));
+        assert!(yaml.contains("  - gap: 5921\n  - path: PETEXA0.STR\n"));
+        assert!(yaml.contains("form2: PETEXA0.STR.XA\n"));
+
+        let rebuilt = project.path().join("rebuilt.bin");
+        let build_report = build(&manifest, &rebuilt, project.path(), false).unwrap();
+        assert_eq!(build_report.sectors, 281_270);
+        assert_eq!(
+            build_report.sha1,
+            "cf3ce6bedeb89dfbc40990336180f3b9b0f40d9f"
+        );
+        assert!(files_are_equal(&spyro_reference_image(), &rebuilt));
+    }
+
+    #[test]
+    fn untouched_multitrack_lemmings_data_track_is_byte_identical() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("3dlemmings.yaml");
+        let extract_report = extract(
+            &lemmings_reference_image(),
+            &manifest,
+            project.path(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(extract_report.sectors, 81_711);
+        assert_eq!(
+            extract_report.sha1,
+            "f713cdcb5d0e3d875031dbdc438dbbab0cdd3340"
+        );
+        let yaml = fs::read_to_string(&manifest).unwrap();
+        assert!(yaml.contains("  noncompliant_trailing_ecc: true\n"));
+        assert!(yaml.contains("      form1_subheader:\n"));
+        assert!(yaml.contains("  - path: L3DMUS/EGYPT1.SWP\n"));
+        assert!(yaml.contains("    extent: 81861\n    length: 15140864\n"));
+        let files = yaml.split_once("  files:\n").unwrap().1;
+        assert!(!files.contains("L3DMUS/EGYPT1.SWP"));
+
+        let rebuilt = project.path().join("rebuilt.bin");
+        let build_report = build(&manifest, &rebuilt, project.path(), false).unwrap();
+        assert_eq!(build_report.sectors, 81_711);
+        assert_eq!(
+            build_report.sha1,
+            "f713cdcb5d0e3d875031dbdc438dbbab0cdd3340"
+        );
+        assert!(files_are_equal(&lemmings_reference_image(), &rebuilt));
+    }
+
+    #[test]
     fn authored_size_change_and_nested_addition_are_reextractable() {
         let project = tempfile::tempdir().unwrap();
         let manifest_path = project.path().join("project.yaml");
@@ -1160,12 +2060,21 @@ mod tests {
         manifest.iso9660.entries.push(Entry {
             path: "EXTRA".to_owned(),
             recording_time: "1900-06-16T09:45:51+09:00".to_owned(),
+            xa: None,
+            extent: None,
+            length: None,
         });
         manifest.iso9660.entries.push(Entry {
             path: "EXTRA/NEW.BIN".to_owned(),
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
+            xa: None,
+            extent: None,
+            length: None,
         });
-        manifest.iso9660.files.push("EXTRA/NEW.BIN".to_owned());
+        manifest
+            .iso9660
+            .files
+            .push(FileLayoutItem::path("EXTRA/NEW.BIN"));
         fs::write(&manifest_path, yaml_serde::to_string(&manifest).unwrap()).unwrap();
 
         let authored = project.path().join("authored.bin");
@@ -1220,7 +2129,10 @@ mod tests {
             .iso9660
             .entries
             .retain(|entry| entry.path != "DUMMY.BIN");
-        manifest.iso9660.files.retain(|path| path != "DUMMY.BIN");
+        manifest
+            .iso9660
+            .files
+            .retain(|item| item.as_path() != Some("DUMMY.BIN"));
         manifest
             .iso9660
             .entries
@@ -1228,12 +2140,16 @@ mod tests {
             .find(|entry| entry.path == "SYSTEM.CNF")
             .unwrap()
             .path = "CONFIG.CNF".to_owned();
-        *manifest
+        let renamed = manifest
             .iso9660
             .files
             .iter_mut()
-            .find(|path| path.as_str() == "SYSTEM.CNF")
-            .unwrap() = "CONFIG.CNF".to_owned();
+            .find(|item| item.as_path() == Some("SYSTEM.CNF"))
+            .unwrap();
+        let FileLayoutItem::Path(path) = renamed else {
+            unreachable!("matched path item")
+        };
+        path.path = "CONFIG.CNF".to_owned();
         fs::write(&manifest_path, yaml_serde::to_string(&manifest).unwrap()).unwrap();
 
         let authored = project.path().join("authored.bin");

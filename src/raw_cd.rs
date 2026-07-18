@@ -198,6 +198,8 @@ pub struct ParsedSector {
     pub bytes: [u8; RAW_SECTOR_SIZE],
     pub kind: Kind,
     pub subheader: XaSubheader,
+    pub form2_edc_valid: bool,
+    pub noncompliant_ecc: bool,
 }
 
 impl ParsedSector {
@@ -242,23 +244,30 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
             .with_context(|| format!("detecting sector type at sector {index}"))?;
         let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
         let subheader = XaSubheader::from(subheader_bytes);
-        let kind = match detected {
-            SectorType::Mode2Xa1 | SectorType::Mode2Xa1Gap => Kind::Form1,
-            SectorType::Mode2Xa2 | SectorType::Mode2Xa2Gap => Kind::Form2,
-            SectorType::Mode2Gap | SectorType::Mode2XaGap
-                if subheader.submode.contains(XaSubmodeFlag::Form2) =>
-            {
-                Kind::Form2
+        let noncompliant_ecc = detected == SectorType::Mode2
+            && !subheader.submode.contains(XaSubmodeFlag::Form2)
+            && recorded_header_ecc_matches(chunk);
+        let kind = if subheader.submode.contains(XaSubmodeFlag::Form2) {
+            Kind::Form2
+        } else if noncompliant_ecc {
+            Kind::XaGap
+        } else {
+            match detected {
+                SectorType::Mode2Xa1 | SectorType::Mode2Xa1Gap => Kind::Form1,
+                SectorType::Mode2Gap | SectorType::Mode2XaGap => Kind::XaGap,
+                other => bail!("unsupported or invalid sector type {other:?} at sector {index}"),
             }
-            SectorType::Mode2Gap | SectorType::Mode2XaGap => Kind::XaGap,
-            other => bail!("unsupported or invalid sector type {other:?} at sector {index}"),
         };
         let mut sector = [0_u8; RAW_SECTOR_SIZE];
         sector.copy_from_slice(chunk);
+        let form2_edc_valid = kind == Kind::Form2
+            && matches!(detected, SectorType::Mode2Xa2 | SectorType::Mode2Xa2Gap);
         sectors.push(ParsedSector {
             bytes: sector,
             kind,
             subheader,
+            form2_edc_valid,
+            noncompliant_ecc,
         });
     }
     Ok((start_frame, sectors))
@@ -318,6 +327,78 @@ impl SectorWriter {
                 Optimizations::all(),
             )
             .context("generating XA gap sector")
+    }
+
+    pub fn xa_gap_with_recorded_header_ecc(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+    ) -> Result<Vec<u8>> {
+        let mut sector = self.xa_gap(frame, subheader)?;
+        write_recorded_header_ecc(&mut sector);
+        Ok(sector)
+    }
+}
+
+fn recorded_header_ecc_matches(sector: &[u8]) -> bool {
+    if sector.len() != RAW_SECTOR_SIZE || sector[16..2076].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+    let mut generated = sector.to_vec();
+    write_recorded_header_ecc(&mut generated);
+    generated[2076..] == sector[2076..]
+}
+
+fn write_recorded_header_ecc(sector: &mut [u8]) {
+    debug_assert_eq!(sector.len(), RAW_SECTOR_SIZE);
+    let address: [u8; 4] = sector[12..16].try_into().expect("four-byte CD header");
+    let mut p = [0_u8; 172];
+    generate_ecc_pq(&address, &sector[16..2076], &mut p, 86, 24, 2, 86);
+    sector[2076..2248].copy_from_slice(&p);
+    let mut q = [0_u8; 104];
+    generate_ecc_pq(&address, &sector[16..2248], &mut q, 52, 43, 86, 88);
+    sector[2248..2352].copy_from_slice(&q);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_ecc_pq(
+    address: &[u8],
+    data: &[u8],
+    ecc: &mut [u8],
+    major_count: usize,
+    minor_count: usize,
+    major_mult: usize,
+    minor_inc: usize,
+) {
+    let mut forward = [0_u8; 256];
+    let mut backward = [0_u8; 256];
+    for index in 0..256 {
+        let next = ((index << 1) ^ if index & 0x80 != 0 { 0x11d } else { 0 }) & 0xff;
+        forward[index] = next as u8;
+        backward[index ^ next] = index as u8;
+    }
+
+    let size = major_count * minor_count;
+    for major in 0..major_count {
+        let mut index = (major >> 1) * major_mult + (major & 1);
+        let mut ecc_a = 0_u8;
+        let mut ecc_b = 0_u8;
+        for _ in 0..minor_count {
+            let value = if index < 4 {
+                address[index]
+            } else {
+                data[index - 4]
+            };
+            index += minor_inc;
+            if index >= size {
+                index -= size;
+            }
+            ecc_b ^= value;
+            ecc_a = forward[usize::from(ecc_a ^ value)];
+        }
+        ecc_a = backward[usize::from(forward[usize::from(ecc_a)] ^ ecc_b)];
+        ecc[major] = ecc_a;
+        ecc[major + major_count] = ecc_a ^ ecc_b;
     }
 }
 
@@ -450,6 +531,8 @@ mod tests {
             .form2(162, [0, 0, 0x20, 0].into(), &[0; 2324], true)
             .unwrap();
         assert_eq!(&sector[2348..2352], &[0x3f, 0x13, 0xb0, 0xbe]);
+        let (_, parsed) = parse_image(&sector).unwrap();
+        assert!(parsed[0].form2_edc_valid);
     }
 
     #[test]
@@ -458,6 +541,7 @@ mod tests {
         let raw = writer.xa_gap(150, XaSubheader::default()).unwrap();
         let (_, parsed) = parse_image(&raw).unwrap();
         assert_eq!(parsed[0].kind, Kind::XaGap);
+        assert!(!parsed[0].noncompliant_ecc);
     }
 
     #[test]
@@ -468,5 +552,52 @@ mod tests {
             .unwrap();
         let (_, parsed) = parse_image(&raw).unwrap();
         assert_eq!(parsed[0].kind, Kind::Form2);
+        assert!(!parsed[0].form2_edc_valid);
+    }
+
+    #[test]
+    fn zero_edc_nonzero_form2_payload_is_classified_from_the_form_bit() {
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin");
+        let mut image = File::open(path).unwrap();
+        image
+            .seek(SeekFrom::Start((964 * RAW_SECTOR_SIZE) as u64))
+            .unwrap();
+        let mut raw = [0_u8; RAW_SECTOR_SIZE];
+        image.read_exact(&mut raw).unwrap();
+
+        let (_, sectors) = parse_image(&raw).unwrap();
+        assert_eq!(sectors[0].kind, Kind::Form2);
+        assert!(!sectors[0].form2_edc_valid);
+        assert_eq!(&sectors[0].bytes[2348..2352], &[0; 4]);
+        assert!(sectors[0].payload().iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn final_xa_gap_accepts_ecc_calculated_with_the_recorded_header() {
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin");
+        let mut image = File::open(path).unwrap();
+        let final_sector = image.metadata().unwrap().len() / RAW_SECTOR_SIZE as u64 - 1;
+        image
+            .seek(SeekFrom::Start(final_sector * RAW_SECTOR_SIZE as u64))
+            .unwrap();
+        let mut raw = [0_u8; RAW_SECTOR_SIZE];
+        image.read_exact(&mut raw).unwrap();
+
+        let (frame, sectors) = parse_image(&raw).unwrap();
+        assert_eq!(sectors[0].kind, Kind::XaGap);
+        assert!(sectors[0].noncompliant_ecc);
+
+        let generated = SectorWriter::new()
+            .xa_gap_with_recorded_header_ecc(frame, XaSubheader::default())
+            .unwrap();
+        assert_eq!(generated, raw);
     }
 }
