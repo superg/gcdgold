@@ -1,0 +1,24 @@
+[package]
+name = "gcdgold"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+ecmlib = "1.0"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+sha1 = "0.11"
+yaml_serde = "0.10"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+
