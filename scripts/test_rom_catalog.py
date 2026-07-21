@@ -485,7 +485,7 @@ def process_catalog(configuration: Configuration) -> int:
     failed = 0
 
     with temporary_output.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.writer(output, lineterminator="\n")
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
         for position, image in enumerate(images, start=1):
             data_path = relative_image_path(image, configuration.roms)
             started = time.monotonic()

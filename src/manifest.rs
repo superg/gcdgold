@@ -5,6 +5,8 @@ use anyhow::Context;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::raw_cd::XaSubheader;
+
 pub const SYSTEM_AREA_SECTORS: usize = 16;
 pub const DEFAULT_XA_PERMISSIONS: u16 = 0x0555;
 
@@ -81,6 +83,7 @@ struct TrackWithDefaults<'a> {
 struct Iso9660WithDefaults<'a> {
     primary_volume: PrimaryVolumeWithDefaults<'a>,
     metadata_subheader: IsoMetadataSubheader,
+    path_table_subheader: EntrySectorSubheader,
     entries: Vec<EntryWithDefaults<'a>>,
     files: &'a [FileLayoutItem],
 }
@@ -108,12 +111,14 @@ struct EntryXaWithDefaults<'a> {
     form1: Option<&'a str>,
     form2: Option<&'a str>,
     index: Option<&'a str>,
+    gap_index: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct PrimaryVolumeWithDefaults<'a> {
     volume_space_size: Option<u32>,
     application_use: PrimaryVolumeApplicationUse,
+    root_directory_identifier: RootDirectoryIdentifier,
     system_identifier: &'a str,
     volume_identifier: &'a str,
     volume_set_identifier: &'a str,
@@ -169,6 +174,7 @@ pub(crate) fn serialize_manifest(
                         form1: xa.and_then(|value| value.form1.as_deref()),
                         form2: xa.and_then(|value| value.form2.as_deref()),
                         index: xa.and_then(|value| value.index.as_deref()),
+                        gap_index: xa.and_then(|value| value.gap_index.as_deref()),
                     },
                     extent: entry.extent,
                     length: entry.length,
@@ -188,6 +194,10 @@ pub(crate) fn serialize_manifest(
                 primary_volume: PrimaryVolumeWithDefaults {
                     volume_space_size: manifest.iso9660.primary_volume.volume_space_size,
                     application_use: manifest.iso9660.primary_volume.application_use,
+                    root_directory_identifier: manifest
+                        .iso9660
+                        .primary_volume
+                        .root_directory_identifier,
                     system_identifier: &manifest.iso9660.primary_volume.system_identifier,
                     volume_identifier: &manifest.iso9660.primary_volume.volume_identifier,
                     volume_set_identifier: &manifest.iso9660.primary_volume.volume_set_identifier,
@@ -215,6 +225,7 @@ pub(crate) fn serialize_manifest(
                     effective_time: manifest.iso9660.primary_volume.effective_time.as_deref(),
                 },
                 metadata_subheader: manifest.iso9660.metadata_subheader,
+                path_table_subheader: manifest.iso9660.path_table_subheader,
                 entries,
                 files: &manifest.iso9660.files,
             },
@@ -389,6 +400,8 @@ pub struct Iso9660 {
     pub primary_volume: PrimaryVolume,
     #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
     pub metadata_subheader: IsoMetadataSubheader,
+    #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
+    pub path_table_subheader: EntrySectorSubheader,
     pub entries: Vec<Entry>,
     pub files: Vec<FileLayoutItem>,
 }
@@ -433,6 +446,8 @@ pub struct FileGapItem {
     pub gap: u32,
     #[serde(default, skip_serializing_if = "GapKind::is_default")]
     pub kind: GapKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subheader: Option<XaSubheader>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -440,6 +455,7 @@ pub struct FileGapItem {
 pub enum GapKind {
     #[default]
     Form2,
+    Form1,
     Xa,
 }
 
@@ -464,6 +480,15 @@ impl FileLayoutItem {
         Self::Gap(FileGapItem {
             gap: sectors,
             kind: GapKind::Form2,
+            subheader: None,
+        })
+    }
+
+    pub const fn form1_gap(sectors: u32, subheader: XaSubheader) -> Self {
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::Form1,
+            subheader: Some(subheader),
         })
     }
 
@@ -471,6 +496,7 @@ impl FileLayoutItem {
         Self::Gap(FileGapItem {
             gap: sectors,
             kind: GapKind::Xa,
+            subheader: None,
         })
     }
 
@@ -501,6 +527,13 @@ impl FileLayoutItem {
             Self::Gap(item) => Some(item.kind),
         }
     }
+
+    pub const fn gap_subheader(&self) -> Option<XaSubheader> {
+        match self {
+            Self::Path(_) | Self::Directory(_) => None,
+            Self::Gap(item) => item.subheader,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +546,8 @@ pub struct PrimaryVolume {
         skip_serializing_if = "PrimaryVolumeApplicationUse::is_default"
     )]
     pub application_use: PrimaryVolumeApplicationUse,
+    #[serde(default, skip_serializing_if = "RootDirectoryIdentifier::is_default")]
+    pub root_directory_identifier: RootDirectoryIdentifier,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub system_identifier: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -539,6 +574,20 @@ pub struct PrimaryVolume {
     pub expiration_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootDirectoryIdentifier {
+    #[default]
+    Current,
+    Parent,
+}
+
+impl RootDirectoryIdentifier {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Current)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +627,7 @@ pub enum EntrySectorSubheader {
     #[default]
     Canonical,
     Data,
+    EndOfFileData,
     DataUntilFinal,
 }
 
@@ -606,6 +656,8 @@ pub struct EntryXa {
     pub form2: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_index: Option<String>,
 }
 
 impl Default for EntryXa {
@@ -619,6 +671,7 @@ impl Default for EntryXa {
             form1: None,
             form2: None,
             index: None,
+            gap_index: None,
         }
     }
 }
@@ -634,6 +687,7 @@ struct EntryXaFields {
     form1: Option<String>,
     form2: Option<String>,
     index: Option<String>,
+    gap_index: Option<String>,
 }
 
 impl Default for EntryXaFields {
@@ -647,6 +701,7 @@ impl Default for EntryXaFields {
             form1: None,
             form2: None,
             index: None,
+            gap_index: None,
         }
     }
 }
@@ -665,6 +720,11 @@ impl<'de> Deserialize<'de> for EntryXa {
                 "interleaved XA metadata requires form1, form2, and index together",
             ));
         }
+        if fields.gap_index.is_some() && asset_count != 3 {
+            return Err(de::Error::custom(
+                "XA gap index requires form1, form2, and index assets",
+            ));
+        }
         Ok(Self {
             group_id: fields.group_id,
             user_id: fields.user_id,
@@ -674,6 +734,7 @@ impl<'de> Deserialize<'de> for EntryXa {
             form1: fields.form1,
             form2: fields.form2,
             index: fields.index,
+            gap_index: fields.gap_index,
         })
     }
 }

@@ -88,6 +88,14 @@ struct XaSidecarRecord {
 enum XaExtentSector {
     Form1(Box<XaForm1Sector>),
     Form2(Box<XaSidecarRecord>),
+    XaGap,
+}
+
+struct XaSidecarAssets {
+    form1: Vec<u8>,
+    form2: Vec<u8>,
+    form2_index: Vec<u8>,
+    gap_index: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +188,17 @@ fn encode_xa_index(indices: &[u32]) -> Vec<u8> {
 }
 
 fn parse_xa_index(bytes: &[u8]) -> Result<Vec<u32>> {
+    parse_xa_positions(bytes, "XAI")
+}
+
+fn parse_xa_gap_index(bytes: &[u8]) -> Result<Vec<u32>> {
+    parse_xa_positions(bytes, "XAG")
+}
+
+fn parse_xa_positions(bytes: &[u8], label: &str) -> Result<Vec<u32>> {
     ensure!(
         bytes.len().is_multiple_of(XA_INDEX_RECORD_SIZE),
-        "XAI asset size must be a multiple of {XA_INDEX_RECORD_SIZE} bytes"
+        "{label} asset size must be a multiple of {XA_INDEX_RECORD_SIZE} bytes"
     );
     let indices = bytes
         .chunks_exact(XA_INDEX_RECORD_SIZE)
@@ -190,32 +206,57 @@ fn parse_xa_index(bytes: &[u8]) -> Result<Vec<u32>> {
         .collect::<Result<Vec<_>>>()?;
     ensure!(
         indices.windows(2).all(|pair| pair[0] < pair[1]),
-        "XAI sector indices must be strictly increasing"
+        "{label} sector indices must be strictly increasing"
     );
     Ok(indices)
 }
 
-fn multiplex_xa_extent(form1: &[u8], form2: &[u8], index: &[u8]) -> Result<Vec<XaExtentSector>> {
+fn multiplex_xa_extent(
+    form1: &[u8],
+    form2: &[u8],
+    index: &[u8],
+    gap_index: &[u8],
+) -> Result<Vec<XaExtentSector>> {
     let form1 = parse_xa_form1_records(form1)?;
     let form2 = parse_xa_form2_records(form2)?;
     let indices = parse_xa_index(index)?;
+    let gap_indices = parse_xa_gap_index(gap_index)?;
     ensure!(
         indices.len() == form2.len(),
         "XAI record count does not match XA2 record count"
     );
-    let sector_count = form1.len() + form2.len();
+    let sector_count = form1.len() + form2.len() + gap_indices.len();
     ensure!(
         indices
             .last()
             .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
         "XAI sector index is outside the interleaved extent"
     );
+    ensure!(
+        gap_indices
+            .last()
+            .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
+        "XAG sector index is outside the interleaved extent"
+    );
+    ensure!(
+        indices
+            .iter()
+            .all(|index| gap_indices.binary_search(index).is_err()),
+        "XAI and XAG sector indices overlap"
+    );
     let mut result = Vec::with_capacity(sector_count);
     let mut form1 = form1.into_iter();
     let mut form2 = form2.into_iter();
     let mut indices = indices.into_iter().peekable();
+    let mut gap_indices = gap_indices.into_iter().peekable();
     for sector_index in 0..sector_count {
-        if indices
+        if gap_indices
+            .peek()
+            .is_some_and(|index| usize::try_from(*index) == Ok(sector_index))
+        {
+            gap_indices.next();
+            result.push(XaExtentSector::XaGap);
+        } else if indices
             .peek()
             .is_some_and(|index| usize::try_from(*index) == Ok(sector_index))
         {
@@ -232,6 +273,10 @@ fn multiplex_xa_extent(form1: &[u8], form2: &[u8], index: &[u8]) -> Result<Vec<X
         }
     }
     ensure!(indices.next().is_none(), "XAI position was not consumed");
+    ensure!(
+        gap_indices.next().is_none(),
+        "XAG position was not consumed"
+    );
     ensure!(form1.next().is_none(), "XA1 record was not consumed");
     ensure!(form2.next().is_none(), "XA2 record was not consumed");
     Ok(result)
@@ -240,10 +285,11 @@ fn multiplex_xa_extent(form1: &[u8], form2: &[u8], index: &[u8]) -> Result<Vec<X
 fn demultiplex_xa_extent(
     sectors: &[crate::raw_cd::ParsedSector],
     form2_edc: bool,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+) -> Result<XaSidecarAssets> {
     let mut form1 = Vec::new();
     let mut form2 = Vec::new();
     let mut indices = Vec::new();
+    let mut gap_indices = Vec::new();
     for (index, sector) in sectors.iter().enumerate() {
         match sector.kind {
             Kind::Form1 => {
@@ -257,11 +303,20 @@ fn demultiplex_xa_extent(
                 form2.extend_from_slice(&encode_xa_form2_record(sector)?);
                 indices.push(u32::try_from(index)?);
             }
-            Kind::XaGap => anyhow::bail!("XA gap inside interleaved extent at sector {index}"),
+            Kind::XaGap => {
+                ensure!(
+                    sector.subheader == XaSubheader::default()
+                        && sector.subheader_copy == XaSubheader::default()
+                        && !sector.noncompliant_ecc,
+                    "noncanonical XA gap inside interleaved extent at sector {index}"
+                );
+                gap_indices.push(u32::try_from(index)?);
+            }
         }
     }
     let index = encode_xa_index(&indices);
-    let reconstructed = multiplex_xa_extent(&form1, &form2, &index)?;
+    let gap_index = encode_xa_index(&gap_indices);
+    let reconstructed = multiplex_xa_extent(&form1, &form2, &index, &gap_index)?;
     ensure!(
         reconstructed.len() == sectors.len(),
         "indexed XA assets do not reproduce the source extent length"
@@ -280,10 +335,16 @@ fn demultiplex_xa_extent(
                     && source.payload() == form2.payload,
                 "mixed XA Form 2 framing differs at sector {index}"
             ),
+            (Kind::XaGap, XaExtentSector::XaGap) => {}
             _ => anyhow::bail!("mixed XA sector order differs at sector {index}"),
         }
     }
-    Ok((form1, form2, index))
+    Ok(XaSidecarAssets {
+        form1,
+        form2,
+        form2_index: index,
+        gap_index,
+    })
 }
 
 fn sector_follows_form2_edc_policy(sector: &crate::raw_cd::ParsedSector, computed: bool) -> bool {
@@ -295,14 +356,84 @@ fn sector_follows_form2_edc_policy(sector: &crate::raw_cd::ParsedSector, compute
 }
 
 fn entry_uses_xa_sidecar(entry: &crate::manifest::Entry) -> bool {
-    entry
-        .xa
-        .as_ref()
-        .and_then(|xa| xa.attributes)
-        .is_some_and(|attributes| {
-            attributes.contains(XaAttributeFlag::Interleaved)
-                || attributes.contains(XaAttributeFlag::Mode2Form2)
-        })
+    entry.xa.as_ref().is_some_and(|xa| xa.form1.is_some())
+        || entry
+            .xa
+            .as_ref()
+            .and_then(|xa| xa.attributes)
+            .is_some_and(|attributes| {
+                attributes.contains(XaAttributeFlag::Interleaved)
+                    || attributes.contains(XaAttributeFlag::Mode2Form2)
+            })
+}
+
+fn entry_file_subheader(entry: &crate::manifest::Entry, mut subheader: XaSubheader) -> XaSubheader {
+    subheader.file_number = entry.xa.as_ref().map_or(0, |xa| xa.file_number);
+    subheader
+}
+
+fn prepare_xa_sidecars(
+    sectors: &[crate::raw_cd::ParsedSector],
+    parsed_iso: &mut iso9660::ParsedIso,
+) -> Result<()> {
+    let iso_paths = parsed_iso
+        .manifest
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let mut sidecar_paths = HashSet::new();
+    for file in &parsed_iso.files {
+        let start = usize::try_from(file.extent)?;
+        let count = usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+        ensure!(
+            start + count <= sectors.len(),
+            "file extent is outside ISO content"
+        );
+        let entry_index = parsed_iso
+            .manifest
+            .entries
+            .iter()
+            .position(|entry| entry.path == file.path)
+            .context("parsed file has no manifest entry")?;
+        let observed_mixed = sectors[start..start + count]
+            .iter()
+            .any(|sector| sector.kind != Kind::Form1);
+        if !observed_mixed && !entry_uses_xa_sidecar(&parsed_iso.manifest.entries[entry_index]) {
+            continue;
+        }
+        ensure!(
+            usize::try_from(file.length)?.is_multiple_of(LOGICAL_BLOCK_SIZE),
+            "mixed XA extent length is not sector aligned for {}",
+            file.path
+        );
+
+        let form1 = format!("{}.XA1", file.path);
+        let form2 = format!("{}.XA2", file.path);
+        let index = format!("{}.XAI", file.path);
+        let gap_index = sectors[start..start + count]
+            .iter()
+            .any(|sector| sector.kind == Kind::XaGap)
+            .then(|| format!("{}.XAG", file.path));
+        for path in [&form1, &form2, &index].into_iter().chain(gap_index.iter()) {
+            ensure!(
+                !iso_paths.contains(path.as_str()),
+                "XA asset path collides with ISO entry {path}"
+            );
+            ensure!(
+                sidecar_paths.insert(path.clone()),
+                "duplicate XA asset path {path}"
+            );
+        }
+        let xa = parsed_iso.manifest.entries[entry_index]
+            .xa
+            .get_or_insert_with(crate::manifest::EntryXa::default);
+        xa.form1 = Some(form1);
+        xa.form2 = Some(form2);
+        xa.index = Some(index);
+        xa.gap_index = gap_index;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -341,6 +472,52 @@ impl<'a> SourcePlacement<'a> {
     }
 }
 
+fn detect_gap_item(
+    sectors: &[crate::raw_cd::ParsedSector],
+    form2_edc: bool,
+) -> Result<Option<FileLayoutItem>> {
+    if sectors.is_empty() {
+        return Ok(None);
+    }
+    if sectors.iter().all(|sector| {
+        sector.kind == Kind::Form2
+            && sector.subheader == FORM2_SUBHEADER
+            && sector.subheader_copy == FORM2_SUBHEADER
+            && sector.payload().iter().all(|byte| *byte == 0)
+    }) {
+        ensure!(
+            sectors
+                .iter()
+                .all(|sector| sector_follows_form2_edc_policy(sector, form2_edc)),
+            "physical gap does not follow track Form 2 EDC policy"
+        );
+        return Ok(Some(FileLayoutItem::gap(u32::try_from(sectors.len())?)));
+    }
+
+    let subheader = sectors[0].subheader;
+    if sectors
+        .iter()
+        .all(|sector| is_structured_form1_gap_sector(sector) && sector.subheader == subheader)
+    {
+        return Ok(Some(FileLayoutItem::form1_gap(
+            u32::try_from(sectors.len())?,
+            subheader,
+        )));
+    }
+
+    Ok(None)
+}
+
+fn is_structured_form1_gap_sector(sector: &crate::raw_cd::ParsedSector) -> bool {
+    sector.kind == Kind::Form1
+        && sector.subheader == sector.subheader_copy
+        && sector.subheader.channel == 0
+        && sector.subheader.coding_info == 0
+        && sector.subheader.submode == XaSubmode::END_OF_FILE
+        && !sector.noncompliant_ecc
+        && sector.payload().iter().all(|byte| *byte == 0)
+}
+
 fn detect_file_layout(
     sectors: &[crate::raw_cd::ParsedSector],
     files: &[iso9660::ParsedFile],
@@ -376,58 +553,28 @@ fn detect_file_layout(
             "overlapping physical placement for {}",
             placement.path()
         );
-        let mut start = extent;
-        while start > previous_end {
-            let sector = &sectors[start - 1];
-            if sector.kind != Kind::Form2
-                || sector.subheader != FORM2_SUBHEADER
-                || sector.payload().iter().any(|byte| *byte != 0)
-            {
-                break;
-            }
-            ensure!(
-                sector_follows_form2_edc_policy(sector, form2_edc),
-                "physical gap before {} does not follow track Form 2 EDC policy",
-                placement.path()
-            );
-            start -= 1;
-        }
         ensure!(
-            start == previous_end,
-            "unsupported unallocated sectors before {}",
-            placement.path()
+            extent <= sectors.len(),
+            "physical placement is outside image"
         );
-        if start < extent {
-            layout.push(FileLayoutItem::gap(u32::try_from(extent - start)?));
+        if extent > previous_end {
+            let gap =
+                detect_gap_item(&sectors[previous_end..extent], form2_edc)?.with_context(|| {
+                    format!(
+                        "unsupported unallocated sectors before {}",
+                        placement.path()
+                    )
+                })?;
+            layout.push(gap);
         }
         layout.push(placement.manifest_item());
         previous_end = extent + usize::try_from(placement.length())?.div_ceil(LOGICAL_BLOCK_SIZE);
     }
-    let mut gap_start = sectors.len();
-    while gap_start > previous_end {
-        let sector = &sectors[gap_start - 1];
-        if sector.kind != Kind::Form2
-            || sector.subheader != FORM2_SUBHEADER
-            || sector.subheader_copy != FORM2_SUBHEADER
-            || sector.payload().iter().any(|byte| *byte != 0)
-        {
-            break;
-        }
-        ensure!(
-            sector_follows_form2_edc_policy(sector, form2_edc),
-            "terminal physical gap does not follow track Form 2 EDC policy"
-        );
-        gap_start -= 1;
+    if previous_end < sectors.len() {
+        let gap = detect_gap_item(&sectors[previous_end..], form2_edc)?
+            .context("unsupported unallocated sectors at the end of ISO content")?;
+        layout.push(gap);
     }
-    if gap_start < sectors.len() {
-        layout.push(FileLayoutItem::gap(u32::try_from(
-            sectors.len() - gap_start,
-        )?));
-    }
-    ensure!(
-        gap_start == previous_end,
-        "unsupported unallocated sectors at the end of ISO content"
-    );
     Ok(layout)
 }
 
@@ -491,6 +638,8 @@ pub fn extract_with_options(
     {
         parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::Data;
     }
+    detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso)?;
+    prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso)?;
     detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso)?;
     validate_iso_subheaders(&sectors, &parsed_iso, trailing_gap)?;
     parsed_iso.manifest.files = detect_file_layout(
@@ -510,7 +659,7 @@ pub fn extract_with_options(
         let entry_index = parsed_iso
             .manifest
             .entries
-            .iter_mut()
+            .iter()
             .position(|entry| entry.path == file.path)
             .context("parsed file has no manifest entry")?;
         if entry_uses_xa_sidecar(&parsed_iso.manifest.entries[entry_index]) {
@@ -525,32 +674,27 @@ pub fn extract_with_options(
                 start + count <= sectors.len(),
                 "interleaved extent is outside image"
             );
-            let (form1, form2, index) =
-                demultiplex_xa_extent(&sectors[start..start + count], form2_edc)
-                    .with_context(|| format!("demultiplexing {}", file.path))?;
-            let form1_path = format!("{}.XA1", file.path);
-            let form2_path = format!("{}.XA2", file.path);
-            let index_path = format!("{}.XAI", file.path);
-            for asset in [&form1_path, &form2_path, &index_path] {
-                ensure!(
-                    parsed_iso
-                        .manifest
-                        .entries
-                        .iter()
-                        .all(|candidate| candidate.path != *asset),
-                    "XA asset path collides with ISO entry {asset}"
-                );
-            }
+            let assets = demultiplex_xa_extent(&sectors[start..start + count], form2_edc)
+                .with_context(|| format!("demultiplexing {}", file.path))?;
             let xa = parsed_iso.manifest.entries[entry_index]
                 .xa
-                .as_mut()
+                .as_ref()
                 .expect("checked XA metadata");
-            xa.form1 = Some(form1_path.clone());
-            xa.form2 = Some(form2_path.clone());
-            xa.index = Some(index_path.clone());
-            extracted_files.insert(form1_path, form1);
-            extracted_files.insert(form2_path, form2);
-            extracted_files.insert(index_path, index);
+            extracted_files.insert(xa.form1.clone().expect("prepared XA1 path"), assets.form1);
+            extracted_files.insert(xa.form2.clone().expect("prepared XA2 path"), assets.form2);
+            extracted_files.insert(
+                xa.index.clone().expect("prepared XAI path"),
+                assets.form2_index,
+            );
+            if let Some(path) = &xa.gap_index {
+                ensure!(!assets.gap_index.is_empty(), "prepared XAG asset is empty");
+                extracted_files.insert(path.clone(), assets.gap_index);
+            } else {
+                ensure!(
+                    assets.gap_index.is_empty(),
+                    "missing prepared XAG asset path"
+                );
+            }
         } else {
             let data = read_extent(&blocks, file.extent, file.length)?;
             extracted_files.insert(file.path.clone(), data);
@@ -738,6 +882,53 @@ fn extract_system_area(
     Ok((content, form2_start, computed, final_form1_subheader))
 }
 
+fn path_table_subheader(
+    policy: EntrySectorSubheader,
+    block_index: u32,
+    blocks: u32,
+) -> XaSubheader {
+    match policy {
+        EntrySectorSubheader::Canonical | EntrySectorSubheader::EndOfFileData => {
+            ISO_METADATA_SUBHEADER
+        }
+        EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
+        EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => FORM1_DATA_SUBHEADER,
+        EntrySectorSubheader::DataUntilFinal => ISO_METADATA_SUBHEADER,
+    }
+}
+
+fn detect_path_table_subheader(
+    sectors: &[crate::raw_cd::ParsedSector],
+    parsed_iso: &mut iso9660::ParsedIso,
+) -> Result<()> {
+    let Some(path_tables) = &parsed_iso.path_tables else {
+        return Ok(());
+    };
+    for policy in [
+        EntrySectorSubheader::Canonical,
+        EntrySectorSubheader::Data,
+        EntrySectorSubheader::DataUntilFinal,
+    ] {
+        let matches = path_tables.extents.iter().all(|extent| {
+            (0..path_tables.blocks).all(|block_index| {
+                let Ok(lba) = usize::try_from(*extent + block_index) else {
+                    return false;
+                };
+                let Some(sector) = sectors.get(lba) else {
+                    return false;
+                };
+                let expected = path_table_subheader(policy, block_index, path_tables.blocks);
+                sector.subheader == expected && sector.subheader_copy == expected
+            })
+        });
+        if matches {
+            parsed_iso.manifest.path_table_subheader = policy;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("path-table sectors use an unsupported XA subheader policy")
+}
+
 fn detect_entry_sector_subheaders(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
@@ -759,9 +950,14 @@ fn detect_entry_sector_subheaders(
         let final_lba = usize::try_from(file.extent)? + blocks - 1;
         ensure!(final_lba < sectors.len(), "file extent is outside image");
         let sector = &sectors[final_lba];
-        if sector.subheader == FORM1_DATA_SUBHEADER && sector.subheader_copy == FORM1_DATA_SUBHEADER
-        {
+        let data_subheader = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
+        let end_of_file_subheader = entry_file_subheader(entry, SYSTEM_END_OF_FILE_SUBHEADER);
+        if sector.subheader == data_subheader && sector.subheader_copy == data_subheader {
             entry.sector_subheader = EntrySectorSubheader::Data;
+        } else if sector.subheader == end_of_file_subheader
+            && sector.subheader_copy == end_of_file_subheader
+        {
+            entry.sector_subheader = EntrySectorSubheader::EndOfFileData;
         }
     }
     for directory in &parsed_iso.directories {
@@ -778,18 +974,18 @@ fn detect_entry_sector_subheaders(
             "directory extent is outside image"
         );
         let directory_sectors = &sectors[start..start + blocks];
+        let data_subheader = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
+        let metadata_subheader = entry_file_subheader(entry, ISO_METADATA_SUBHEADER);
         if directory_sectors.iter().all(|sector| {
-            sector.subheader == FORM1_DATA_SUBHEADER
-                && sector.subheader_copy == FORM1_DATA_SUBHEADER
+            sector.subheader == data_subheader && sector.subheader_copy == data_subheader
         }) {
             entry.sector_subheader = EntrySectorSubheader::Data;
         } else if blocks > 1
             && directory_sectors[..blocks - 1].iter().all(|sector| {
-                sector.subheader == FORM1_DATA_SUBHEADER
-                    && sector.subheader_copy == FORM1_DATA_SUBHEADER
+                sector.subheader == data_subheader && sector.subheader_copy == data_subheader
             })
-            && directory_sectors[blocks - 1].subheader == ISO_METADATA_SUBHEADER
-            && directory_sectors[blocks - 1].subheader_copy == ISO_METADATA_SUBHEADER
+            && directory_sectors[blocks - 1].subheader == metadata_subheader
+            && directory_sectors[blocks - 1].subheader_copy == metadata_subheader
         {
             entry.sector_subheader = EntrySectorSubheader::DataUntilFinal;
         }
@@ -827,6 +1023,7 @@ fn validate_iso_subheaders(
                             block_index + 1 == blocks,
                             interleaved,
                             entry.sector_subheader,
+                            entry.xa.as_ref().map_or(0, |xa| xa.file_number),
                         ),
                     )
                     .is_none(),
@@ -852,28 +1049,56 @@ fn validate_iso_subheaders(
             );
             ensure!(
                 directory_sector_info
-                    .insert(
-                        lba,
-                        match entry.sector_subheader {
+                    .insert(lba, {
+                        let subheader = match entry.sector_subheader {
                             EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
                             EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => {
                                 FORM1_DATA_SUBHEADER
                             }
                             EntrySectorSubheader::Canonical
+                            | EntrySectorSubheader::EndOfFileData
                             | EntrySectorSubheader::DataUntilFinal => ISO_METADATA_SUBHEADER,
-                        },
-                    )
+                        };
+                        entry_file_subheader(entry, subheader)
+                    })
                     .is_none(),
                 "overlapping directory extents at LBA {lba}"
             );
         }
     }
 
+    let mut path_table_sector_info = HashMap::new();
+    if let Some(path_tables) = &parsed_iso.path_tables {
+        for extent in path_tables.extents {
+            for block_index in 0..path_tables.blocks {
+                let lba = usize::try_from(extent + block_index)?;
+                ensure!(
+                    path_table_sector_info
+                        .insert(
+                            lba,
+                            path_table_subheader(
+                                parsed_iso.manifest.path_table_subheader,
+                                block_index,
+                                path_tables.blocks,
+                            ),
+                        )
+                        .is_none(),
+                    "overlapping path-table extents at LBA {lba}"
+                );
+            }
+        }
+    }
+
     for (lba, sector) in sectors.iter().enumerate().take(content_end).skip(16) {
-        let context = if file_sector_info.contains_key(&lba) {
+        let is_file_sector = file_sector_info.contains_key(&lba);
+        let is_directory_sector = directory_sector_info.contains_key(&lba);
+        let is_path_table_sector = path_table_sector_info.contains_key(&lba);
+        let context = if is_file_sector {
             "file"
-        } else if directory_sector_info.contains_key(&lba) {
+        } else if is_directory_sector {
             "directory"
+        } else if is_path_table_sector {
+            "path-table"
         } else {
             "metadata"
         };
@@ -882,16 +1107,29 @@ fn validate_iso_subheaders(
                 IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
             }
-        } else if let Some((is_last, interleaved, policy)) = file_sector_info.get(&lba) {
+        } else if let Some((is_last, interleaved, policy, file_number)) = file_sector_info.get(&lba)
+        {
             if *interleaved {
                 continue;
             }
-            if *is_last && *policy != EntrySectorSubheader::Data {
-                ISO_METADATA_SUBHEADER
+            let subheader = if *is_last {
+                match policy {
+                    EntrySectorSubheader::Canonical | EntrySectorSubheader::DataUntilFinal => {
+                        ISO_METADATA_SUBHEADER
+                    }
+                    EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
+                    EntrySectorSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
+                }
             } else {
                 FORM1_DATA_SUBHEADER
+            };
+            XaSubheader {
+                file_number: *file_number,
+                ..subheader
             }
         } else if let Some(subheader) = directory_sector_info.get(&lba) {
+            *subheader
+        } else if let Some(subheader) = path_table_sector_info.get(&lba) {
             *subheader
         } else {
             match parsed_iso.manifest.metadata_subheader {
@@ -904,6 +1142,9 @@ fn validate_iso_subheaders(
             && sector.subheader_copy == FORM2_SUBHEADER
             && sector.payload().iter().all(|byte| *byte == 0)
         {
+            continue;
+        }
+        if !is_file_sector && !is_directory_sector && is_structured_form1_gap_sector(sector) {
             continue;
         }
         ensure!(
@@ -1041,7 +1282,25 @@ pub fn build(
                     })?,
                 );
             }
-            let sectors = multiplex_xa_extent(&assets[0], &assets[1], &assets[2])
+            let gap_index = if let Some(asset) = xa.gap_index.as_deref() {
+                ensure!(
+                    secondary_paths.insert(asset),
+                    "duplicate XA secondary asset path {asset}"
+                );
+                ensure!(
+                    !iso_paths.contains(asset)
+                        && asset != manifest.system_area.path
+                        && manifest.track.ppf.as_deref() != Some(asset),
+                    "XA secondary asset path collides with another authored asset: {asset}"
+                );
+                let host_path = safe_join(data_dir, asset)?;
+                validate_input_file(&host_path, "XAG")?;
+                fs::read(&host_path)
+                    .with_context(|| format!("reading XAG asset {}", host_path.display()))?
+            } else {
+                Vec::new()
+            };
+            let sectors = multiplex_xa_extent(&assets[0], &assets[1], &assets[2], &gap_index)
                 .with_context(|| format!("multiplexing {file}"))?;
             file_lengths.insert(
                 file.to_owned(),
@@ -1133,12 +1392,26 @@ pub fn build(
             .iter()
             .any(|gap| lba >= gap.start && lba < gap.start + gap.sectors)
         {
-            raw.extend_from_slice(&writer.form2(
-                start_frame + lba,
-                FORM2_SUBHEADER,
-                &[0; FORM2_PAYLOAD_SIZE],
-                manifest.track.form2_edc,
-            )?);
+            let gap = layout
+                .gaps
+                .iter()
+                .find(|gap| lba >= gap.start && lba < gap.start + gap.sectors)
+                .expect("matched gap placement");
+            let sector = match gap.kind {
+                crate::manifest::GapKind::Form1 => writer.form1(
+                    start_frame + lba,
+                    gap.subheader.expect("validated Form 1 gap subheader"),
+                    &[0; LOGICAL_BLOCK_SIZE],
+                )?,
+                crate::manifest::GapKind::Form2 => writer.form2(
+                    start_frame + lba,
+                    FORM2_SUBHEADER,
+                    &[0; FORM2_PAYLOAD_SIZE],
+                    manifest.track.form2_edc,
+                )?,
+                crate::manifest::GapKind::Xa => unreachable!("XA gaps are always trailing"),
+            };
+            raw.extend_from_slice(&sector);
             continue;
         }
         if let Some((path, block_index, _)) = file_sector_info.get(&lba)
@@ -1162,16 +1435,20 @@ pub fn build(
                         manifest.track.form2_edc,
                     )?)
                 }
+                XaExtentSector::XaGap => raw
+                    .extend_from_slice(&writer.xa_gap(start_frame + lba, XaSubheader::default())?),
             }
             continue;
         }
-        let subheader = if lba == 16 {
+        let mut subheader = if lba == 16 {
             match manifest.iso9660.metadata_subheader {
                 IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
             }
         } else if layout.data_subheader_sectors.contains(&lba) {
             FORM1_DATA_SUBHEADER
+        } else if layout.end_of_file_data_subheader_sectors.contains(&lba) {
+            SYSTEM_END_OF_FILE_SUBHEADER
         } else if layout.metadata_subheader_sectors.contains(&lba) {
             ISO_METADATA_SUBHEADER
         } else if let Some((_, _, is_last)) = file_sector_info.get(&lba) {
@@ -1186,6 +1463,9 @@ pub fn build(
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
             }
         };
+        if let Some(file_number) = layout.sector_file_numbers.get(&lba) {
+            subheader.file_number = *file_number;
+        }
         raw.extend_from_slice(&writer.form1(
             start_frame + lba,
             subheader,
@@ -1414,6 +1694,7 @@ mod tests {
                 length: LOGICAL_BLOCK_SIZE as u32,
             }],
             directories: Vec::new(),
+            path_tables: None,
         }
     }
 
@@ -1564,6 +1845,12 @@ mod tests {
         parse_image(&raw).unwrap().1.remove(0)
     }
 
+    fn parsed_xa_gap_sector() -> crate::raw_cd::ParsedSector {
+        let mut writer = SectorWriter::new();
+        let raw = writer.xa_gap(150, XaSubheader::default()).unwrap();
+        parse_image(&raw).unwrap().1.remove(0)
+    }
+
     #[test]
     fn xa_sidecars_preserve_framing_payloads_and_order() {
         let layouts = [
@@ -1578,15 +1865,25 @@ mod tests {
                 .enumerate()
                 .map(|(index, form2)| parsed_xa_sector(*form2, u8::try_from(index + 1).unwrap()))
                 .collect::<Vec<_>>();
-            let (xa1, xa2, xai) = demultiplex_xa_extent(&sectors, true).unwrap();
+            let assets = demultiplex_xa_extent(&sectors, true).unwrap();
             let expected_indices = layout
                 .iter()
                 .enumerate()
                 .filter_map(|(index, form2)| form2.then_some(u32::try_from(index).unwrap()))
                 .collect::<Vec<_>>();
-            assert_eq!(parse_xa_index(&xai).unwrap(), expected_indices);
+            assert_eq!(
+                parse_xa_index(&assets.form2_index).unwrap(),
+                expected_indices
+            );
+            assert!(assets.gap_index.is_empty());
 
-            let reconstructed = multiplex_xa_extent(&xa1, &xa2, &xai).unwrap();
+            let reconstructed = multiplex_xa_extent(
+                &assets.form1,
+                &assets.form2,
+                &assets.form2_index,
+                &assets.gap_index,
+            )
+            .unwrap();
             for (expected, actual) in sectors.iter().zip(reconstructed) {
                 match actual {
                     XaExtentSector::Form1(actual) => {
@@ -1601,9 +1898,73 @@ mod tests {
                         assert_eq!(actual.subheader_copy, expected.subheader_copy);
                         assert_eq!(actual.payload, expected.payload());
                     }
+                    XaExtentSector::XaGap => panic!("unexpected XA gap"),
                 }
             }
         }
+    }
+
+    #[test]
+    fn xa_sidecars_preserve_structured_gap_positions() {
+        let sectors = vec![
+            parsed_xa_sector(false, 1),
+            parsed_xa_gap_sector(),
+            parsed_xa_sector(true, 2),
+        ];
+
+        let assets = demultiplex_xa_extent(&sectors, true).unwrap();
+        assert_eq!(parse_xa_gap_index(&assets.gap_index).unwrap(), vec![1]);
+        assert_eq!(
+            multiplex_xa_extent(
+                &assets.form1,
+                &assets.form2,
+                &assets.form2_index,
+                &assets.gap_index,
+            )
+            .unwrap(),
+            vec![
+                XaExtentSector::Form1(Box::new(XaForm1Sector {
+                    subheader: sectors[0].subheader,
+                    subheader_copy: sectors[0].subheader_copy,
+                    payload: sectors[0].payload().try_into().unwrap(),
+                })),
+                XaExtentSector::XaGap,
+                XaExtentSector::Form2(Box::new(XaSidecarRecord {
+                    subheader: sectors[2].subheader,
+                    subheader_copy: sectors[2].subheader_copy,
+                    payload: sectors[2].payload().try_into().unwrap(),
+                })),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_xa_assets_can_describe_an_extent_with_omitted_attributes() {
+        let mut entry = test_manifest().iso9660.entries.remove(1);
+        entry.xa = Some(crate::manifest::EntryXa {
+            attributes: Some(crate::manifest::XaAttributes::from_bits(0)),
+            form1: Some("FILE.BIN.XA1".to_owned()),
+            form2: Some("FILE.BIN.XA2".to_owned()),
+            index: Some("FILE.BIN.XAI".to_owned()),
+            ..crate::manifest::EntryXa::default()
+        });
+
+        assert!(entry_uses_xa_sidecar(&entry));
+    }
+
+    #[test]
+    fn mixed_xa_sidecars_are_inferred_from_observed_sector_kinds() {
+        let mut sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER; 18]);
+        sectors[17] = parsed_xa_sector(true, 1);
+        let mut parsed = parsed_iso();
+
+        prepare_xa_sidecars(&sectors, &mut parsed).unwrap();
+
+        let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
+        assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
+        assert_eq!(xa.form2.as_deref(), Some("FILE.BIN.XA2"));
+        assert_eq!(xa.index.as_deref(), Some("FILE.BIN.XAI"));
+        assert_eq!(xa.gap_index, None);
     }
 
     #[test]
@@ -1616,8 +1977,8 @@ mod tests {
 
         let form1 = encode_xa_form1_record(&parsed_xa_sector(false, 1)).unwrap();
         let form2 = encode_xa_form2_record(&parsed_xa_sector(true, 2)).unwrap();
-        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[])).is_err());
-        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[2])).is_err());
+        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[]), &[]).is_err());
+        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[2]), &[]).is_err());
 
         let mut wrong_form1 = form1;
         wrong_form1[2] |= XaSubmode::FORM2.bits();
@@ -1652,6 +2013,88 @@ mod tests {
             detect_file_layout(&sectors, &files, &[], true).unwrap(),
             vec![FileLayoutItem::path("FILE.BIN"), FileLayoutItem::gap(3)]
         );
+    }
+
+    #[test]
+    fn file_layout_detects_zero_form1_separator_in_memory() {
+        let separator = XaSubheader {
+            file_number: 1,
+            submode: XaSubmode::END_OF_FILE,
+            ..XaSubheader::default()
+        };
+        let mut sectors =
+            parsed_form1_sequence(&[FORM1_DATA_SUBHEADER, separator, FORM1_DATA_SUBHEADER]);
+        let mut writer = SectorWriter::new();
+        sectors[1] = parse_image(
+            &writer
+                .form1(151, separator, &[0; LOGICAL_BLOCK_SIZE])
+                .unwrap(),
+        )
+        .unwrap()
+        .1
+        .remove(0);
+        let files = vec![
+            iso9660::ParsedFile {
+                path: "A.BIN".to_owned(),
+                extent: 0,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+            iso9660::ParsedFile {
+                path: "B.BIN".to_owned(),
+                extent: 2,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+        ];
+
+        assert_eq!(
+            detect_file_layout(&sectors, &files, &[], true).unwrap(),
+            vec![
+                FileLayoutItem::path("A.BIN"),
+                FileLayoutItem::form1_gap(1, separator),
+                FileLayoutItem::path("B.BIN"),
+            ]
+        );
+    }
+
+    #[test]
+    fn iso_validation_accepts_structured_form1_gap_between_files() {
+        let separator = XaSubheader {
+            file_number: 1,
+            submode: XaSubmode::END_OF_FILE,
+            ..XaSubheader::default()
+        };
+        let mut subheaders = vec![FORM1_DATA_SUBHEADER; 20];
+        subheaders[16] = PVD_SUBHEADER;
+        subheaders[17] = ISO_METADATA_SUBHEADER;
+        subheaders[18] = separator;
+        subheaders[19] = ISO_METADATA_SUBHEADER;
+        let mut sectors = parsed_form1_sequence(&subheaders);
+        let mut writer = SectorWriter::new();
+        sectors[18] = parse_image(
+            &writer
+                .form1(168, separator, &[0; LOGICAL_BLOCK_SIZE])
+                .unwrap(),
+        )
+        .unwrap()
+        .1
+        .remove(0);
+        let mut parsed = parsed_iso();
+        parsed.manifest.entries.push(crate::manifest::Entry {
+            path: "SECOND.BIN".to_owned(),
+            recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
+            hidden: false,
+            sector_subheader: EntrySectorSubheader::Canonical,
+            xa: None,
+            extent: None,
+            length: None,
+        });
+        parsed.files.push(iso9660::ParsedFile {
+            path: "SECOND.BIN".to_owned(),
+            extent: 19,
+            length: LOGICAL_BLOCK_SIZE as u32,
+        });
+
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
     #[test]
@@ -1724,6 +2167,65 @@ mod tests {
             EntrySectorSubheader::DataUntilFinal
         );
         validate_iso_subheaders(&directory_sectors, &directory_iso, 0).unwrap();
+    }
+
+    #[test]
+    fn path_table_data_until_final_policy_is_detected_in_memory() {
+        let mut subheaders = vec![ISO_METADATA_SUBHEADER; 26];
+        subheaders[..16].fill(FORM1_DATA_SUBHEADER);
+        subheaders[16] = PVD_SUBHEADER;
+        for lba in [18, 20, 22, 24] {
+            subheaders[lba] = FORM1_DATA_SUBHEADER;
+        }
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.path_tables = Some(iso9660::ParsedPathTables {
+            extents: [18, 20, 22, 24],
+            blocks: 2,
+        });
+
+        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+
+        assert_eq!(
+            parsed.manifest.path_table_subheader,
+            EntrySectorSubheader::DataUntilFinal
+        );
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
+    fn file_end_of_file_data_subheader_is_detected_in_memory() {
+        let mut subheaders = vec![FORM1_DATA_SUBHEADER; 18];
+        subheaders[16] = PVD_SUBHEADER;
+        subheaders[17] = SYSTEM_END_OF_FILE_SUBHEADER;
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+
+        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        assert_eq!(
+            parsed.manifest.entries[1].sector_subheader,
+            EntrySectorSubheader::EndOfFileData
+        );
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
+    fn entry_xa_file_number_drives_iso_sector_subheaders() {
+        let mut subheaders = vec![FORM1_DATA_SUBHEADER; 18];
+        subheaders[16] = PVD_SUBHEADER;
+        subheaders[17] = XaSubheader {
+            file_number: 1,
+            ..ISO_METADATA_SUBHEADER
+        };
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.manifest.entries[1].xa = Some(crate::manifest::EntryXa {
+            file_number: 1,
+            ..crate::manifest::EntryXa::default()
+        });
+
+        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
     #[test]
