@@ -461,11 +461,11 @@ def install_results(output: Path, temporary_output: Path) -> None:
     fsync_directory(output.parent)
 
 
-def outcome_percentages(passed: int, failed: int) -> tuple[float, float]:
+def pass_rate(passed: int, failed: int) -> float:
     completed = passed + failed
     if completed == 0:
-        return 0.0, 0.0
-    return passed * 100.0 / completed, failed * 100.0 / completed
+        return 0.0
+    return passed * 100.0 / completed
 
 
 def process_catalog(configuration: Configuration) -> int:
@@ -494,23 +494,21 @@ def process_catalog(configuration: Configuration) -> int:
 
             if outcome.passed:
                 passed += 1
-                pass_percentage, fail_percentage = outcome_percentages(passed, failed)
+                rate = pass_rate(passed, failed)
                 print(
-                    f"[{position}/{len(images)}] PASS "
-                    f"[PASS {pass_percentage:.2f}% | FAIL {fail_percentage:.2f}%] "
-                    f"{data_path} ({elapsed:.1f}s)",
+                    f"[{position}/{len(images)}, rate: {rate:.2f}%] "
+                    f"PASS {data_path} ({elapsed:.1f}s)",
                     flush=True,
                 )
                 continue
 
             failed += 1
-            pass_percentage, fail_percentage = outcome_percentages(passed, failed)
+            rate = pass_rate(passed, failed)
             writer.writerow([data_path, outcome.reason])
             fsync_file(output)
             print(
-                f"[{position}/{len(images)}] FAIL "
-                f"[PASS {pass_percentage:.2f}% | FAIL {fail_percentage:.2f}%] "
-                f"{data_path}: "
+                f"[{position}/{len(images)}, rate: {rate:.2f}%] "
+                f"FAIL {data_path}: "
                 f"{outcome.reason} ({elapsed:.1f}s)",
                 flush=True,
             )
@@ -518,11 +516,10 @@ def process_catalog(configuration: Configuration) -> int:
         fsync_file(output)
 
     install_results(configuration.output, temporary_output)
-    pass_percentage, fail_percentage = outcome_percentages(passed, failed)
+    rate = pass_rate(passed, failed)
     print(
         "summary: "
-        f"passed={passed} ({pass_percentage:.2f}%) "
-        f"failed={failed} ({fail_percentage:.2f}%) "
+        f"passed={passed} failed={failed} rate={rate:.2f}% "
         f"discovery_errors={len(discovery_errors)} total={len(images)}",
         flush=True,
     )

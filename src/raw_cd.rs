@@ -554,21 +554,6 @@ const fn to_bcd(value: u8) -> u8 {
 mod tests {
     use super::*;
 
-    fn read_interactive_sector(lba: u64) -> [u8; RAW_SECTOR_SIZE] {
-        use std::fs::File;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::path::Path;
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/interactive4.bin");
-        let mut image = File::open(path).unwrap();
-        image
-            .seek(SeekFrom::Start(lba * RAW_SECTOR_SIZE as u64))
-            .unwrap();
-        let mut raw = [0_u8; RAW_SECTOR_SIZE];
-        image.read_exact(&mut raw).unwrap();
-        raw
-    }
-
     #[test]
     fn xa_subheader_maps_named_fields_to_exact_bytes() {
         let subheader = XaSubheader::from([7, 8, 0x89, 10]);
@@ -672,17 +657,9 @@ mod tests {
 
     #[test]
     fn zero_edc_nonzero_form2_payload_is_classified_from_the_form_bit() {
-        use std::fs::File;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::path::Path;
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin");
-        let mut image = File::open(path).unwrap();
-        image
-            .seek(SeekFrom::Start((964 * RAW_SECTOR_SIZE) as u64))
+        let raw = SectorWriter::new()
+            .form2(1_114, [1, 2, 0x24, 3].into(), &[0x5a; 2324], false)
             .unwrap();
-        let mut raw = [0_u8; RAW_SECTOR_SIZE];
-        image.read_exact(&mut raw).unwrap();
 
         let (_, sectors) = parse_image(&raw).unwrap();
         assert_eq!(sectors[0].kind, Kind::Form2);
@@ -693,14 +670,30 @@ mod tests {
 
     #[test]
     fn primary_subheader_classifies_sectors_when_the_duplicate_differs() {
-        let form2 = read_interactive_sector(13_336);
+        let mut writer = SectorWriter::new();
+        let form2 = writer
+            .form2_with_subheaders(
+                13_486,
+                [0x01, 0x03, 0xe2, 0x18].into(),
+                [0x01, 0x19, 0xb2, 0xad].into(),
+                &[0x5a; 2324],
+                false,
+            )
+            .unwrap();
         let (_, sectors) = parse_image(&form2).unwrap();
         assert_eq!(sectors[0].kind, Kind::Form2);
         assert_eq!(sectors[0].subheader, [0x01, 0x03, 0xe2, 0x18].into());
         assert_eq!(sectors[0].subheader_copy, [0x01, 0x19, 0xb2, 0xad].into());
         assert!(!sectors[0].form2_edc_valid);
 
-        let form1 = read_interactive_sector(13_337);
+        let form1 = writer
+            .form1_with_subheaders(
+                13_487,
+                [0x01, 0x0f, 0xd3, 0xeb].into(),
+                [0x01, 0x0d, 0x9d, 0x23].into(),
+                &[0xa5; LOGICAL_BLOCK_SIZE],
+            )
+            .unwrap();
         let (_, sectors) = parse_image(&form1).unwrap();
         assert_eq!(sectors[0].kind, Kind::Form1);
         assert_eq!(sectors[0].subheader, [0x01, 0x0f, 0xd3, 0xeb].into());
@@ -709,8 +702,15 @@ mod tests {
 
     #[test]
     fn duplicate_subheader_overlay_precedes_form1_protection_generation() {
-        let source = read_interactive_sector(13_337);
-        let mut canonical = source;
+        let source = SectorWriter::new()
+            .form1_with_subheaders(
+                13_487,
+                [0x01, 0x0f, 0xd3, 0xeb].into(),
+                [0x01, 0x0d, 0x9d, 0x23].into(),
+                &[0xa5; LOGICAL_BLOCK_SIZE],
+            )
+            .unwrap();
+        let mut canonical = source.clone();
         canonical[20..24].copy_from_slice(&source[16..20]);
         regenerate_mode2_protection(&mut canonical, false, false).unwrap();
         assert_ne!(canonical, source);
@@ -723,8 +723,16 @@ mod tests {
 
     #[test]
     fn duplicate_subheader_overlay_precedes_zero_form2_edc_generation() {
-        let source = read_interactive_sector(13_336);
-        let mut canonical = source;
+        let source = SectorWriter::new()
+            .form2_with_subheaders(
+                13_486,
+                [0x01, 0x03, 0xe2, 0x18].into(),
+                [0x01, 0x19, 0xb2, 0xad].into(),
+                &[0x5a; 2324],
+                false,
+            )
+            .unwrap();
+        let mut canonical = source.clone();
         canonical[20..24].copy_from_slice(&source[16..20]);
         regenerate_mode2_protection(&mut canonical, false, false).unwrap();
         assert_ne!(canonical, source);
@@ -763,20 +771,13 @@ mod tests {
 
     #[test]
     fn final_xa_gap_accepts_ecc_calculated_with_the_recorded_header() {
-        use std::fs::File;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::path::Path;
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/3dlemmings.bin");
-        let mut image = File::open(path).unwrap();
-        let final_sector = image.metadata().unwrap().len() / RAW_SECTOR_SIZE as u64 - 1;
-        image
-            .seek(SeekFrom::Start(final_sector * RAW_SECTOR_SIZE as u64))
+        let frame = 81_860;
+        let raw = SectorWriter::new()
+            .xa_gap_with_recorded_header_ecc(frame, XaSubheader::default())
             .unwrap();
-        let mut raw = [0_u8; RAW_SECTOR_SIZE];
-        image.read_exact(&mut raw).unwrap();
 
-        let (frame, sectors) = parse_image(&raw).unwrap();
+        let (parsed_frame, sectors) = parse_image(&raw).unwrap();
+        assert_eq!(parsed_frame, frame);
         assert_eq!(sectors[0].kind, Kind::XaGap);
         assert!(sectors[0].noncompliant_ecc);
 
