@@ -198,6 +198,7 @@ pub struct ParsedSector {
     pub bytes: [u8; RAW_SECTOR_SIZE],
     pub kind: Kind,
     pub subheader: XaSubheader,
+    pub subheader_copy: XaSubheader,
     pub form2_edc_valid: bool,
     pub noncompliant_ecc: bool,
 }
@@ -235,15 +236,12 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
             chunk[12..15] == expected,
             "non-monotonic MSF at sector {index}"
         );
-        ensure!(
-            chunk[16..20] == chunk[20..24],
-            "mismatched XA subheader copies at sector {index}"
-        );
         let detected = detector
             .detect_sector_type(chunk)
             .with_context(|| format!("detecting sector type at sector {index}"))?;
         let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
         let subheader = XaSubheader::from(subheader_bytes);
+        let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&chunk[20..24])?);
         let noncompliant_ecc = detected == SectorType::Mode2
             && !subheader.submode.contains(XaSubmodeFlag::Form2)
             && recorded_header_ecc_matches(chunk);
@@ -266,6 +264,7 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
             bytes: sector,
             kind,
             subheader,
+            subheader_copy,
             form2_edc_valid,
             noncompliant_ecc,
         });
@@ -296,6 +295,20 @@ impl SectorWriter {
             .context("generating Form 1 sector")
     }
 
+    pub fn form1_with_subheaders(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        subheader_copy: XaSubheader,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut sector = self.form1(frame, subheader, data)?;
+        sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
+        regenerate_mode2_protection(&mut sector, true, false)
+            .context("generating Form 1 protection with distinct subheaders")?;
+        Ok(sector)
+    }
+
     pub fn form2(
         &mut self,
         frame: u32,
@@ -315,6 +328,21 @@ impl SectorWriter {
         self.standard
             .decode_sector(&compact, SectorType::Mode2Xa2, frame, optimizations)
             .context("generating Form 2 sector")
+    }
+
+    pub fn form2_with_subheaders(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        subheader_copy: XaSubheader,
+        data: &[u8],
+        computed_edc: bool,
+    ) -> Result<Vec<u8>> {
+        let mut sector = self.form2(frame, subheader, data, computed_edc)?;
+        sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
+        regenerate_mode2_protection(&mut sector, computed_edc, false)
+            .context("generating Form 2 protection with distinct subheaders")?;
+        Ok(sector)
     }
 
     pub fn xa_gap(&mut self, frame: u32, subheader: XaSubheader) -> Result<Vec<u8>> {
@@ -347,6 +375,78 @@ fn recorded_header_ecc_matches(sector: &[u8]) -> bool {
     let mut generated = sector.to_vec();
     write_recorded_header_ecc(&mut generated);
     generated[2076..] == sector[2076..]
+}
+
+pub(crate) fn regenerate_mode2_protection(
+    sector: &mut [u8],
+    form2_edc: bool,
+    recorded_header_ecc: bool,
+) -> Result<Kind> {
+    ensure!(
+        sector.len() == RAW_SECTOR_SIZE,
+        "raw sector must be 2352 bytes"
+    );
+    ensure!(
+        sector[15] == 2,
+        "unsupported patched sector mode {}",
+        sector[15]
+    );
+    let primary = XaSubheader::from(<[u8; 4]>::try_from(&sector[16..20])?);
+    if primary.submode.contains(XaSubmodeFlag::Form2) {
+        let edc = if form2_edc {
+            generate_edc(&sector[16..2348]).to_le_bytes()
+        } else {
+            [0; 4]
+        };
+        sector[2348..2352].copy_from_slice(&edc);
+        return Ok(Kind::Form2);
+    }
+
+    if recorded_header_ecc {
+        sector[2072..2076].fill(0);
+        write_recorded_header_ecc(sector);
+        return Ok(Kind::XaGap);
+    }
+
+    let edc = generate_edc(&sector[16..2072]).to_le_bytes();
+    sector[2072..2076].copy_from_slice(&edc);
+    write_standard_form1_ecc(sector);
+    Ok(Kind::Form1)
+}
+
+fn generate_edc(data: &[u8]) -> u32 {
+    let mut edc = 0_u32;
+    for byte in data {
+        edc = (edc >> 8) ^ EDC_LOOKUP[usize::from((edc as u8) ^ byte)];
+    }
+    edc
+}
+
+const EDC_LOOKUP: [u32; 256] = make_edc_lookup();
+
+const fn make_edc_lookup() -> [u32; 256] {
+    let mut lookup = [0_u32; 256];
+    let mut index = 0;
+    while index < lookup.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = (value >> 1) ^ if value & 1 != 0 { 0xd801_8001 } else { 0 };
+            bit += 1;
+        }
+        lookup[index] = value;
+        index += 1;
+    }
+    lookup
+}
+
+fn write_standard_form1_ecc(sector: &mut [u8]) {
+    let mut p = [0_u8; 172];
+    generate_ecc_pq(&[0; 4], &sector[16..2076], &mut p, 86, 24, 2, 86);
+    sector[2076..2248].copy_from_slice(&p);
+    let mut q = [0_u8; 104];
+    generate_ecc_pq(&[0; 4], &sector[16..2248], &mut q, 52, 43, 86, 88);
+    sector[2248..2352].copy_from_slice(&q);
 }
 
 fn write_recorded_header_ecc(sector: &mut [u8]) {
@@ -453,6 +553,21 @@ const fn to_bcd(value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_interactive_sector(lba: u64) -> [u8; RAW_SECTOR_SIZE] {
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/interactive4.bin");
+        let mut image = File::open(path).unwrap();
+        image
+            .seek(SeekFrom::Start(lba * RAW_SECTOR_SIZE as u64))
+            .unwrap();
+        let mut raw = [0_u8; RAW_SECTOR_SIZE];
+        image.read_exact(&mut raw).unwrap();
+        raw
+    }
 
     #[test]
     fn xa_subheader_maps_named_fields_to_exact_bytes() {
@@ -574,6 +689,76 @@ mod tests {
         assert!(!sectors[0].form2_edc_valid);
         assert_eq!(&sectors[0].bytes[2348..2352], &[0; 4]);
         assert!(sectors[0].payload().iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn primary_subheader_classifies_sectors_when_the_duplicate_differs() {
+        let form2 = read_interactive_sector(13_336);
+        let (_, sectors) = parse_image(&form2).unwrap();
+        assert_eq!(sectors[0].kind, Kind::Form2);
+        assert_eq!(sectors[0].subheader, [0x01, 0x03, 0xe2, 0x18].into());
+        assert_eq!(sectors[0].subheader_copy, [0x01, 0x19, 0xb2, 0xad].into());
+        assert!(!sectors[0].form2_edc_valid);
+
+        let form1 = read_interactive_sector(13_337);
+        let (_, sectors) = parse_image(&form1).unwrap();
+        assert_eq!(sectors[0].kind, Kind::Form1);
+        assert_eq!(sectors[0].subheader, [0x01, 0x0f, 0xd3, 0xeb].into());
+        assert_eq!(sectors[0].subheader_copy, [0x01, 0x0d, 0x9d, 0x23].into());
+    }
+
+    #[test]
+    fn duplicate_subheader_overlay_precedes_form1_protection_generation() {
+        let source = read_interactive_sector(13_337);
+        let mut canonical = source;
+        canonical[20..24].copy_from_slice(&source[16..20]);
+        regenerate_mode2_protection(&mut canonical, false, false).unwrap();
+        assert_ne!(canonical, source);
+        assert_eq!(canonical[16..20], canonical[20..24]);
+
+        canonical[20..24].copy_from_slice(&source[20..24]);
+        regenerate_mode2_protection(&mut canonical, false, false).unwrap();
+        assert_eq!(canonical, source);
+    }
+
+    #[test]
+    fn duplicate_subheader_overlay_precedes_zero_form2_edc_generation() {
+        let source = read_interactive_sector(13_336);
+        let mut canonical = source;
+        canonical[20..24].copy_from_slice(&source[16..20]);
+        regenerate_mode2_protection(&mut canonical, false, false).unwrap();
+        assert_ne!(canonical, source);
+        assert_eq!(&canonical[2348..2352], &[0; 4]);
+
+        canonical[20..24].copy_from_slice(&source[20..24]);
+        regenerate_mode2_protection(&mut canonical, false, false).unwrap();
+        assert_eq!(canonical, source);
+    }
+
+    #[test]
+    fn sector_writer_preserves_distinct_subheader_copies_before_protection() {
+        let mut writer = SectorWriter::new();
+        let primary: XaSubheader = [1, 2, 0x08, 4].into();
+        let duplicate: XaSubheader = [5, 6, 0x28, 8].into();
+        let form1 = writer
+            .form1_with_subheaders(150, primary, duplicate, &[0x11; LOGICAL_BLOCK_SIZE])
+            .unwrap();
+        assert_eq!(&form1[16..20], &[1, 2, 0x08, 4]);
+        assert_eq!(&form1[20..24], &[5, 6, 0x28, 8]);
+        let (_, parsed) = parse_image(&form1).unwrap();
+        assert_eq!(parsed[0].kind, Kind::Form1);
+        assert_eq!(parsed[0].subheader_copy, duplicate);
+
+        let primary: XaSubheader = [9, 10, 0x20, 12].into();
+        let duplicate: XaSubheader = [13, 14, 0, 16].into();
+        let form2 = writer
+            .form2_with_subheaders(151, primary, duplicate, &[0x22; 2324], false)
+            .unwrap();
+        assert_eq!(&form2[16..20], &[9, 10, 0x20, 12]);
+        assert_eq!(&form2[20..24], &[13, 14, 0, 16]);
+        let (_, parsed) = parse_image(&form2).unwrap();
+        assert_eq!(parsed[0].kind, Kind::Form2);
+        assert_eq!(parsed[0].subheader_copy, duplicate);
     }
 
     #[test]

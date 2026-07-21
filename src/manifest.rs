@@ -5,9 +5,8 @@ use anyhow::Context;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::raw_cd::{XaSubheader, XaSubmode};
-
 pub const SYSTEM_AREA_SECTORS: usize = 16;
+pub const DEFAULT_XA_PERMISSIONS: u16 = 0x0555;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,17 +28,14 @@ pub struct Track {
     )]
     pub start_msf: String,
     #[serde(
-        default = "default_trailing_gap",
-        skip_serializing_if = "is_default_trailing_gap"
-    )]
-    pub trailing_gap: u32,
-    #[serde(
         default = "default_form2_edc",
         skip_serializing_if = "is_default_form2_edc"
     )]
     pub form2_edc: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub noncompliant_trailing_ecc: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppf: Option<String>,
 }
 
 impl Default for Track {
@@ -47,9 +43,9 @@ impl Default for Track {
         Self {
             mode: TrackMode::default(),
             start_msf: default_start_msf(),
-            trailing_gap: default_trailing_gap(),
             form2_edc: default_form2_edc(),
             noncompliant_trailing_ecc: false,
+            ppf: None,
         }
     }
 }
@@ -58,9 +54,9 @@ impl Track {
     fn is_default(&self) -> bool {
         self.mode.is_default()
             && is_default_start_msf(&self.start_msf)
-            && is_default_trailing_gap(&self.trailing_gap)
             && is_default_form2_edc(&self.form2_edc)
             && !self.noncompliant_trailing_ecc
+            && self.ppf.is_none()
     }
 }
 
@@ -75,14 +71,16 @@ struct ManifestWithDefaults<'a> {
 struct TrackWithDefaults<'a> {
     mode: TrackMode,
     start_msf: &'a str,
-    trailing_gap: u32,
     form2_edc: bool,
     noncompliant_trailing_ecc: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ppf: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct Iso9660WithDefaults<'a> {
     primary_volume: PrimaryVolumeWithDefaults<'a>,
+    metadata_subheader: IsoMetadataSubheader,
     entries: Vec<EntryWithDefaults<'a>>,
     files: &'a [FileLayoutItem],
 }
@@ -91,6 +89,8 @@ struct Iso9660WithDefaults<'a> {
 struct EntryWithDefaults<'a> {
     path: &'a str,
     recording_time: &'a str,
+    hidden: bool,
+    sector_subheader: EntrySectorSubheader,
     xa: EntryXaWithDefaults<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extent: Option<u32>,
@@ -102,33 +102,18 @@ struct EntryWithDefaults<'a> {
 struct EntryXaWithDefaults<'a> {
     group_id: u16,
     user_id: u16,
+    permissions: u16,
     attributes: XaAttributes,
     file_number: u8,
-    form1_subheader: Option<XaSubheaderWithDefaults>,
+    form1: Option<&'a str>,
     form2: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct XaSubheaderWithDefaults {
-    file_number: u8,
-    channel: u8,
-    submode: XaSubmode,
-    coding_info: u8,
-}
-
-impl From<XaSubheader> for XaSubheaderWithDefaults {
-    fn from(subheader: XaSubheader) -> Self {
-        Self {
-            file_number: subheader.file_number,
-            channel: subheader.channel,
-            submode: subheader.submode,
-            coding_info: subheader.coding_info,
-        }
-    }
+    index: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct PrimaryVolumeWithDefaults<'a> {
+    volume_space_size: Option<u32>,
+    application_use: PrimaryVolumeApplicationUse,
     system_identifier: &'a str,
     volume_identifier: &'a str,
     volume_set_identifier: &'a str,
@@ -173,13 +158,17 @@ pub(crate) fn serialize_manifest(
                 EntryWithDefaults {
                     path: &entry.path,
                     recording_time: &entry.recording_time,
+                    hidden: entry.hidden,
+                    sector_subheader: entry.sector_subheader,
                     xa: EntryXaWithDefaults {
                         group_id: xa.map_or(0, |value| value.group_id),
                         user_id: xa.map_or(0, |value| value.user_id),
+                        permissions: xa.map_or(DEFAULT_XA_PERMISSIONS, |value| value.permissions),
                         attributes,
                         file_number: xa.map_or(0, |value| value.file_number),
-                        form1_subheader: xa.and_then(|value| value.form1_subheader).map(Into::into),
+                        form1: xa.and_then(|value| value.form1.as_deref()),
                         form2: xa.and_then(|value| value.form2.as_deref()),
+                        index: xa.and_then(|value| value.index.as_deref()),
                     },
                     extent: entry.extent,
                     length: entry.length,
@@ -190,13 +179,15 @@ pub(crate) fn serialize_manifest(
             track: TrackWithDefaults {
                 mode: manifest.track.mode,
                 start_msf: &manifest.track.start_msf,
-                trailing_gap: manifest.track.trailing_gap,
                 form2_edc: manifest.track.form2_edc,
                 noncompliant_trailing_ecc: manifest.track.noncompliant_trailing_ecc,
+                ppf: manifest.track.ppf.as_deref(),
             },
             system_area: &manifest.system_area,
             iso9660: Iso9660WithDefaults {
                 primary_volume: PrimaryVolumeWithDefaults {
+                    volume_space_size: manifest.iso9660.primary_volume.volume_space_size,
+                    application_use: manifest.iso9660.primary_volume.application_use,
                     system_identifier: &manifest.iso9660.primary_volume.system_identifier,
                     volume_identifier: &manifest.iso9660.primary_volume.volume_identifier,
                     volume_set_identifier: &manifest.iso9660.primary_volume.volume_set_identifier,
@@ -223,6 +214,7 @@ pub(crate) fn serialize_manifest(
                     expiration_time: manifest.iso9660.primary_volume.expiration_time.as_deref(),
                     effective_time: manifest.iso9660.primary_volume.effective_time.as_deref(),
                 },
+                metadata_subheader: manifest.iso9660.metadata_subheader,
                 entries,
                 files: &manifest.iso9660.files,
             },
@@ -329,14 +321,6 @@ fn is_default_start_msf(value: &String) -> bool {
     value == "00:02:00"
 }
 
-fn default_trailing_gap() -> u32 {
-    150
-}
-
-fn is_default_trailing_gap(value: &u32) -> bool {
-    *value == 150
-}
-
 fn default_form2_edc() -> bool {
     true
 }
@@ -354,6 +338,22 @@ const fn is_false(value: &bool) -> bool {
 pub struct SystemArea {
     pub path: String,
     pub form1_sectors: Form1Sectors,
+    #[serde(default, skip_serializing_if = "SystemAreaFinalSubheader::is_default")]
+    pub final_form1_subheader: SystemAreaFinalSubheader,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemAreaFinalSubheader {
+    #[default]
+    Data,
+    EndOfFileData,
+}
+
+impl SystemAreaFinalSubheader {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Data)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,14 +387,31 @@ impl Form1Sectors {
 #[serde(deny_unknown_fields)]
 pub struct Iso9660 {
     pub primary_volume: PrimaryVolume,
+    #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
+    pub metadata_subheader: IsoMetadataSubheader,
     pub entries: Vec<Entry>,
     pub files: Vec<FileLayoutItem>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsoMetadataSubheader {
+    #[default]
+    Canonical,
+    Data,
+}
+
+impl IsoMetadataSubheader {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Canonical)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum FileLayoutItem {
     Path(FilePathItem),
+    Directory(FileDirectoryItem),
     Gap(FileGapItem),
 }
 
@@ -406,8 +423,30 @@ pub struct FilePathItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct FileDirectoryItem {
+    pub directory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FileGapItem {
     pub gap: u32,
+    #[serde(default, skip_serializing_if = "GapKind::is_default")]
+    pub kind: GapKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GapKind {
+    #[default]
+    Form2,
+    Xa,
+}
+
+impl GapKind {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Form2)
+    }
 }
 
 impl FileLayoutItem {
@@ -415,21 +454,51 @@ impl FileLayoutItem {
         Self::Path(FilePathItem { path: path.into() })
     }
 
+    pub fn directory(path: impl Into<String>) -> Self {
+        Self::Directory(FileDirectoryItem {
+            directory: path.into(),
+        })
+    }
+
     pub const fn gap(sectors: u32) -> Self {
-        Self::Gap(FileGapItem { gap: sectors })
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::Form2,
+        })
+    }
+
+    pub const fn xa_gap(sectors: u32) -> Self {
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::Xa,
+        })
     }
 
     pub fn as_path(&self) -> Option<&str> {
         match self {
             Self::Path(item) => Some(&item.path),
-            Self::Gap(_) => None,
+            Self::Directory(_) | Self::Gap(_) => None,
+        }
+    }
+
+    pub fn as_directory(&self) -> Option<&str> {
+        match self {
+            Self::Directory(item) => Some(&item.directory),
+            Self::Path(_) | Self::Gap(_) => None,
         }
     }
 
     pub const fn gap_sectors(&self) -> Option<u32> {
         match self {
-            Self::Path(_) => None,
+            Self::Path(_) | Self::Directory(_) => None,
             Self::Gap(item) => Some(item.gap),
+        }
+    }
+
+    pub const fn gap_kind(&self) -> Option<GapKind> {
+        match self {
+            Self::Path(_) | Self::Directory(_) => None,
+            Self::Gap(item) => Some(item.kind),
         }
     }
 }
@@ -437,6 +506,13 @@ impl FileLayoutItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimaryVolume {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_space_size: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "PrimaryVolumeApplicationUse::is_default"
+    )]
+    pub application_use: PrimaryVolumeApplicationUse,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub system_identifier: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -465,11 +541,29 @@ pub struct PrimaryVolume {
     pub effective_time: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryVolumeApplicationUse {
+    #[default]
+    CdXa001,
+    CdXa001_1_1,
+}
+
+impl PrimaryVolumeApplicationUse {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::CdXa001)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub path: String,
     pub recording_time: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
+    pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,21 +572,110 @@ pub struct Entry {
     pub length: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrySectorSubheader {
+    #[default]
+    Canonical,
+    Data,
+    DataUntilFinal,
+}
+
+impl EntrySectorSubheader {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Canonical)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(default)]
 pub struct EntryXa {
     #[serde(skip_serializing_if = "is_zero_u16")]
     pub group_id: u16,
     #[serde(skip_serializing_if = "is_zero_u16")]
     pub user_id: u16,
+    #[serde(skip_serializing_if = "is_default_xa_permissions")]
+    pub permissions: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes: Option<XaAttributes>,
     #[serde(skip_serializing_if = "is_zero")]
     pub file_number: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub form1_subheader: Option<XaSubheader>,
+    pub form1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub form2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+}
+
+impl Default for EntryXa {
+    fn default() -> Self {
+        Self {
+            group_id: 0,
+            user_id: 0,
+            permissions: DEFAULT_XA_PERMISSIONS,
+            attributes: None,
+            file_number: 0,
+            form1: None,
+            form2: None,
+            index: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EntryXaFields {
+    group_id: u16,
+    user_id: u16,
+    permissions: u16,
+    attributes: Option<XaAttributes>,
+    file_number: u8,
+    form1: Option<String>,
+    form2: Option<String>,
+    index: Option<String>,
+}
+
+impl Default for EntryXaFields {
+    fn default() -> Self {
+        Self {
+            group_id: 0,
+            user_id: 0,
+            permissions: DEFAULT_XA_PERMISSIONS,
+            attributes: None,
+            file_number: 0,
+            form1: None,
+            form2: None,
+            index: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EntryXa {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = EntryXaFields::deserialize(deserializer)?;
+        let asset_count = usize::from(fields.form1.is_some())
+            + usize::from(fields.form2.is_some())
+            + usize::from(fields.index.is_some());
+        if asset_count != 0 && asset_count != 3 {
+            return Err(de::Error::custom(
+                "interleaved XA metadata requires form1, form2, and index together",
+            ));
+        }
+        Ok(Self {
+            group_id: fields.group_id,
+            user_id: fields.user_id,
+            permissions: fields.permissions,
+            attributes: fields.attributes,
+            file_number: fields.file_number,
+            form1: fields.form1,
+            form2: fields.form2,
+            index: fields.index,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -605,6 +788,10 @@ const fn is_zero_u16(value: &u16) -> bool {
     *value == 0
 }
 
+const fn is_default_xa_permissions(value: &u16) -> bool {
+    *value == DEFAULT_XA_PERMISSIONS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,9 +800,9 @@ mod tests {
         Track {
             mode,
             start_msf: start_msf.to_owned(),
-            trailing_gap: 150,
             form2_edc: true,
             noncompliant_trailing_ecc: false,
+            ppf: None,
         }
     }
 
@@ -624,7 +811,6 @@ mod tests {
         let yaml = yaml_serde::to_string(&track(TrackMode::Mode2Xa, "00:02:00")).unwrap();
         assert!(!yaml.lines().any(|line| line.starts_with("mode:")));
         assert!(!yaml.lines().any(|line| line.starts_with("start_msf:")));
-        assert!(!yaml.lines().any(|line| line.starts_with("trailing_gap:")));
         assert!(!yaml.lines().any(|line| line.starts_with("form2_edc:")));
         assert!(
             !yaml
@@ -636,7 +822,6 @@ mod tests {
         let parsed: Track = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(parsed.mode, TrackMode::Mode2Xa);
         assert_eq!(parsed.start_msf, "00:02:00");
-        assert_eq!(parsed.trailing_gap, 150);
         assert!(parsed.form2_edc);
         assert!(!parsed.noncompliant_trailing_ecc);
     }
@@ -668,12 +853,26 @@ mod tests {
     }
 
     #[test]
-    fn nondefault_trailing_gap_is_stored() {
-        let mut track = track(TrackMode::Mode2Xa, "00:02:00");
-        track.trailing_gap = 151;
-        let yaml = yaml_serde::to_string(&track).unwrap();
-        assert!(yaml.lines().any(|line| line == "trailing_gap: 151"));
+    fn track_rejects_removed_trailing_gap_fields() {
+        assert!(yaml_serde::from_str::<Track>("trailing_gap: 151\n").is_err());
         assert!(yaml_serde::from_str::<Track>("trailing_gap_sectors: 151\n").is_err());
+    }
+
+    #[test]
+    fn physical_gap_kinds_round_trip_without_ambiguity() {
+        let form2 = yaml_serde::to_string(&FileLayoutItem::gap(3)).unwrap();
+        assert_eq!(form2, "gap: 3\n");
+        assert_eq!(
+            yaml_serde::from_str::<FileLayoutItem>(&form2).unwrap(),
+            FileLayoutItem::gap(3)
+        );
+
+        let xa = yaml_serde::to_string(&FileLayoutItem::xa_gap(150)).unwrap();
+        assert_eq!(xa, "gap: 150\nkind: xa\n");
+        assert_eq!(
+            yaml_serde::from_str::<FileLayoutItem>(&xa).unwrap(),
+            FileLayoutItem::xa_gap(150)
+        );
     }
 
     #[test]
@@ -702,6 +901,18 @@ mod tests {
     }
 
     #[test]
+    fn track_ppf_is_optional_and_round_trips_as_a_relative_asset_path() {
+        let mut track = track(TrackMode::Mode2Xa, "00:02:00");
+        assert!(!yaml_serde::to_string(&track).unwrap().contains("ppf:"));
+
+        track.ppf = Some("interactive4.ppf".to_owned());
+        let yaml = yaml_serde::to_string(&track).unwrap();
+        assert!(yaml.lines().any(|line| line == "ppf: interactive4.ppf"));
+        let parsed: Track = yaml_serde::from_str(&yaml).unwrap();
+        assert_eq!(parsed.ppf.as_deref(), Some("interactive4.ppf"));
+    }
+
+    #[test]
     fn form1_sector_count_supports_auto_and_explicit_layouts() {
         assert_eq!(
             Form1Sectors::Auto("auto".to_owned()).resolve(2049).unwrap(),
@@ -718,20 +929,23 @@ mod tests {
 
     #[test]
     fn interleaved_xa_entry_metadata_round_trips_as_named_fields() {
-        let yaml = "path: PETEXA0.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  attributes:\n  - interleaved\n  file_number: 1\n  form2: PETEXA0.STR.XA\n";
+        let yaml = "path: PETEXA0.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  attributes:\n  - interleaved\n  file_number: 1\n  form1: PETEXA0.STR.XA1\n  form2: PETEXA0.STR.XA2\n  index: PETEXA0.STR.XAI\n";
         let entry: Entry = yaml_serde::from_str(yaml).unwrap();
+        let xa = entry.xa.as_ref().unwrap();
+        assert_eq!(xa.form1.as_deref(), Some("PETEXA0.STR.XA1"));
+        assert_eq!(xa.form2.as_deref(), Some("PETEXA0.STR.XA2"));
+        assert_eq!(xa.index.as_deref(), Some("PETEXA0.STR.XAI"));
         assert_eq!(yaml_serde::to_string(&entry).unwrap(), yaml);
     }
 
     #[test]
-    fn mixed_xa_form1_subheader_round_trips_as_named_fields() {
-        let yaml = "path: ANIMATIO.000\nrecording_time: 1995-06-25T15:56:08+09:00\nxa:\n  attributes:\n  - mode2_form1\n  - mode2_form2\n  file_number: 1\n  form1_subheader:\n    file_number: 1\n    channel: 1\n    submode:\n    - video\n    - realtime\n    coding_info: 128\n  form2: ANIMATIO.000.XA\n";
-        let entry: Entry = yaml_serde::from_str(yaml).unwrap();
-        assert_eq!(
-            entry.xa.as_ref().unwrap().form1_subheader,
-            Some([1, 1, 0x42, 0x80].into())
-        );
-        assert_eq!(yaml_serde::to_string(&entry).unwrap(), yaml);
+    fn legacy_interleaved_xa_shape_is_rejected() {
+        for yaml in [
+            "path: OLD.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  form2: OLD.STR.XA\n",
+            "path: OLD.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  form1_subheader: {}\n",
+        ] {
+            assert!(yaml_serde::from_str::<Entry>(yaml).is_err());
+        }
     }
 
     #[test]

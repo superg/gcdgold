@@ -2,6 +2,7 @@
 
 mod iso9660;
 mod manifest;
+mod ppf;
 mod raw_cd;
 mod workflow;
 

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::manifest::{Entry, EntryXa, FileLayoutItem, Iso9660, PrimaryVolume, XaAttributes};
+use crate::manifest::{
+    DEFAULT_XA_PERMISSIONS, Entry, EntrySectorSubheader, EntryXa, FileLayoutItem, GapKind, Iso9660,
+    PrimaryVolume, PrimaryVolumeApplicationUse, XaAttributes,
+};
 use crate::raw_cd::LOGICAL_BLOCK_SIZE;
 
 const VOLUME_SET_SIZE: u16 = 1;
@@ -10,9 +13,9 @@ const VOLUME_SEQUENCE_NUMBER: u16 = 1;
 const ISO_LOGICAL_BLOCK_SIZE: u16 = 2048;
 const FILE_STRUCTURE_VERSION: u8 = 1;
 const FILE_VERSION: u8 = 1;
+const HIDDEN_FLAG: u8 = 1;
 const DIRECTORY_FLAG: u8 = 2;
 const XA_SYSTEM_USE_SIZE: usize = 14;
-const XA_PERMISSION_BITS: u16 = 0x0555;
 const XA_ATTRIBUTE_MASK: u16 = 0xf800;
 const APPLICATION_USE_START: usize = 883;
 const APPLICATION_USE_END: usize = 1395;
@@ -27,9 +30,17 @@ pub struct ParsedFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct ParsedDirectory {
+    pub path: String,
+    pub extent: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct ParsedIso {
     pub manifest: Iso9660,
     pub files: Vec<ParsedFile>,
+    pub directories: Vec<ParsedDirectory>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +67,8 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         &blocks[17][0..7] == b"\xffCD001\x01",
         "expected volume terminator at LBA 17"
     );
-    let pvd = parse_pvd(pvd_block)?;
+    let source_volume_space_size = read_both_u32(pvd_block, 80)?;
+    let mut pvd = parse_pvd(pvd_block)?;
     let root_record = parse_record(&pvd_block[156..])?;
     validate_standard_record_fields(&root_record, true, false)?;
     let root_records = read_directory(blocks, root_record.extent, root_record.length)?;
@@ -65,6 +77,8 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     let root = Entry {
         path: ROOT_PATH.to_owned(),
         recording_time: parse_recording_time(dot.recording_time)?,
+        hidden: root_record.flags & 1 != 0,
+        sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, true)?,
         extent: None,
         length: None,
@@ -72,6 +86,11 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
 
     let mut entries = vec![root];
     let mut files = Vec::new();
+    let mut directories = vec![ParsedDirectory {
+        path: ROOT_PATH.to_owned(),
+        extent: root_record.extent,
+        length: root_record.length,
+    }];
     let mut queue = VecDeque::from([(String::new(), root_record.extent, root_record.length)]);
     let mut seen_dirs = HashSet::new();
     while let Some((parent, extent, length)) = queue.pop_front() {
@@ -110,12 +129,19 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             let entry = Entry {
                 path: path.clone(),
                 recording_time: parse_recording_time(record.recording_time)?,
+                hidden: record.flags & 1 != 0,
+                sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                 xa,
                 extent: external_cdda.then_some(record.extent),
                 length: external_cdda.then_some(record.length),
             };
             entries.push(entry);
             if is_dir {
+                directories.push(ParsedDirectory {
+                    path: path.clone(),
+                    extent: record.extent,
+                    length: record.length,
+                });
                 queue.push_back((path, record.extent, record.length));
             } else if !external_cdda {
                 files.push(ParsedFile {
@@ -133,14 +159,39 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         .iter()
         .map(|file| FileLayoutItem::path(&file.path))
         .collect();
+    let inferred_volume_space_size = entries.iter().try_fold(
+        u32::try_from(blocks.len())?,
+        |maximum, entry| -> Result<u32> {
+            let Some(extent) = entry.extent else {
+                return Ok(maximum);
+            };
+            let blocks = entry
+                .length
+                .context("external CDDA entry has no length")?
+                .div_ceil(LOGICAL_BLOCK_SIZE as u32);
+            Ok(maximum.max(
+                extent
+                    .checked_add(blocks)
+                    .context("external CDDA extent overflow")?,
+            ))
+        },
+    )?;
+    ensure!(
+        source_volume_space_size >= inferred_volume_space_size,
+        "PVD volume space size is smaller than the referenced disc content"
+    );
+    pvd.volume_space_size = (source_volume_space_size != inferred_volume_space_size)
+        .then_some(source_volume_space_size);
 
     Ok(ParsedIso {
         manifest: Iso9660 {
             primary_volume: pvd,
+            metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             entries,
             files: file_order,
         },
         files,
+        directories,
     })
 }
 
@@ -162,11 +213,18 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
         block[881] == FILE_STRUCTURE_VERSION,
         "unsupported file structure version"
     );
-    ensure!(
-        block[APPLICATION_USE_START..APPLICATION_USE_END] == standard_cd_xa_application_use(),
-        "unsupported PVD CD-XA application-use data"
-    );
+    let application_use = [
+        PrimaryVolumeApplicationUse::CdXa001,
+        PrimaryVolumeApplicationUse::CdXa001_1_1,
+    ]
+    .into_iter()
+    .find(|kind| {
+        block[APPLICATION_USE_START..APPLICATION_USE_END] == standard_cd_xa_application_use(*kind)
+    })
+    .context("unsupported PVD CD-XA application-use data")?;
     Ok(PrimaryVolume {
+        volume_space_size: None,
+        application_use,
         system_identifier: read_fixed(block, 8, 32)?,
         volume_identifier: read_fixed(block, 40, 32)?,
         volume_set_identifier: read_fixed(block, 190, 128)?,
@@ -186,9 +244,15 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
     })
 }
 
-fn standard_cd_xa_application_use() -> [u8; APPLICATION_USE_END - APPLICATION_USE_START] {
+fn standard_cd_xa_application_use(
+    kind: PrimaryVolumeApplicationUse,
+) -> [u8; APPLICATION_USE_END - APPLICATION_USE_START] {
     let mut data = [0; APPLICATION_USE_END - APPLICATION_USE_START];
     data[CD_XA_SIGNATURE_OFFSET..CD_XA_SIGNATURE_OFFSET + 8].copy_from_slice(b"CD-XA001");
+    if kind == PrimaryVolumeApplicationUse::CdXa001_1_1 {
+        data[CD_XA_SIGNATURE_OFFSET + 8..CD_XA_SIGNATURE_OFFSET + 18]
+            .copy_from_slice(&[0, 0, b'1', b' ', b'1', b' ', b' ', b' ', b' ', b' ']);
+    }
     data
 }
 
@@ -258,9 +322,10 @@ fn validate_standard_record_fields(
     directory: bool,
     uses_xa_system_use: bool,
 ) -> Result<()> {
-    let expected_flags = if directory { DIRECTORY_FLAG } else { 0 };
+    let expected_directory_flag = if directory { DIRECTORY_FLAG } else { 0 };
     ensure!(
-        record.flags == expected_flags,
+        record.flags & DIRECTORY_FLAG == expected_directory_flag
+            && record.flags & !(HIDDEN_FLAG | DIRECTORY_FLAG) == 0,
         "unsupported directory-record flags"
     );
     ensure!(
@@ -300,10 +365,7 @@ fn entry_xa(record: &Record, directory: bool, uses_xa_system_use: bool) -> Resul
     let group_id = u16::from_be_bytes(bytes[0..2].try_into()?);
     let user_id = u16::from_be_bytes(bytes[2..4].try_into()?);
     let raw_attributes = u16::from_be_bytes(bytes[4..6].try_into()?);
-    ensure!(
-        raw_attributes & !XA_ATTRIBUTE_MASK == XA_PERMISSION_BITS,
-        "unsupported directory-record XA permission attributes"
-    );
+    let permissions = raw_attributes & !XA_ATTRIBUTE_MASK;
     let attributes = XaAttributes::from_bits(raw_attributes & XA_ATTRIBUTE_MASK);
     ensure!(
         attributes.contains(crate::manifest::XaAttributeFlag::Directory) == directory,
@@ -315,17 +377,23 @@ fn entry_xa(record: &Record, directory: bool, uses_xa_system_use: bool) -> Resul
         XaAttributes::MODE2_FORM1.bits()
     };
     let file_number = bytes[8];
-    if group_id == 0 && user_id == 0 && attributes.bits() == default_attributes && file_number == 0
+    if group_id == 0
+        && user_id == 0
+        && permissions == DEFAULT_XA_PERMISSIONS
+        && attributes.bits() == default_attributes
+        && file_number == 0
     {
         Ok(None)
     } else {
         Ok(Some(EntryXa {
             group_id,
             user_id,
+            permissions,
             attributes: Some(attributes),
             file_number,
-            form1_subheader: None,
+            form1: None,
             form2: None,
+            index: None,
         }))
     }
 }
@@ -351,10 +419,16 @@ fn serialize_xa_system_use(entry: &Entry, directory: bool) -> Result<Vec<u8>> {
         "XA directory attribute does not match entry kind for {}",
         entry.path
     );
+    let permissions = xa.map_or(DEFAULT_XA_PERMISSIONS, |value| value.permissions);
+    ensure!(
+        permissions & XA_ATTRIBUTE_MASK == 0,
+        "XA permissions overlap attribute bits for {}",
+        entry.path
+    );
     let mut result = vec![0_u8; XA_SYSTEM_USE_SIZE];
     result[0..2].copy_from_slice(&xa.map_or(0, |value| value.group_id).to_be_bytes());
     result[2..4].copy_from_slice(&xa.map_or(0, |value| value.user_id).to_be_bytes());
-    result[4..6].copy_from_slice(&(XA_PERMISSION_BITS | attributes.bits()).to_be_bytes());
+    result[4..6].copy_from_slice(&(permissions | attributes.bits()).to_be_bytes());
     result[6..8].copy_from_slice(b"XA");
     result[8] = xa.map_or(0, |value| value.file_number);
     Ok(result)
@@ -373,6 +447,8 @@ pub struct Layout {
     pub blocks: Vec<[u8; LOGICAL_BLOCK_SIZE]>,
     pub files: Vec<FilePlacement>,
     pub gaps: Vec<GapPlacement>,
+    pub data_subheader_sectors: HashSet<u32>,
+    pub metadata_subheader_sectors: HashSet<u32>,
     pub volume_blocks: u32,
 }
 
@@ -395,7 +471,7 @@ struct DirectoryPlacement {
     blocks: u32,
 }
 
-pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32) -> Result<Layout> {
+pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layout> {
     let file_paths = validate_entries(iso)?;
     let directories = directory_order(&iso.entries, &file_paths)?;
     let path_table_size: usize = directories
@@ -431,6 +507,11 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
     placements[0].extent = next_extent;
     next_extent += placements[0].blocks;
     placed_directories[0] = true;
+    let explicit_directory_paths = iso
+        .files
+        .iter()
+        .filter_map(FileLayoutItem::as_directory)
+        .collect::<HashSet<_>>();
 
     let mut external_ancestors = HashSet::new();
     for entry in iso.entries.iter().filter(|entry| entry.extent.is_some()) {
@@ -442,7 +523,9 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
         }
     }
     for index in 1..placements.len() {
-        if external_ancestors.contains(&index) {
+        if external_ancestors.contains(&index)
+            && !explicit_directory_paths.contains(placements[index].path.as_str())
+        {
             placements[index].extent = next_extent;
             next_extent += placements[index].blocks;
             placed_directories[index] = true;
@@ -452,9 +535,47 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
     let mut files = Vec::with_capacity(file_paths.len());
     let mut gaps = Vec::new();
     let mut pending_gap = None;
+    let mut trailing_xa_gap = 0;
     for item in &iso.files {
+        if let Some(path) = item.as_directory() {
+            let mut ancestors = Vec::new();
+            let mut ancestor = parent_path(path);
+            while ancestor != ROOT_PATH {
+                ancestors.push(directory_index[ancestor.as_str()]);
+                ancestor = parent_path(&ancestor);
+            }
+            for index in ancestors.into_iter().rev() {
+                if !placed_directories[index] {
+                    placements[index].extent = next_extent;
+                    next_extent += placements[index].blocks;
+                    placed_directories[index] = true;
+                }
+            }
+            if let Some(sectors) = pending_gap.take() {
+                gaps.push(GapPlacement {
+                    start: next_extent,
+                    sectors,
+                });
+                next_extent = next_extent
+                    .checked_add(sectors)
+                    .context("gap placement overflow")?;
+            }
+            let index = directory_index[path];
+            ensure!(
+                !placed_directories[index],
+                "directory placement was already allocated: {path}"
+            );
+            placements[index].extent = next_extent;
+            next_extent += placements[index].blocks;
+            placed_directories[index] = true;
+            continue;
+        }
         let Some(path) = item.as_path() else {
-            pending_gap = item.gap_sectors();
+            let sectors = item.gap_sectors().expect("file layout item kind");
+            match item.gap_kind().expect("file layout item kind") {
+                GapKind::Form2 => pending_gap = Some(sectors),
+                GapKind::Xa => trailing_xa_gap = sectors,
+            }
             continue;
         };
         let mut ancestors = Vec::new();
@@ -500,8 +621,17 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
             next_extent += directory.blocks;
         }
     }
+    if let Some(sectors) = pending_gap {
+        gaps.push(GapPlacement {
+            start: next_extent,
+            sectors,
+        });
+        next_extent = next_extent
+            .checked_add(sectors)
+            .context("gap placement overflow")?;
+    }
     let volume_blocks = next_extent
-        .checked_add(trailing)
+        .checked_add(trailing_xa_gap)
         .context("volume size overflow")?;
     let external_files = iso
         .entries
@@ -525,7 +655,7 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
             external.path
         );
     }
-    let logical_volume_blocks =
+    let inferred_logical_volume_blocks =
         external_files
             .iter()
             .try_fold(volume_blocks, |maximum, external| -> Result<u32> {
@@ -536,6 +666,15 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
                         .context("external CDDA extent overflow")?,
                 ))
             })?;
+    let logical_volume_blocks = if let Some(explicit) = iso.primary_volume.volume_space_size {
+        ensure!(
+            explicit >= inferred_logical_volume_blocks,
+            "volume_space_size cannot be smaller than the authored or referenced disc content"
+        );
+        explicit
+    } else {
+        inferred_logical_volume_blocks
+    };
     let placement_by_path: HashMap<_, _> = files
         .iter()
         .chain(&external_files)
@@ -545,6 +684,30 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
         .iter()
         .map(|dir| (dir.path.as_str(), dir))
         .collect();
+    let mut data_subheader_sectors = HashSet::new();
+    let mut metadata_subheader_sectors = HashSet::new();
+    for entry in &iso.entries {
+        if file_paths.contains(entry.path.as_str()) {
+            if entry.sector_subheader == EntrySectorSubheader::Data {
+                let file = placement_by_path[entry.path.as_str()];
+                ensure!(file.blocks > 0, "data-subheader file cannot be empty");
+                data_subheader_sectors.insert(file.extent + file.blocks - 1);
+            }
+        } else {
+            let directory = directory_by_path[entry.path.as_str()];
+            let data_blocks = match entry.sector_subheader {
+                EntrySectorSubheader::Canonical => 0,
+                EntrySectorSubheader::Data => directory.blocks,
+                EntrySectorSubheader::DataUntilFinal => directory.blocks - 1,
+            };
+            for lba in directory.extent..directory.extent + data_blocks {
+                data_subheader_sectors.insert(lba);
+            }
+            for lba in directory.extent + data_blocks..directory.extent + directory.blocks {
+                metadata_subheader_sectors.insert(lba);
+            }
+        }
+    }
 
     let mut blocks = vec![[0_u8; LOGICAL_BLOCK_SIZE]; usize::try_from(next_extent)?];
     let pointers = [
@@ -582,6 +745,8 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>, trailing: u32)
         blocks,
         files,
         gaps,
+        data_subheader_sectors,
+        metadata_subheader_sectors,
         volume_blocks,
     })
 }
@@ -609,36 +774,59 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         .filter_map(|entry| entry.extent.map(|_| entry.path.as_str()))
         .collect::<HashSet<_>>();
     let mut authored_file_paths = HashSet::new();
-    let mut previous_was_gap = false;
+    let mut explicit_directories = HashSet::new();
+    let mut previous_gap_kind = None;
     for (index, item) in iso.files.iter().enumerate() {
-        let Some(path) = item.as_path() else {
-            let sectors = item.gap_sectors().expect("file layout item kind");
-            ensure!(sectors > 0, "physical gap must contain at least one sector");
-            ensure!(!previous_was_gap, "consecutive physical gaps are redundant");
+        if let Some(path) = item.as_path() {
+            ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
+            ensure!(paths.contains(path), "unknown file entry {path}");
             ensure!(
-                index + 1 < iso.files.len(),
-                "physical gap cannot end files list"
+                !external_paths.contains(path),
+                "external CDDA entry cannot appear in files: {path}"
             );
-            previous_was_gap = true;
+            ensure!(
+                authored_file_paths.insert(path),
+                "duplicate file entry {path}"
+            );
+            previous_gap_kind = None;
             continue;
-        };
-        ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
-        ensure!(paths.contains(path), "unknown file entry {path}");
-        ensure!(
-            !external_paths.contains(path),
-            "external CDDA entry cannot appear in files: {path}"
-        );
-        ensure!(
-            authored_file_paths.insert(path),
-            "duplicate file entry {path}"
-        );
-        previous_was_gap = false;
+        }
+        if let Some(path) = item.as_directory() {
+            ensure!(path != ROOT_PATH, "filesystem root placement is fixed");
+            ensure!(paths.contains(path), "unknown directory entry {path}");
+            ensure!(
+                explicit_directories.insert(path),
+                "duplicate directory placement {path}"
+            );
+            previous_gap_kind = None;
+            continue;
+        }
+        {
+            let sectors = item.gap_sectors().expect("file layout item kind");
+            let kind = item.gap_kind().expect("file layout item kind");
+            ensure!(sectors > 0, "physical gap must contain at least one sector");
+            ensure!(
+                previous_gap_kind != Some(kind),
+                "consecutive physical gaps of the same kind are redundant"
+            );
+            if kind == GapKind::Xa {
+                ensure!(index + 1 == iso.files.len(), "XA gap must end files list");
+            }
+            previous_gap_kind = Some(kind);
+            continue;
+        }
     }
     let file_paths = authored_file_paths
         .union(&external_paths)
         .copied()
         .collect::<HashSet<_>>();
     let directory_paths: HashSet<_> = paths.difference(&file_paths).copied().collect();
+    for path in explicit_directories {
+        ensure!(
+            directory_paths.contains(path),
+            "directory placement names a file entry: {path}"
+        );
+    }
     for (index, entry) in iso.entries.iter().enumerate() {
         let has_extent = entry.extent.is_some();
         let has_length = entry.length.is_some();
@@ -664,19 +852,46 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         serialize_xa_system_use(entry, !is_file)?;
         ensure!(
             is_file
-                || entry
-                    .xa
-                    .as_ref()
-                    .is_none_or(|xa| { xa.form1_subheader.is_none() && xa.form2.is_none() }),
+                || entry.xa.as_ref().is_none_or(|xa| {
+                    xa.form1.is_none() && xa.form2.is_none() && xa.index.is_none()
+                }),
             "directory entry cannot have mixed XA framing: {}",
             entry.path
         );
         ensure!(
+            entry.xa.as_ref().is_none_or(|xa| {
+                let count = usize::from(xa.form1.is_some())
+                    + usize::from(xa.form2.is_some())
+                    + usize::from(xa.index.is_some());
+                count == 0 || count == 3
+            }),
+            "interleaved XA entry requires Form 1, Form 2, and index assets: {}",
+            entry.path
+        );
+        let indexed_assets = entry.xa.as_ref().is_some_and(|xa| xa.form1.is_some());
+        let mixed_attributes =
             entry
                 .xa
                 .as_ref()
-                .is_none_or(|xa| xa.form1_subheader.is_none() || xa.form2.is_some()),
-            "Form 1 subheader requires a Form 2 sidecar: {}",
+                .and_then(|xa| xa.attributes)
+                .is_some_and(|attributes| {
+                    attributes.contains(crate::manifest::XaAttributeFlag::Interleaved)
+                        || attributes.contains(crate::manifest::XaAttributeFlag::Mode2Form2)
+                });
+        ensure!(
+            indexed_assets == (is_file && mixed_attributes),
+            "indexed XA assets must match interleaved or Form 2 file attributes: {}",
+            entry.path
+        );
+        ensure!(
+            entry.sector_subheader == EntrySectorSubheader::Canonical
+                || (!has_extent && !mixed_attributes),
+            "data sector subheader policy is unsupported for external or mixed XA entry: {}",
+            entry.path
+        );
+        ensure!(
+            entry.sector_subheader != EntrySectorSubheader::DataUntilFinal || !is_file,
+            "data_until_final sector subheader policy is supported only for directories: {}",
             entry.path
         );
         if index != 0 {
@@ -817,7 +1032,7 @@ fn serialize_pvd(
         extent: root_extent,
         length: root_length,
         recording_time: serialize_recording_time(&root.recording_time)?,
-        flags: DIRECTORY_FLAG,
+        flags: DIRECTORY_FLAG | (u8::from(root.hidden) * HIDDEN_FLAG),
         file_unit_size: 0,
         interleave_gap_size: 0,
         volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
@@ -839,7 +1054,7 @@ fn serialize_pvd(
     block[864..881].copy_from_slice(&serialize_volume_time(pvd.effective_time.as_deref())?);
     block[881] = FILE_STRUCTURE_VERSION;
     block[APPLICATION_USE_START..APPLICATION_USE_END]
-        .copy_from_slice(&standard_cd_xa_application_use());
+        .copy_from_slice(&standard_cd_xa_application_use(pvd.application_use));
     Ok(block)
 }
 
@@ -962,7 +1177,8 @@ fn make_record(
         extent,
         length,
         recording_time: serialize_recording_time(&entry.recording_time)?,
-        flags: if directory { DIRECTORY_FLAG } else { 0 },
+        flags: (if directory { DIRECTORY_FLAG } else { 0 })
+            | (u8::from(entry.hidden) * HIDDEN_FLAG),
         file_unit_size: 0,
         interleave_gap_size: 0,
         volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
@@ -1284,6 +1500,8 @@ mod tests {
         Entry {
             path: path.to_owned(),
             recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
+            hidden: false,
+            sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
             length: None,
@@ -1293,6 +1511,7 @@ mod tests {
     fn test_iso(entries: Vec<Entry>, files: Vec<&str>) -> Iso9660 {
         Iso9660 {
             primary_volume: parse_pvd(&standard_pvd_block()).unwrap(),
+            metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             entries,
             files: files.into_iter().map(FileLayoutItem::path).collect(),
         }
@@ -1326,6 +1545,32 @@ mod tests {
             parse_pvd(&invalid).unwrap_err().to_string(),
             "unsupported PVD CD-XA application-use data"
         );
+
+        let mut extended = source;
+        extended[1032..1042]
+            .copy_from_slice(&[0, 0, b'1', b' ', b'1', b' ', b' ', b' ', b' ', b' ']);
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.primary_volume = parse_pvd(&extended).unwrap();
+        assert_eq!(
+            iso.primary_volume.application_use,
+            PrimaryVolumeApplicationUse::CdXa001_1_1
+        );
+        let generated =
+            serialize_pvd(&iso, 20, 10, [18, 19, 20, 21], 22, 2048, &iso.entries[0]).unwrap();
+        assert_eq!(&generated[883..1395], &extended[883..1395]);
+    }
+
+    #[test]
+    fn explicit_volume_space_size_may_exceed_the_authored_data_track() {
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.primary_volume.volume_space_size = Some(294_418);
+        iso.files.push(FileLayoutItem::xa_gap(150));
+        let lengths = HashMap::new();
+
+        let authored = layout(&iso, &lengths).unwrap();
+
+        assert_eq!(authored.volume_blocks, 173);
+        assert_eq!(read_both_u32(&authored.blocks[16], 80).unwrap(), 294_418);
     }
 
     #[test]
@@ -1486,7 +1731,7 @@ mod tests {
             ("S1/B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
         ]);
 
-        let authored = layout(&iso, &file_lengths, 0).unwrap();
+        let authored = layout(&iso, &file_lengths).unwrap();
         assert_eq!(
             authored
                 .files
@@ -1500,6 +1745,28 @@ mod tests {
                 u32::from_le_bytes(authored.blocks[18][offset..offset + 4].try_into().unwrap())
             }),
             [22, 24, 26]
+        );
+    }
+
+    #[test]
+    fn explicit_directory_item_controls_empty_directory_placement() {
+        let mut iso = test_iso(
+            vec![
+                test_entry(ROOT_PATH),
+                test_entry("EMPTY"),
+                test_entry("FILE.BIN"),
+            ],
+            vec!["FILE.BIN"],
+        );
+        iso.files.insert(0, FileLayoutItem::directory("EMPTY"));
+        let lengths = HashMap::from([("FILE.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64)]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+
+        assert_eq!(authored.files[0].extent, 24);
+        assert_eq!(
+            u32::from_le_bytes(authored.blocks[18][12..16].try_into().unwrap()),
+            23
         );
     }
 
@@ -1519,13 +1786,13 @@ mod tests {
             ("B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
         ]);
 
-        let authored = layout(&iso, &lengths, 0).unwrap();
+        let authored = layout(&iso, &lengths).unwrap();
         assert_eq!(authored.files[0].extent, 23);
         assert_eq!(authored.files[1].extent, 27);
     }
 
     #[test]
-    fn physical_gaps_reject_zero_consecutive_and_final_items() {
+    fn physical_gaps_reject_zero_redundant_and_nonfinal_xa_items() {
         let base = test_iso(
             vec![
                 test_entry(ROOT_PATH),
@@ -1548,8 +1815,8 @@ mod tests {
             ],
             vec![
                 FileLayoutItem::path("A.BIN"),
+                FileLayoutItem::xa_gap(1),
                 FileLayoutItem::path("B.BIN"),
-                FileLayoutItem::gap(1),
             ],
         ] {
             let mut iso = base.clone();
@@ -1564,10 +1831,12 @@ mod tests {
         directory.xa = Some(EntryXa {
             group_id: 0,
             user_id: 0,
+            permissions: DEFAULT_XA_PERMISSIONS,
             attributes: Some(XaAttributes::MODE2_FORM1),
             file_number: 0,
-            form1_subheader: None,
+            form1: None,
             form2: None,
+            index: None,
         });
         assert!(validate(&test_iso(vec![directory], vec![])).is_err());
 
@@ -1575,14 +1844,46 @@ mod tests {
         directory.xa = Some(EntryXa {
             group_id: 0,
             user_id: 0,
+            permissions: DEFAULT_XA_PERMISSIONS,
             attributes: Some(XaAttributes::from_bits(
                 XaAttributes::MODE2_FORM1.bits() | XaAttributes::DIRECTORY.bits(),
             )),
             file_number: 0,
-            form1_subheader: None,
-            form2: Some("ROOT.XA".to_owned()),
+            form1: Some("ROOT.XA1".to_owned()),
+            form2: Some("ROOT.XA2".to_owned()),
+            index: Some("ROOT.XAI".to_owned()),
         });
         assert!(validate(&test_iso(vec![directory], vec![])).is_err());
+
+        let mut mixed_without_assets = test_entry("MOVIE.STR");
+        mixed_without_assets.xa = Some(EntryXa {
+            attributes: Some(XaAttributes::from_bits(
+                XaAttributes::MODE2_FORM1.bits() | XaAttributes::MODE2_FORM2.bits(),
+            )),
+            ..EntryXa::default()
+        });
+        assert!(
+            validate(&test_iso(
+                vec![test_entry(ROOT_PATH), mixed_without_assets],
+                vec!["MOVIE.STR"],
+            ))
+            .is_err()
+        );
+
+        let mut assets_without_mixed_attributes = test_entry("MOVIE.STR");
+        assets_without_mixed_attributes.xa = Some(EntryXa {
+            form1: Some("MOVIE.STR.XA1".to_owned()),
+            form2: Some("MOVIE.STR.XA2".to_owned()),
+            index: Some("MOVIE.STR.XAI".to_owned()),
+            ..EntryXa::default()
+        });
+        assert!(
+            validate(&test_iso(
+                vec![test_entry(ROOT_PATH), assets_without_mixed_attributes],
+                vec!["MOVIE.STR"],
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1603,7 +1904,7 @@ mod tests {
         record.system_use = serialize_xa_system_use(&test_entry("DIR"), true).unwrap();
         validate_standard_record_fields(&record, true, true).unwrap();
 
-        record.flags = 1;
+        record.flags = 4;
         assert!(validate_standard_record_fields(&record, false, true).is_err());
         record.flags = 0;
         record.system_use = serialize_xa_system_use(&test_entry("FILE.BIN"), false).unwrap();
@@ -1615,11 +1916,20 @@ mod tests {
         record.interleave_gap_size = 0;
         record.volume_sequence_number = 2;
         assert!(validate_standard_record_fields(&record, false, true).is_err());
-        record.volume_sequence_number = 1;
-        record.system_use[4] = 0;
-        assert!(validate_standard_record_fields(&record, false, true).is_err());
 
         assert_eq!(identifier(&test_entry("FILE.BIN"), true), "FILE.BIN;1");
+    }
+
+    #[test]
+    fn hidden_directory_record_flag_is_structured_and_rebuilt() {
+        let mut entry = test_entry("SECRET.BIN");
+        entry.hidden = true;
+
+        let bytes = make_record(&entry, 24, 7, b"SECRET.BIN;1".to_vec(), false).unwrap();
+        let record = parse_record(&bytes).unwrap();
+
+        assert_eq!(record.flags, 1);
+        validate_standard_record_fields(&record, false, true).unwrap();
     }
 
     #[test]
@@ -1644,6 +1954,42 @@ mod tests {
                 &Entry {
                     path: "PETEXA0.STR".to_owned(),
                     recording_time: "1998-01-01T00:00:00+00:00".to_owned(),
+                    hidden: false,
+                    sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
+                    xa: Some(xa),
+                    extent: None,
+                    length: None,
+                },
+                false,
+            )
+            .unwrap(),
+            record.system_use
+        );
+    }
+
+    #[test]
+    fn nondefault_xa_permission_bits_are_preserved() {
+        let record = Record {
+            extent: 24,
+            length: 61,
+            recording_time: [99, 1, 1, 0, 0, 0, 0],
+            flags: 0,
+            file_unit_size: 0,
+            interleave_gap_size: 0,
+            volume_sequence_number: 1,
+            name: b"SYSTEM.CNF;1".to_vec(),
+            system_use: [0, 0, 0, 0, 0x09, 0x11, b'X', b'A', 0, 0, 0, 0, 0, 0].to_vec(),
+        };
+
+        let xa = entry_xa(&record, false, true).unwrap().unwrap();
+        assert_eq!(xa.permissions, 0x0111);
+        assert_eq!(
+            serialize_xa_system_use(
+                &Entry {
+                    path: "SYSTEM.CNF".to_owned(),
+                    recording_time: "1999-01-01T00:00:00+00:00".to_owned(),
+                    hidden: false,
+                    sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                     extent: None,
                     length: None,
@@ -1666,7 +2012,7 @@ mod tests {
         audio.length = Some(2048);
         let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
         let lengths = HashMap::new();
-        let authored = layout(&iso, &lengths, 0).unwrap();
+        let authored = layout(&iso, &lengths).unwrap();
         assert_eq!(authored.volume_blocks, 23);
         assert_eq!(read_both_u32(&authored.blocks[16], 80).unwrap(), 26);
 
@@ -1696,7 +2042,7 @@ mod tests {
         );
         let lengths = HashMap::from([(String::from("LOCAL.BIN"), 2048_u64)]);
 
-        let authored = layout(&iso, &lengths, 0).unwrap();
+        let authored = layout(&iso, &lengths).unwrap();
         assert_eq!(authored.files[0].extent, 24);
     }
 }

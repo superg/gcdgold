@@ -1,2 +1,9 @@
 /data/
+/gcdgold-catalog-logs/
+/gcdgold-catalog.tsv
+/gcdgold-failures.csv
+/gcdgold-failures.csv.bak
+/gcdgold-failures.csv.bak.tmp
+/gcdgold-failures.csv.tmp
+/scripts/test_rom_catalog.toml
 /target/
