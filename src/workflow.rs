@@ -650,6 +650,10 @@ pub fn extract_with_options(
         && sectors[16].subheader_copy == FORM1_DATA_SUBHEADER
     {
         parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::Data;
+    } else if sectors[16].subheader == SYSTEM_END_OF_FILE_SUBHEADER
+        && sectors[16].subheader_copy == SYSTEM_END_OF_FILE_SUBHEADER
+    {
+        parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
     } else if sectors[16].subheader == ISO_METADATA_SUBHEADER
         && sectors[16].subheader_copy == ISO_METADATA_SUBHEADER
     {
@@ -905,10 +909,12 @@ fn path_table_subheader(
     blocks: u32,
 ) -> XaSubheader {
     match policy {
-        EntrySectorSubheader::Canonical
-        | EntrySectorSubheader::EndOfFileData
-        | EntrySectorSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
+        EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => {
+            ISO_METADATA_SUBHEADER
+        }
         EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
+        EntrySectorSubheader::EndOfFileData if block_index + 1 < blocks => FORM1_DATA_SUBHEADER,
+        EntrySectorSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
         EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => FORM1_DATA_SUBHEADER,
         EntrySectorSubheader::DataUntilFinal => ISO_METADATA_SUBHEADER,
     }
@@ -924,6 +930,7 @@ fn detect_path_table_subheader(
     for policy in [
         EntrySectorSubheader::Canonical,
         EntrySectorSubheader::Data,
+        EntrySectorSubheader::EndOfFileData,
         EntrySectorSubheader::DataUntilFinal,
     ] {
         let matches = path_tables
@@ -1005,11 +1012,20 @@ fn detect_entry_sector_subheaders(
         );
         let directory_sectors = &sectors[start..start + blocks];
         let data_subheader = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
+        let end_of_file_subheader = entry_file_subheader(entry, SYSTEM_END_OF_FILE_SUBHEADER);
         let metadata_subheader = entry_file_subheader(entry, ISO_METADATA_SUBHEADER);
         if directory_sectors.iter().all(|sector| {
             sector.subheader == data_subheader && sector.subheader_copy == data_subheader
         }) {
             entry.sector_subheader = EntrySectorSubheader::Data;
+        } else if blocks > 0
+            && directory_sectors[..blocks - 1].iter().all(|sector| {
+                sector.subheader == data_subheader && sector.subheader_copy == data_subheader
+            })
+            && directory_sectors[blocks - 1].subheader == end_of_file_subheader
+            && directory_sectors[blocks - 1].subheader_copy == end_of_file_subheader
+        {
+            entry.sector_subheader = EntrySectorSubheader::EndOfFileData;
         } else if blocks > 1
             && directory_sectors[..blocks - 1].iter().all(|sector| {
                 sector.subheader == data_subheader && sector.subheader_copy == data_subheader
@@ -1085,8 +1101,11 @@ fn validate_iso_subheaders(
                             EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => {
                                 FORM1_DATA_SUBHEADER
                             }
+                            EntrySectorSubheader::EndOfFileData if block_index + 1 < blocks => {
+                                FORM1_DATA_SUBHEADER
+                            }
+                            EntrySectorSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
                             EntrySectorSubheader::Canonical
-                            | EntrySectorSubheader::EndOfFileData
                             | EntrySectorSubheader::DataUntilFinal
                             | EntrySectorSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
                         };
@@ -1137,10 +1156,12 @@ fn validate_iso_subheaders(
         } else {
             "metadata"
         };
-        let expected = if lba == 16 {
+        let pvd_end = 16 + usize::from(parsed_iso.manifest.primary_volume_copies);
+        let expected = if (16..pvd_end).contains(&lba) {
             match parsed_iso.manifest.metadata_subheader {
                 IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
+                IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
                 IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
             }
         } else if let Some((is_last, interleaved, policy, file_number)) = file_sector_info.get(&lba)
@@ -1175,6 +1196,7 @@ fn validate_iso_subheaders(
                     ISO_METADATA_SUBHEADER
                 }
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
+                IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
             }
         };
         if sector.kind == Kind::Form2
@@ -1480,10 +1502,12 @@ pub fn build(
             }
             continue;
         }
-        let mut subheader = if lba == 16 {
+        let pvd_end = 16 + u32::from(manifest.iso9660.primary_volume_copies);
+        let mut subheader = if (16..pvd_end).contains(&lba) {
             match manifest.iso9660.metadata_subheader {
                 IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
+                IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
                 IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
             }
         } else if layout.data_subheader_sectors.contains(&lba) {
@@ -1504,6 +1528,7 @@ pub fn build(
                     ISO_METADATA_SUBHEADER
                 }
                 IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
+                IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
             }
         };
         if let Some(file_number) = layout.sector_file_numbers.get(&lba) {
@@ -2268,6 +2293,36 @@ mod tests {
     }
 
     #[test]
+    fn pvd_end_of_file_data_subheader_is_supported_in_memory() {
+        let mut subheaders = vec![FORM1_DATA_SUBHEADER; 18];
+        subheaders[16] = SYSTEM_END_OF_FILE_SUBHEADER;
+        subheaders[17] = SYSTEM_END_OF_FILE_SUBHEADER;
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
+        parsed.manifest.entries.truncate(1);
+        parsed.manifest.files.clear();
+        parsed.files.clear();
+
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
+    fn repeated_pvds_retain_the_pvd_subheader() {
+        let mut subheaders = vec![ISO_METADATA_SUBHEADER; 20];
+        subheaders[..16].fill(FORM1_DATA_SUBHEADER);
+        subheaders[16..19].fill(PVD_SUBHEADER);
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.manifest.primary_volume_copies = 3;
+        parsed.manifest.entries.truncate(1);
+        parsed.manifest.files.clear();
+        parsed.files.clear();
+
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
     fn pvd_metadata_policy_can_mix_all_metadata_and_canonical_files() {
         let mut subheaders = vec![FORM1_DATA_SUBHEADER; 21];
         subheaders[16] = ISO_METADATA_SUBHEADER;
@@ -2355,6 +2410,43 @@ mod tests {
     }
 
     #[test]
+    fn directory_end_of_file_data_subheader_is_detected_in_memory() {
+        let mut subheaders = vec![FORM1_DATA_SUBHEADER; 18];
+        subheaders[16] = PVD_SUBHEADER;
+        subheaders[17] = SYSTEM_END_OF_FILE_SUBHEADER;
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.files.clear();
+        parsed
+            .manifest
+            .entries
+            .retain(|entry| entry.path == iso9660::ROOT_PATH);
+        parsed.manifest.entries.push(Entry {
+            path: "DIR".to_owned(),
+            recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
+            hidden: false,
+            associated: false,
+            sector_subheader: EntrySectorSubheader::Canonical,
+            xa: None,
+            extent: None,
+            length: None,
+        });
+        parsed.directories.push(iso9660::ParsedDirectory {
+            path: "DIR".to_owned(),
+            extent: 17,
+            length: LOGICAL_BLOCK_SIZE as u32,
+        });
+
+        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+
+        assert_eq!(
+            parsed.manifest.entries[1].sector_subheader,
+            EntrySectorSubheader::EndOfFileData
+        );
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
     fn path_table_data_until_final_policy_is_detected_in_memory() {
         let mut subheaders = vec![ISO_METADATA_SUBHEADER; 26];
         subheaders[..16].fill(FORM1_DATA_SUBHEADER);
@@ -2374,6 +2466,31 @@ mod tests {
         assert_eq!(
             parsed.manifest.path_table_subheader,
             EntrySectorSubheader::DataUntilFinal
+        );
+        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
+    fn path_table_end_of_file_data_policy_is_detected_in_memory() {
+        let mut subheaders = vec![ISO_METADATA_SUBHEADER; 26];
+        subheaders[..16].fill(FORM1_DATA_SUBHEADER);
+        subheaders[16] = PVD_SUBHEADER;
+        for lba in [18, 20, 22, 24] {
+            subheaders[lba] = FORM1_DATA_SUBHEADER;
+            subheaders[lba + 1] = SYSTEM_END_OF_FILE_SUBHEADER;
+        }
+        let sectors = parsed_form1_sequence(&subheaders);
+        let mut parsed = parsed_iso();
+        parsed.path_tables = Some(iso9660::ParsedPathTables {
+            extents: [18, 20, 22, 24],
+            blocks: 2,
+        });
+
+        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+
+        assert_eq!(
+            parsed.manifest.path_table_subheader,
+            EntrySectorSubheader::EndOfFileData
         );
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }

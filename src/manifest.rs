@@ -82,8 +82,10 @@ struct TrackWithDefaults<'a> {
 #[derive(Serialize)]
 struct Iso9660WithDefaults<'a> {
     primary_volume: PrimaryVolumeWithDefaults<'a>,
+    primary_volume_copies: u8,
     metadata_subheader: IsoMetadataSubheader,
     identifier_policy: IdentifierPolicy,
+    directory_record_packing: DirectoryRecordPacking,
     path_table_copies: PathTableCopies,
     path_table_subheader: EntrySectorSubheader,
     entries: Vec<EntryWithDefaults<'a>>,
@@ -228,8 +230,10 @@ pub(crate) fn serialize_manifest(
                     expiration_time: manifest.iso9660.primary_volume.expiration_time.as_deref(),
                     effective_time: manifest.iso9660.primary_volume.effective_time.as_deref(),
                 },
+                primary_volume_copies: manifest.iso9660.primary_volume_copies,
                 metadata_subheader: manifest.iso9660.metadata_subheader,
                 identifier_policy: manifest.iso9660.identifier_policy,
+                directory_record_packing: manifest.iso9660.directory_record_packing,
                 path_table_copies: manifest.iso9660.path_table_copies,
                 path_table_subheader: manifest.iso9660.path_table_subheader,
                 entries,
@@ -404,16 +408,31 @@ impl Form1Sectors {
 #[serde(deny_unknown_fields)]
 pub struct Iso9660 {
     pub primary_volume: PrimaryVolume,
+    #[serde(
+        default = "default_primary_volume_copies",
+        skip_serializing_if = "is_one"
+    )]
+    pub primary_volume_copies: u8,
     #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
     pub metadata_subheader: IsoMetadataSubheader,
     #[serde(default, skip_serializing_if = "IdentifierPolicy::is_default")]
     pub identifier_policy: IdentifierPolicy,
+    #[serde(default, skip_serializing_if = "DirectoryRecordPacking::is_default")]
+    pub directory_record_packing: DirectoryRecordPacking,
     #[serde(default, skip_serializing_if = "PathTableCopies::is_default")]
     pub path_table_copies: PathTableCopies,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub path_table_subheader: EntrySectorSubheader,
     pub entries: Vec<Entry>,
     pub files: Vec<FileLayoutItem>,
+}
+
+const fn default_primary_volume_copies() -> u8 {
+    1
+}
+
+const fn is_one(value: &u8) -> bool {
+    *value == 1
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +446,20 @@ pub enum IdentifierPolicy {
 impl IdentifierPolicy {
     const fn is_default(&self) -> bool {
         matches!(self, Self::IsoLevel1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryRecordPacking {
+    #[default]
+    Fill,
+    AvoidExactFit,
+}
+
+impl DirectoryRecordPacking {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Fill)
     }
 }
 
@@ -450,6 +483,7 @@ pub enum IsoMetadataSubheader {
     #[default]
     Canonical,
     Data,
+    EndOfFileData,
     IsoMetadata,
 }
 
@@ -635,6 +669,7 @@ pub enum PrimaryVolumeApplicationUse {
     #[default]
     CdXa001,
     CdXa001_1_1,
+    CdXa001Xcd3221Revision13,
     #[serde(rename = "cd_rep_2_0_131")]
     CdRep20131,
 }

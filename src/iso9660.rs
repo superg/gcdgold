@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::{Context, Result, ensure};
 
 use crate::manifest::{
-    DEFAULT_XA_PERMISSIONS, Entry, EntrySectorSubheader, EntryXa, FileLayoutItem, GapKind,
-    IdentifierPolicy, Iso9660, PathTableCopies, PrimaryVolume, PrimaryVolumeApplicationUse,
-    RootDirectoryIdentifier, XaAttributes,
+    DEFAULT_XA_PERMISSIONS, DirectoryRecordPacking, Entry, EntrySectorSubheader, EntryXa,
+    FileLayoutItem, GapKind, IdentifierPolicy, Iso9660, PathTableCopies, PrimaryVolume,
+    PrimaryVolumeApplicationUse, RootDirectoryIdentifier, XaAttributes,
 };
 use crate::raw_cd::{LOGICAL_BLOCK_SIZE, XaSubheader};
 
@@ -73,9 +73,27 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         &pvd_block[0..7] == b"\x01CD001\x01",
         "missing supported PVD at LBA 16"
     );
+    let mut primary_volume_copies = 1_usize;
+    while blocks
+        .get(16 + primary_volume_copies)
+        .is_some_and(|block| &block[..7] == b"\x01CD001\x01")
+    {
+        ensure!(
+            blocks[16 + primary_volume_copies] == *pvd_block,
+            "additional primary volume descriptors must be identical"
+        );
+        primary_volume_copies += 1;
+    }
     ensure!(
-        &blocks[17][0..7] == b"\xffCD001\x01",
-        "expected volume terminator at LBA 17"
+        matches!(primary_volume_copies, 1 | 3),
+        "unsupported primary volume descriptor copy count {primary_volume_copies}"
+    );
+    let terminator_lba = 16 + primary_volume_copies;
+    ensure!(
+        blocks
+            .get(terminator_lba)
+            .is_some_and(|block| &block[..7] == b"\xffCD001\x01"),
+        "expected volume terminator at LBA {terminator_lba}"
     );
     let source_volume_space_size = read_both_u32(pvd_block, 80)?;
     let path_table_size = read_both_u32(pvd_block, 132)?;
@@ -107,7 +125,8 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     let mut pvd = parse_pvd(pvd_block)?;
     let root_record = parse_record(&pvd_block[156..])?;
     validate_standard_record_fields(&root_record, true, false)?;
-    let root_records = read_directory(blocks, root_record.extent, root_record.length)?;
+    let (root_records, mut packing_observation) =
+        read_directory(blocks, root_record.extent, root_record.length)?;
     ensure!(root_records.len() >= 2, "root directory lacks dot records");
     let dot = &root_records[0];
     let root = Entry {
@@ -136,7 +155,8 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             seen_dirs.insert(extent),
             "directory extent cycle at LBA {extent}"
         );
-        let records = read_directory(blocks, extent, length)?;
+        let (records, observation) = read_directory(blocks, extent, length)?;
+        packing_observation.merge(observation);
         ensure!(records.len() >= 2, "directory lacks dot records");
         for record in &records {
             validate_standard_record_fields(record, record.flags & DIRECTORY_FLAG != 0, true)?;
@@ -226,6 +246,10 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         source_volume_space_size >= referenced_volume_space_size,
         "PVD volume space size is smaller than the referenced disc content"
     );
+    ensure!(
+        !(packing_observation.skipped_exact_fit && packing_observation.packed_exact_fit),
+        "directories use inconsistent exact-fit record packing"
+    );
     let inferred_volume_space_size = entries.iter().try_fold(
         u32::try_from(blocks.len())?,
         |maximum, entry| -> Result<u32> {
@@ -249,8 +273,14 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     Ok(ParsedIso {
         manifest: Iso9660 {
             primary_volume: pvd,
+            primary_volume_copies: u8::try_from(primary_volume_copies)?,
             metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             identifier_policy,
+            directory_record_packing: if packing_observation.skipped_exact_fit {
+                DirectoryRecordPacking::AvoidExactFit
+            } else {
+                DirectoryRecordPacking::Fill
+            },
             path_table_copies,
             path_table_subheader: EntrySectorSubheader::Canonical,
             entries,
@@ -286,6 +316,7 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
     let application_use = [
         PrimaryVolumeApplicationUse::CdXa001,
         PrimaryVolumeApplicationUse::CdXa001_1_1,
+        PrimaryVolumeApplicationUse::CdXa001Xcd3221Revision13,
         PrimaryVolumeApplicationUse::CdRep20131,
     ]
     .into_iter()
@@ -333,14 +364,30 @@ fn primary_volume_application_use(
         data[CD_XA_SIGNATURE_OFFSET + 8..CD_XA_SIGNATURE_OFFSET + 18]
             .copy_from_slice(&[0, 0, b'1', b' ', b'1', b' ', b' ', b' ', b' ', b' ']);
     }
+    if kind == PrimaryVolumeApplicationUse::CdXa001Xcd3221Revision13 {
+        data[APPLICATION_USE_END - APPLICATION_USE_START - 12..].copy_from_slice(b"XCD322.1 (13");
+    }
     data
+}
+
+#[derive(Clone, Copy, Default)]
+struct DirectoryPackingObservation {
+    skipped_exact_fit: bool,
+    packed_exact_fit: bool,
+}
+
+impl DirectoryPackingObservation {
+    fn merge(&mut self, other: Self) {
+        self.skipped_exact_fit |= other.skipped_exact_fit;
+        self.packed_exact_fit |= other.packed_exact_fit;
+    }
 }
 
 fn read_directory(
     blocks: &[[u8; LOGICAL_BLOCK_SIZE]],
     extent: u32,
     length: u32,
-) -> Result<Vec<Record>> {
+) -> Result<(Vec<Record>, DirectoryPackingObservation)> {
     let start = usize::try_from(extent)?;
     let count = usize::try_from(length)?.div_ceil(LOGICAL_BLOCK_SIZE);
     ensure!(
@@ -353,18 +400,30 @@ fn read_directory(
     }
     bytes.truncate(usize::try_from(length)?);
     let mut records = Vec::new();
+    let mut observation = DirectoryPackingObservation::default();
     let mut offset = 0;
     while offset < bytes.len() {
         let length = usize::from(bytes[offset]);
         if length == 0 {
-            offset = (offset / LOGICAL_BLOCK_SIZE + 1) * LOGICAL_BLOCK_SIZE;
+            let next_block = (offset / LOGICAL_BLOCK_SIZE + 1) * LOGICAL_BLOCK_SIZE;
+            if next_block < bytes.len()
+                && bytes[next_block] != 0
+                && next_block - offset == usize::from(bytes[next_block])
+                && bytes[offset..next_block].iter().all(|byte| *byte == 0)
+            {
+                observation.skipped_exact_fit = true;
+            }
+            offset = next_block;
             continue;
         }
         ensure!(offset + length <= bytes.len(), "truncated directory record");
         records.push(parse_record(&bytes[offset..offset + length])?);
         offset += length;
+        if offset.is_multiple_of(LOGICAL_BLOCK_SIZE) {
+            observation.packed_exact_fit = true;
+        }
     }
-    Ok(records)
+    Ok((records, observation))
 }
 
 fn parse_record(bytes: &[u8]) -> Result<Record> {
@@ -582,17 +641,21 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
         .map(|(_, name, _)| 8 + name.len() + usize::from(name.len() % 2 == 1))
         .sum();
     let path_blocks = path_table_size.div_ceil(LOGICAL_BLOCK_SIZE).max(1) as u32;
+    let path_table_start = 17 + u32::from(iso.primary_volume_copies);
     let (path_table_pointers, mut next_extent) = match iso.path_table_copies {
         PathTableCopies::Duplicate => (
             [
-                18,
-                18 + path_blocks,
-                18 + path_blocks * 2,
-                18 + path_blocks * 3,
+                path_table_start,
+                path_table_start + path_blocks,
+                path_table_start + path_blocks * 2,
+                path_table_start + path_blocks * 3,
             ],
-            18 + path_blocks * 4,
+            path_table_start + path_blocks * 4,
         ),
-        PathTableCopies::Single => ([18, 0, 18 + path_blocks, 0], 18 + path_blocks * 2),
+        PathTableCopies::Single => (
+            [path_table_start, 0, path_table_start + path_blocks, 0],
+            path_table_start + path_blocks * 2,
+        ),
     };
 
     let entry_by_path: HashMap<_, _> = iso
@@ -603,7 +666,7 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
     let mut placements = Vec::with_capacity(directories.len());
     for (path, name, parent) in &directories {
         let record_lengths = directory_record_lengths(path, iso, &file_paths);
-        let blocks = packed_blocks(&record_lengths) as u32;
+        let blocks = packed_blocks(&record_lengths, iso.directory_record_packing) as u32;
         placements.push(DirectoryPlacement {
             path: path.clone(),
             name: name.clone(),
@@ -775,13 +838,6 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
             })
         })
         .collect::<Vec<_>>();
-    for external in &external_files {
-        ensure!(
-            external.extent >= volume_blocks,
-            "external CDDA extent overlaps the authored data track: {}",
-            external.path
-        );
-    }
     let referenced_content_blocks = placements
         .iter()
         .map(|placement| (placement.extent, placement.blocks))
@@ -834,9 +890,8 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
     let path_table_data_blocks = match iso.path_table_subheader {
         EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => 0,
         EntrySectorSubheader::Data => path_blocks,
-        EntrySectorSubheader::DataUntilFinal => path_blocks - 1,
-        EntrySectorSubheader::EndOfFileData => {
-            unreachable!("validated path-table subheader policy")
+        EntrySectorSubheader::EndOfFileData | EntrySectorSubheader::DataUntilFinal => {
+            path_blocks - 1
         }
     };
     for pointer in path_table_pointers
@@ -848,6 +903,11 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
         }
         for lba in pointer + path_table_data_blocks..pointer + path_blocks {
             metadata_subheader_sectors.insert(lba);
+        }
+        if iso.path_table_subheader == EntrySectorSubheader::EndOfFileData {
+            let final_lba = pointer + path_blocks - 1;
+            metadata_subheader_sectors.remove(&final_lba);
+            end_of_file_data_subheader_sectors.insert(final_lba);
         }
     }
     for entry in &iso.entries {
@@ -892,11 +952,11 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
                 }
             }
             let data_blocks = match entry.sector_subheader {
-                EntrySectorSubheader::Canonical
-                | EntrySectorSubheader::EndOfFileData
-                | EntrySectorSubheader::IsoMetadata => 0,
+                EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => 0,
                 EntrySectorSubheader::Data => directory.blocks,
-                EntrySectorSubheader::DataUntilFinal => directory.blocks - 1,
+                EntrySectorSubheader::EndOfFileData | EntrySectorSubheader::DataUntilFinal => {
+                    directory.blocks - 1
+                }
             };
             for lba in directory.extent..directory.extent + data_blocks {
                 data_subheader_sectors.insert(lba);
@@ -904,11 +964,16 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
             for lba in directory.extent + data_blocks..directory.extent + directory.blocks {
                 metadata_subheader_sectors.insert(lba);
             }
+            if entry.sector_subheader == EntrySectorSubheader::EndOfFileData {
+                let final_lba = directory.extent + directory.blocks - 1;
+                metadata_subheader_sectors.remove(&final_lba);
+                end_of_file_data_subheader_sectors.insert(final_lba);
+            }
         }
     }
 
     let mut blocks = vec![[0_u8; LOGICAL_BLOCK_SIZE]; usize::try_from(next_extent)?];
-    blocks[16] = serialize_pvd(
+    let pvd = serialize_pvd(
         iso,
         logical_volume_blocks,
         path_table_size as u32,
@@ -917,7 +982,11 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
         placements[0].blocks * 2048,
         entry_by_path[ROOT_PATH],
     )?;
-    blocks[17][0..7].copy_from_slice(b"\xffCD001\x01");
+    for copy in 0..u32::from(iso.primary_volume_copies) {
+        blocks[usize::try_from(16 + copy)?] = pvd;
+    }
+    let terminator_lba = 16 + u32::from(iso.primary_volume_copies);
+    blocks[usize::try_from(terminator_lba)?][0..7].copy_from_slice(b"\xffCD001\x01");
     write_path_tables(&mut blocks, &placements, path_table_pointers, path_blocks)?;
     for directory in &placements {
         let data = serialize_directory(
@@ -947,8 +1016,8 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
 
 fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     ensure!(
-        iso.path_table_subheader != EntrySectorSubheader::EndOfFileData,
-        "end_of_file_data sector subheader policy is unsupported for path tables"
+        matches!(iso.primary_volume_copies, 1 | 3),
+        "primary_volume_copies must be 1 or 3"
     );
     let root = iso
         .entries
@@ -973,7 +1042,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         .collect::<HashSet<_>>();
     let mut authored_file_paths = HashSet::new();
     let mut explicit_directories = HashSet::new();
-    let mut previous_gap_kind = None;
+    let mut previous_gap = None;
     for (index, item) in iso.files.iter().enumerate() {
         if let Some(path) = item.as_path() {
             ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
@@ -986,7 +1055,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 authored_file_paths.insert(path),
                 "duplicate file entry {path}"
             );
-            previous_gap_kind = None;
+            previous_gap = None;
             continue;
         }
         if let Some(path) = item.as_directory() {
@@ -996,7 +1065,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 explicit_directories.insert(path),
                 "duplicate directory placement {path}"
             );
-            previous_gap_kind = None;
+            previous_gap = None;
             continue;
         }
         {
@@ -1005,8 +1074,8 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             let subheader = item.gap_subheader();
             ensure!(sectors > 0, "physical gap must contain at least one sector");
             ensure!(
-                previous_gap_kind != Some(kind),
-                "consecutive physical gaps of the same kind are redundant"
+                previous_gap != Some((kind, subheader)),
+                "consecutive identical physical gaps are redundant"
             );
             if kind == GapKind::Xa {
                 ensure!(index + 1 == iso.files.len(), "XA gap must end files list");
@@ -1026,7 +1095,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                     "only a Form 1 gap may declare an XA subheader"
                 ),
             }
-            previous_gap_kind = Some(kind);
+            previous_gap = Some((kind, subheader));
             continue;
         }
     }
@@ -1055,13 +1124,6 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             "fixed extent and length are supported only for external CDDA entries: {}",
             entry.path
         );
-        if let Some(length) = entry.length {
-            ensure!(
-                length > 0,
-                "external CDDA entry cannot be empty: {}",
-                entry.path
-            );
-        }
         let is_file = file_paths.contains(entry.path.as_str());
         serialize_xa_system_use(entry, !is_file)?;
         ensure!(
@@ -1114,11 +1176,6 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         ensure!(
             entry.sector_subheader != EntrySectorSubheader::DataUntilFinal || !is_file,
             "data_until_final sector subheader policy is supported only for directories: {}",
-            entry.path
-        );
-        ensure!(
-            entry.sector_subheader != EntrySectorSubheader::EndOfFileData || is_file,
-            "end_of_file_data sector subheader policy is supported only for files: {}",
             entry.path
         );
         if index != 0 {
@@ -1243,11 +1300,14 @@ fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str
     lengths
 }
 
-fn packed_blocks(lengths: &[usize]) -> usize {
+fn packed_blocks(lengths: &[usize], packing: DirectoryRecordPacking) -> usize {
     let mut offset = 0;
     for length in lengths {
         let in_block = offset % LOGICAL_BLOCK_SIZE;
-        if in_block + length > LOGICAL_BLOCK_SIZE {
+        if in_block + length > LOGICAL_BLOCK_SIZE
+            || (in_block + length == LOGICAL_BLOCK_SIZE
+                && packing == DirectoryRecordPacking::AvoidExactFit)
+        {
             offset += LOGICAL_BLOCK_SIZE - in_block;
         }
         offset += length;
@@ -1425,7 +1485,10 @@ fn serialize_directory(
     let mut offset = 0;
     for record in records {
         let in_block = offset % LOGICAL_BLOCK_SIZE;
-        if in_block + record.len() > LOGICAL_BLOCK_SIZE {
+        if in_block + record.len() > LOGICAL_BLOCK_SIZE
+            || (in_block + record.len() == LOGICAL_BLOCK_SIZE
+                && iso.directory_record_packing == DirectoryRecordPacking::AvoidExactFit)
+        {
             offset += LOGICAL_BLOCK_SIZE - in_block;
         }
         result[offset..offset + record.len()].copy_from_slice(&record);
@@ -1796,8 +1859,10 @@ mod tests {
     fn test_iso(entries: Vec<Entry>, files: Vec<&str>) -> Iso9660 {
         Iso9660 {
             primary_volume: parse_pvd(&standard_pvd_block()).unwrap(),
+            primary_volume_copies: 1,
             metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             identifier_policy: IdentifierPolicy::IsoLevel1,
+            directory_record_packing: DirectoryRecordPacking::Fill,
             path_table_copies: PathTableCopies::Duplicate,
             path_table_subheader: EntrySectorSubheader::Canonical,
             entries,
@@ -1846,6 +1911,18 @@ mod tests {
         let generated =
             serialize_pvd(&iso, 20, 10, [18, 19, 20, 21], 22, 2048, &iso.entries[0]).unwrap();
         assert_eq!(&generated[883..1395], &extended[883..1395]);
+
+        let mut xcd = source;
+        xcd[APPLICATION_USE_END - 12..APPLICATION_USE_END].copy_from_slice(b"XCD322.1 (13");
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.primary_volume = parse_pvd(&xcd).unwrap();
+        assert_eq!(
+            iso.primary_volume.application_use,
+            PrimaryVolumeApplicationUse::CdXa001Xcd3221Revision13
+        );
+        let generated =
+            serialize_pvd(&iso, 20, 10, [18, 19, 20, 21], 22, 2048, &iso.entries[0]).unwrap();
+        assert_eq!(&generated[883..1395], &xcd[883..1395]);
     }
 
     #[test]
@@ -1952,6 +2029,27 @@ mod tests {
     }
 
     #[test]
+    fn path_table_end_of_file_data_policy_applies_to_each_copy() {
+        let mut entries = vec![test_entry(ROOT_PATH)];
+        entries.extend((0..200).map(|index| test_entry(&format!("D{index:03}"))));
+        let mut iso = test_iso(entries, vec![]);
+        iso.path_table_subheader = EntrySectorSubheader::EndOfFileData;
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+
+        assert!(
+            [18, 20, 22, 24]
+                .into_iter()
+                .all(|lba| authored.data_subheader_sectors.contains(&lba))
+        );
+        assert!(
+            [19, 21, 23, 25]
+                .into_iter()
+                .all(|lba| authored.end_of_file_data_subheader_sectors.contains(&lba))
+        );
+    }
+
+    #[test]
     fn single_path_table_copies_omit_optional_pointers_and_sectors() {
         let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
         iso.path_table_copies = PathTableCopies::Single;
@@ -1984,6 +2082,17 @@ mod tests {
     }
 
     #[test]
+    fn directory_end_of_file_data_subheader_marks_its_final_sector() {
+        let mut root = test_entry(ROOT_PATH);
+        root.sector_subheader = EntrySectorSubheader::EndOfFileData;
+        let iso = test_iso(vec![root], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+
+        assert!(authored.end_of_file_data_subheader_sectors.contains(&22));
+    }
+
+    #[test]
     fn fixed_primary_volume_values_are_validated() {
         parse_pvd(&standard_pvd_block()).unwrap();
 
@@ -2002,6 +2111,34 @@ mod tests {
         assert_eq!(
             parse_pvd(&block).unwrap_err().to_string(),
             "unsupported file structure version"
+        );
+    }
+
+    #[test]
+    fn three_primary_volume_copies_precede_the_terminator() {
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.primary_volume_copies = 3;
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+
+        assert_eq!(&authored.blocks[16][..7], b"\x01CD001\x01");
+        assert_eq!(authored.blocks[16], authored.blocks[17]);
+        assert_eq!(authored.blocks[16], authored.blocks[18]);
+        assert_eq!(&authored.blocks[19][..7], b"\xffCD001\x01");
+        assert_eq!(
+            parse(&authored.blocks)
+                .unwrap()
+                .manifest
+                .primary_volume_copies,
+            3
+        );
+    }
+
+    #[test]
+    fn avoid_exact_fit_directory_packing_starts_the_record_in_the_next_block() {
+        assert_eq!(
+            packed_blocks(&[1986, 62], DirectoryRecordPacking::AvoidExactFit),
+            2
         );
     }
 
@@ -2238,6 +2375,40 @@ mod tests {
             [
                 FileLayoutItem::form1_gap(1, crate::raw_cd::XaSubheader::default()),
                 FileLayoutItem::gap(2),
+            ],
+        );
+        let lengths = HashMap::from([
+            ("A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
+            ("B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
+        ]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+
+        assert_eq!(authored.files[0].extent, 23);
+        assert_eq!(authored.files[1].extent, 27);
+        assert_eq!(authored.gaps[0].start, 24);
+        assert_eq!(authored.gaps[1].start, 25);
+    }
+
+    #[test]
+    fn consecutive_form1_gaps_with_different_subheaders_are_placed_in_order() {
+        let mut iso = test_iso(
+            vec![
+                test_entry(ROOT_PATH),
+                test_entry("A.BIN"),
+                test_entry("B.BIN"),
+            ],
+            vec!["A.BIN", "B.BIN"],
+        );
+        let second_subheader = crate::raw_cd::XaSubheader {
+            file_number: 1,
+            ..crate::raw_cd::XaSubheader::default()
+        };
+        iso.files.splice(
+            1..1,
+            [
+                FileLayoutItem::form1_gap(1, crate::raw_cd::XaSubheader::default()),
+                FileLayoutItem::form1_gap(2, second_subheader),
             ],
         );
         let lengths = HashMap::from([
@@ -2564,6 +2735,42 @@ mod tests {
         let parsed = parse(&authored.blocks).unwrap();
         assert!(parsed.files.is_empty());
         assert_eq!(parsed.manifest.entries[1].extent, Some(25));
+        assert_eq!(parsed.manifest.entries[1].length, Some(2048));
+    }
+
+    #[test]
+    fn empty_external_cdda_directory_record_is_preserved() {
+        let mut audio = test_entry("BLANK.RAW");
+        audio.xa = Some(EntryXa {
+            attributes: Some(XaAttributes::CDDA),
+            ..EntryXa::default()
+        });
+        audio.extent = Some(30_692);
+        audio.length = Some(0);
+        let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+
+        assert_eq!(parsed.manifest.entries[1].extent, Some(30_692));
+        assert_eq!(parsed.manifest.entries[1].length, Some(0));
+    }
+
+    #[test]
+    fn external_cdda_extent_may_overlap_the_authored_data_track() {
+        let mut audio = test_entry("SILENCE.DA");
+        audio.xa = Some(EntryXa {
+            attributes: Some(XaAttributes::CDDA),
+            ..EntryXa::default()
+        });
+        audio.extent = Some(0);
+        audio.length = Some(2048);
+        let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+
+        assert_eq!(parsed.manifest.entries[1].extent, Some(0));
         assert_eq!(parsed.manifest.entries[1].length, Some(2048));
     }
 
