@@ -1,0 +1,3 @@
+gcdgold = "../target/release/gcdgold"
+roms = "/mnt/e/redump/psx/complete"
+output = "../gcdgold-failures.csv"

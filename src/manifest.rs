@@ -83,6 +83,8 @@ struct TrackWithDefaults<'a> {
 struct Iso9660WithDefaults<'a> {
     primary_volume: PrimaryVolumeWithDefaults<'a>,
     metadata_subheader: IsoMetadataSubheader,
+    identifier_policy: IdentifierPolicy,
+    path_table_copies: PathTableCopies,
     path_table_subheader: EntrySectorSubheader,
     entries: Vec<EntryWithDefaults<'a>>,
     files: &'a [FileLayoutItem],
@@ -93,6 +95,7 @@ struct EntryWithDefaults<'a> {
     path: &'a str,
     recording_time: &'a str,
     hidden: bool,
+    associated: bool,
     sector_subheader: EntrySectorSubheader,
     xa: EntryXaWithDefaults<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +167,7 @@ pub(crate) fn serialize_manifest(
                     path: &entry.path,
                     recording_time: &entry.recording_time,
                     hidden: entry.hidden,
+                    associated: entry.associated,
                     sector_subheader: entry.sector_subheader,
                     xa: EntryXaWithDefaults {
                         group_id: xa.map_or(0, |value| value.group_id),
@@ -225,6 +229,8 @@ pub(crate) fn serialize_manifest(
                     effective_time: manifest.iso9660.primary_volume.effective_time.as_deref(),
                 },
                 metadata_subheader: manifest.iso9660.metadata_subheader,
+                identifier_policy: manifest.iso9660.identifier_policy,
+                path_table_copies: manifest.iso9660.path_table_copies,
                 path_table_subheader: manifest.iso9660.path_table_subheader,
                 entries,
                 files: &manifest.iso9660.files,
@@ -400,6 +406,10 @@ pub struct Iso9660 {
     pub primary_volume: PrimaryVolume,
     #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
     pub metadata_subheader: IsoMetadataSubheader,
+    #[serde(default, skip_serializing_if = "IdentifierPolicy::is_default")]
+    pub identifier_policy: IdentifierPolicy,
+    #[serde(default, skip_serializing_if = "PathTableCopies::is_default")]
+    pub path_table_copies: PathTableCopies,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub path_table_subheader: EntrySectorSubheader,
     pub entries: Vec<Entry>,
@@ -408,10 +418,39 @@ pub struct Iso9660 {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum IdentifierPolicy {
+    #[default]
+    IsoLevel1,
+    NonstandardAscii,
+}
+
+impl IdentifierPolicy {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::IsoLevel1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathTableCopies {
+    #[default]
+    Duplicate,
+    Single,
+}
+
+impl PathTableCopies {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Duplicate)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IsoMetadataSubheader {
     #[default]
     Canonical,
     Data,
+    IsoMetadata,
 }
 
 impl IsoMetadataSubheader {
@@ -596,6 +635,8 @@ pub enum PrimaryVolumeApplicationUse {
     #[default]
     CdXa001,
     CdXa001_1_1,
+    #[serde(rename = "cd_rep_2_0_131")]
+    CdRep20131,
 }
 
 impl PrimaryVolumeApplicationUse {
@@ -611,6 +652,8 @@ pub struct Entry {
     pub recording_time: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub associated: bool,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -629,6 +672,7 @@ pub enum EntrySectorSubheader {
     Data,
     EndOfFileData,
     DataUntilFinal,
+    IsoMetadata,
 }
 
 impl EntrySectorSubheader {
