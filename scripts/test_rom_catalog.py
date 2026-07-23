@@ -194,11 +194,11 @@ def parse_cue(cue: Path) -> tuple[list[Path], list[str]]:
             continue
         if not mode.upper().endswith("/2352"):
             errors.append(f"unsupported data track mode {mode} at line {line_number}")
-            continue
-        if active_file is None:
+        elif active_file is None:
             errors.append(f"data track at line {line_number} has no preceding FILE")
-            continue
-        images.append(cue_file_path(cue, active_file))
+        else:
+            images.append(cue_file_path(cue, active_file))
+        break
 
     return images, errors
 

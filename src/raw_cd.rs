@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const RAW_SECTOR_SIZE: usize = 2352;
 pub const LOGICAL_BLOCK_SIZE: usize = 2048;
+pub const MODE2_DATA_SIZE: usize = 2336;
 pub const SYNC: [u8; 12] = [
     0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
 ];
@@ -188,9 +189,12 @@ const fn is_zero(value: &u8) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Mode1,
+    Mode1Gap,
     Form1,
     Form2,
     XaGap,
+    RawZero,
 }
 
 #[derive(Debug, Clone)]
@@ -205,14 +209,21 @@ pub struct ParsedSector {
 
 impl ParsedSector {
     pub fn logical_block(&self) -> &[u8] {
-        &self.bytes[24..24 + LOGICAL_BLOCK_SIZE]
+        match self.kind {
+            Kind::Mode1 | Kind::Mode1Gap => &self.bytes[16..16 + LOGICAL_BLOCK_SIZE],
+            Kind::Form1 | Kind::Form2 | Kind::XaGap | Kind::RawZero => {
+                &self.bytes[24..24 + LOGICAL_BLOCK_SIZE]
+            }
+        }
     }
 
     pub fn payload(&self) -> &[u8] {
         match self.kind {
+            Kind::Mode1 | Kind::Mode1Gap => &self.bytes[16..2064],
             Kind::Form1 => &self.bytes[24..2072],
             Kind::Form2 => &self.bytes[24..2348],
             Kind::XaGap => &self.bytes[24..2072],
+            Kind::RawZero => &self.bytes[24..2072],
         }
     }
 }
@@ -224,13 +235,37 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
     );
     ensure!(!bytes.is_empty(), "raw image is empty");
     let first = &bytes[..RAW_SECTOR_SIZE];
+    let track_mode = first[15];
+    ensure!(
+        matches!(track_mode, 1 | 2),
+        "unsupported sector mode at sector 0"
+    );
     let start_frame = msf_to_frame([first[12], first[13], first[14]])?;
     let detector = Encoder::new(Optimizations::all());
     let mut sectors = Vec::with_capacity(bytes.len() / RAW_SECTOR_SIZE);
 
     for (index, chunk) in bytes.chunks_exact(RAW_SECTOR_SIZE).enumerate() {
+        if chunk.iter().all(|byte| *byte == 0) {
+            let remaining_start = (index + 1) * RAW_SECTOR_SIZE;
+            ensure!(
+                bytes[remaining_start..].iter().all(|byte| *byte == 0),
+                "all-zero raw sectors are supported only as a terminal run"
+            );
+            sectors.push(ParsedSector {
+                bytes: [0; RAW_SECTOR_SIZE],
+                kind: Kind::RawZero,
+                subheader: XaSubheader::default(),
+                subheader_copy: XaSubheader::default(),
+                form2_edc_valid: false,
+                noncompliant_ecc: false,
+            });
+            continue;
+        }
         ensure!(chunk[..12] == SYNC, "invalid sync at sector {index}");
-        ensure!(chunk[15] == 2, "unsupported sector mode at sector {index}");
+        ensure!(
+            chunk[15] == track_mode,
+            "mixed or unsupported sector mode at sector {index}"
+        );
         let expected = frame_to_msf(start_frame + u32::try_from(index)?)?;
         ensure!(
             chunk[12..15] == expected,
@@ -239,6 +274,26 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         let detected = detector
             .detect_sector_type(chunk)
             .with_context(|| format!("detecting sector type at sector {index}"))?;
+        if track_mode == 1 {
+            let kind = match detected {
+                SectorType::Mode1 => Kind::Mode1,
+                SectorType::Mode1Gap => Kind::Mode1Gap,
+                other => {
+                    bail!("unsupported or invalid sector type {other:?} at sector {index}")
+                }
+            };
+            let mut sector = [0_u8; RAW_SECTOR_SIZE];
+            sector.copy_from_slice(chunk);
+            sectors.push(ParsedSector {
+                bytes: sector,
+                kind,
+                subheader: XaSubheader::default(),
+                subheader_copy: XaSubheader::default(),
+                form2_edc_valid: false,
+                noncompliant_ecc: false,
+            });
+            continue;
+        }
         let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
         let subheader = XaSubheader::from(subheader_bytes);
         let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&chunk[20..24])?);
@@ -283,6 +338,16 @@ impl SectorWriter {
             standard: Decoder::new(),
             gap: Decoder::new(),
         }
+    }
+
+    pub fn mode1(&mut self, frame: u32, data: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            data.len() == LOGICAL_BLOCK_SIZE,
+            "Mode 1 payload must be 2048 bytes"
+        );
+        self.standard
+            .decode_sector(data, SectorType::Mode1, frame, Optimizations::all())
+            .context("generating Mode 1 sector")
     }
 
     pub fn form1(&mut self, frame: u32, subheader: XaSubheader, data: &[u8]) -> Result<Vec<u8>> {
@@ -633,6 +698,46 @@ mod tests {
         assert_eq!(&sector[2348..2352], &[0x3f, 0x13, 0xb0, 0xbe]);
         let (_, parsed) = parse_image(&sector).unwrap();
         assert!(parsed[0].form2_edc_valid);
+    }
+
+    #[test]
+    fn canonical_mode1_sector_exposes_its_logical_block() {
+        let payload = [0x5a; LOGICAL_BLOCK_SIZE];
+        let raw = SectorWriter::new().mode1(150, &payload).unwrap();
+
+        let (start_frame, parsed) = parse_image(&raw).unwrap();
+
+        assert_eq!(start_frame, 150);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, Kind::Mode1);
+        assert_eq!(parsed[0].logical_block(), payload);
+        assert_eq!(parsed[0].payload(), payload);
+    }
+
+    #[test]
+    fn canonical_zero_payload_mode1_sector_is_a_mode1_gap() {
+        let raw = SectorWriter::new()
+            .mode1(150, &[0; LOGICAL_BLOCK_SIZE])
+            .unwrap();
+
+        let (_, parsed) = parse_image(&raw).unwrap();
+
+        assert_eq!(parsed[0].kind, Kind::Mode1Gap);
+        assert!(parsed[0].payload().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn terminal_all_zero_raw_sector_is_bounded() {
+        let mut raw = SectorWriter::new()
+            .form2(150, [0, 0, 0x20, 0].into(), &[0; 2324], true)
+            .unwrap();
+        raw.extend_from_slice(&[0; RAW_SECTOR_SIZE]);
+
+        let (start_frame, parsed) = parse_image(&raw).unwrap();
+
+        assert_eq!(start_frame, 150);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].bytes, [0; RAW_SECTOR_SIZE]);
     }
 
     #[test]

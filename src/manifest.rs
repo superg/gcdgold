@@ -83,11 +83,29 @@ struct TrackWithDefaults<'a> {
 struct Iso9660WithDefaults<'a> {
     primary_volume: PrimaryVolumeWithDefaults<'a>,
     primary_volume_copies: u8,
+    supplementary_volumes: &'a [JolietVolume],
+    metadata_layout: &'a [MetadataLayoutItem],
+    xa_system_use: bool,
+    xa_system_use_omissions: &'a [String],
     metadata_subheader: IsoMetadataSubheader,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_framing_subheader: Option<XaSubheader>,
     identifier_policy: IdentifierPolicy,
     directory_record_packing: DirectoryRecordPacking,
+    directory_parent_recording_time: DirectoryParentRecordingTime,
+    directory_length_policy: DirectoryLengthPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_table_size: Option<u32>,
+    path_table_padding: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_table_little_hex: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_table_big_hex: Option<&'a str>,
     path_table_copies: PathTableCopies,
+    path_table_order: PathTableOrder,
     path_table_subheader: EntrySectorSubheader,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_table_framing_subheader: Option<XaSubheader>,
     entries: Vec<EntryWithDefaults<'a>>,
     files: &'a [FileLayoutItem],
 }
@@ -98,6 +116,13 @@ struct EntryWithDefaults<'a> {
     recording_time: &'a str,
     hidden: bool,
     associated: bool,
+    unbacked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_reference: Option<DirectoryReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_slack: Option<&'a DirectorySlack>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocation_padding_hex: Option<&'a str>,
     sector_subheader: EntrySectorSubheader,
     xa: EntryXaWithDefaults<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,13 +142,26 @@ struct EntryXaWithDefaults<'a> {
     form2: Option<&'a str>,
     index: Option<&'a str>,
     gap_index: Option<&'a str>,
+    logical_length: Option<u32>,
+    length_encoding: XaLengthEncoding,
+    framing_subheader: Option<XaSubheader>,
 }
 
 #[derive(Serialize)]
 struct PrimaryVolumeWithDefaults<'a> {
     volume_space_size: Option<u32>,
+    file_structure_version: u8,
+    u16_encoding: PvdU16Encoding,
     application_use: PrimaryVolumeApplicationUse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_use_hex: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_directory_record_length: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_directory_recording_time: Option<&'a str>,
     root_directory_identifier: RootDirectoryIdentifier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    escape_sequence: Option<JolietLevel>,
     system_identifier: &'a str,
     volume_identifier: &'a str,
     volume_set_identifier: &'a str,
@@ -133,6 +171,8 @@ struct PrimaryVolumeWithDefaults<'a> {
     copyright_file_identifier: &'a str,
     abstract_file_identifier: &'a str,
     bibliographic_file_identifier: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserved_hex: Option<&'a str>,
     creation_time: Option<&'a str>,
     modification_time: Option<&'a str>,
     expiration_time: Option<&'a str>,
@@ -170,6 +210,10 @@ pub(crate) fn serialize_manifest(
                     recording_time: &entry.recording_time,
                     hidden: entry.hidden,
                     associated: entry.associated,
+                    unbacked: entry.unbacked,
+                    directory_reference: entry.directory_reference,
+                    directory_slack: entry.directory_slack.as_ref(),
+                    allocation_padding_hex: entry.allocation_padding_hex.as_deref(),
                     sector_subheader: entry.sector_subheader,
                     xa: EntryXaWithDefaults {
                         group_id: xa.map_or(0, |value| value.group_id),
@@ -181,6 +225,10 @@ pub(crate) fn serialize_manifest(
                         form2: xa.and_then(|value| value.form2.as_deref()),
                         index: xa.and_then(|value| value.index.as_deref()),
                         gap_index: xa.and_then(|value| value.gap_index.as_deref()),
+                        logical_length: xa.and_then(|value| value.logical_length),
+                        length_encoding: xa
+                            .map_or_else(XaLengthEncoding::default, |value| value.length_encoding),
+                        framing_subheader: xa.and_then(|value| value.framing_subheader),
                     },
                     extent: entry.extent,
                     length: entry.length,
@@ -199,11 +247,32 @@ pub(crate) fn serialize_manifest(
             iso9660: Iso9660WithDefaults {
                 primary_volume: PrimaryVolumeWithDefaults {
                     volume_space_size: manifest.iso9660.primary_volume.volume_space_size,
+                    file_structure_version: manifest
+                        .iso9660
+                        .primary_volume
+                        .file_structure_version
+                        .unwrap_or(1),
+                    u16_encoding: manifest.iso9660.primary_volume.u16_encoding,
                     application_use: manifest.iso9660.primary_volume.application_use,
+                    application_use_hex: manifest
+                        .iso9660
+                        .primary_volume
+                        .application_use_hex
+                        .as_deref(),
+                    root_directory_record_length: manifest
+                        .iso9660
+                        .primary_volume
+                        .root_directory_record_length,
+                    root_directory_recording_time: manifest
+                        .iso9660
+                        .primary_volume
+                        .root_directory_recording_time
+                        .as_deref(),
                     root_directory_identifier: manifest
                         .iso9660
                         .primary_volume
                         .root_directory_identifier,
+                    escape_sequence: manifest.iso9660.primary_volume.escape_sequence,
                     system_identifier: &manifest.iso9660.primary_volume.system_identifier,
                     volume_identifier: &manifest.iso9660.primary_volume.volume_identifier,
                     volume_set_identifier: &manifest.iso9660.primary_volume.volume_set_identifier,
@@ -225,17 +294,31 @@ pub(crate) fn serialize_manifest(
                         .iso9660
                         .primary_volume
                         .bibliographic_file_identifier,
+                    reserved_hex: manifest.iso9660.primary_volume.reserved_hex.as_deref(),
                     creation_time: manifest.iso9660.primary_volume.creation_time.as_deref(),
                     modification_time: manifest.iso9660.primary_volume.modification_time.as_deref(),
                     expiration_time: manifest.iso9660.primary_volume.expiration_time.as_deref(),
                     effective_time: manifest.iso9660.primary_volume.effective_time.as_deref(),
                 },
                 primary_volume_copies: manifest.iso9660.primary_volume_copies,
+                supplementary_volumes: &manifest.iso9660.supplementary_volumes,
+                metadata_layout: &manifest.iso9660.metadata_layout,
+                xa_system_use: manifest.iso9660.xa_system_use,
+                xa_system_use_omissions: &manifest.iso9660.xa_system_use_omissions,
                 metadata_subheader: manifest.iso9660.metadata_subheader,
+                metadata_framing_subheader: manifest.iso9660.metadata_framing_subheader,
                 identifier_policy: manifest.iso9660.identifier_policy,
                 directory_record_packing: manifest.iso9660.directory_record_packing,
+                directory_parent_recording_time: manifest.iso9660.directory_parent_recording_time,
+                directory_length_policy: manifest.iso9660.directory_length_policy,
+                path_table_size: manifest.iso9660.path_table_size,
+                path_table_padding: manifest.iso9660.path_table_padding,
+                path_table_little_hex: manifest.iso9660.path_table_little_hex.as_deref(),
+                path_table_big_hex: manifest.iso9660.path_table_big_hex.as_deref(),
                 path_table_copies: manifest.iso9660.path_table_copies,
+                path_table_order: manifest.iso9660.path_table_order,
                 path_table_subheader: manifest.iso9660.path_table_subheader,
+                path_table_framing_subheader: manifest.iso9660.path_table_framing_subheader,
                 entries,
                 files: &manifest.iso9660.files,
             },
@@ -359,8 +442,35 @@ const fn is_false(value: &bool) -> bool {
 pub struct SystemArea {
     pub path: String,
     pub form1_sectors: Form1Sectors,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sector_layout: Vec<SystemAreaSectorRun>,
     #[serde(default, skip_serializing_if = "SystemAreaFinalSubheader::is_default")]
     pub final_form1_subheader: SystemAreaFinalSubheader,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub form1_framing: Vec<SystemAreaForm1Framing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemAreaSectorRun {
+    pub kind: SystemAreaSectorKind,
+    pub sectors: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemAreaSectorKind {
+    Form1,
+    Form2,
+    XaGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemAreaForm1Framing {
+    pub sector: u8,
+    pub subheader: XaSubheader,
+    pub subheader_copy: XaSubheader,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,16 +523,45 @@ pub struct Iso9660 {
         skip_serializing_if = "is_one"
     )]
     pub primary_volume_copies: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_volumes: Vec<JolietVolume>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_layout: Vec<MetadataLayoutItem>,
+    #[serde(default = "default_xa_system_use", skip_serializing_if = "is_true")]
+    pub xa_system_use: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xa_system_use_omissions: Vec<String>,
     #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
     pub metadata_subheader: IsoMetadataSubheader,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_framing_subheader: Option<XaSubheader>,
     #[serde(default, skip_serializing_if = "IdentifierPolicy::is_default")]
     pub identifier_policy: IdentifierPolicy,
     #[serde(default, skip_serializing_if = "DirectoryRecordPacking::is_default")]
     pub directory_record_packing: DirectoryRecordPacking,
+    #[serde(
+        default,
+        skip_serializing_if = "DirectoryParentRecordingTime::is_default"
+    )]
+    pub directory_parent_recording_time: DirectoryParentRecordingTime,
+    #[serde(default, skip_serializing_if = "DirectoryLengthPolicy::is_default")]
+    pub directory_length_policy: DirectoryLengthPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub path_table_padding: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_little_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_big_hex: Option<String>,
     #[serde(default, skip_serializing_if = "PathTableCopies::is_default")]
     pub path_table_copies: PathTableCopies,
+    #[serde(default, skip_serializing_if = "PathTableOrder::is_default")]
+    pub path_table_order: PathTableOrder,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub path_table_subheader: EntrySectorSubheader,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_framing_subheader: Option<XaSubheader>,
     pub entries: Vec<Entry>,
     pub files: Vec<FileLayoutItem>,
 }
@@ -431,8 +570,20 @@ const fn default_primary_volume_copies() -> u8 {
     1
 }
 
+const fn default_xa_system_use() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
 const fn is_one(value: &u8) -> bool {
     *value == 1
+}
+
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +616,150 @@ impl DirectoryRecordPacking {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DirectoryParentRecordingTime {
+    #[default]
+    Parent,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryLengthPolicy {
+    #[default]
+    Allocated,
+    Records,
+}
+
+impl DirectoryLengthPolicy {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Allocated)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JolietLevel {
+    Level1,
+    Level2,
+    Level3,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JolietVolume {
+    pub level: JolietLevel,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flags: u8,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_fill_empty_strings: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_pad_strings: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_set_identifier_raw_hex: Option<String>,
+    pub descriptor: PrimaryVolume,
+    #[serde(default = "default_xa_system_use", skip_serializing_if = "is_true")]
+    pub xa_system_use: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_little_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_table_big_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_identifier_odd_bytes_hex: Option<String>,
+    pub entries: Vec<JolietEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JolietEntry {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omit_version: bool,
+    pub recording_time: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub associated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xa: Option<EntryXa>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MetadataLayoutItem {
+    PathTable(MetadataPathTableItem),
+    Directories(MetadataDirectoriesItem),
+    Gap(MetadataGapItem),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataPathTableItem {
+    pub path_table: MetadataPathTable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataPathTable {
+    PrimaryLittle,
+    PrimaryBig,
+    JolietLittle,
+    JolietBig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataDirectoriesItem {
+    pub directories: MetadataVolume,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataVolume {
+    #[default]
+    Primary,
+    Joliet,
+}
+
+impl MetadataVolume {
+    const fn is_primary(&self) -> bool {
+        matches!(self, Self::Primary)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataGapItem {
+    pub gap: u32,
+    #[serde(default, skip_serializing_if = "GapKind::is_default")]
+    pub kind: GapKind,
+}
+
+impl MetadataLayoutItem {
+    pub const fn path_table(path_table: MetadataPathTable) -> Self {
+        Self::PathTable(MetadataPathTableItem { path_table })
+    }
+
+    pub const fn directories(directories: MetadataVolume) -> Self {
+        Self::Directories(MetadataDirectoriesItem { directories })
+    }
+
+    pub const fn gap(sectors: u32, kind: GapKind) -> Self {
+        Self::Gap(MetadataGapItem { gap: sectors, kind })
+    }
+}
+
+impl DirectoryParentRecordingTime {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Parent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathTableCopies {
     #[default]
     Duplicate,
@@ -474,6 +769,20 @@ pub enum PathTableCopies {
 impl PathTableCopies {
     const fn is_default(&self) -> bool {
         matches!(self, Self::Duplicate)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathTableOrder {
+    #[default]
+    LittleEndianFirst,
+    BigEndianFirst,
+}
+
+impl PathTableOrder {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::LittleEndianFirst)
     }
 }
 
@@ -498,6 +807,7 @@ impl IsoMetadataSubheader {
 pub enum FileLayoutItem {
     Path(FilePathItem),
     Directory(FileDirectoryItem),
+    XaExtent(FileXaExtentItem),
     Gap(FileGapItem),
 }
 
@@ -511,6 +821,24 @@ pub struct FilePathItem {
 #[serde(deny_unknown_fields)]
 pub struct FileDirectoryItem {
     pub directory: String,
+    #[serde(default, skip_serializing_if = "MetadataVolume::is_primary")]
+    pub volume: MetadataVolume,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileXaExtentItem {
+    pub xa_extent: XaExtentAssets,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaExtentAssets {
+    pub form1: String,
+    pub form2: String,
+    pub index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_index: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -521,6 +849,8 @@ pub struct FileGapItem {
     pub kind: GapKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subheader: Option<XaSubheader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form2_edc: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -528,8 +858,10 @@ pub struct FileGapItem {
 pub enum GapKind {
     #[default]
     Form2,
+    Mode1,
     Form1,
     Xa,
+    RawZero,
 }
 
 impl GapKind {
@@ -546,7 +878,19 @@ impl FileLayoutItem {
     pub fn directory(path: impl Into<String>) -> Self {
         Self::Directory(FileDirectoryItem {
             directory: path.into(),
+            volume: MetadataVolume::Primary,
         })
+    }
+
+    pub fn volume_directory(volume: MetadataVolume, path: impl Into<String>) -> Self {
+        Self::Directory(FileDirectoryItem {
+            directory: path.into(),
+            volume,
+        })
+    }
+
+    pub fn xa_extent(assets: XaExtentAssets) -> Self {
+        Self::XaExtent(FileXaExtentItem { xa_extent: assets })
     }
 
     pub const fn gap(sectors: u32) -> Self {
@@ -554,6 +898,25 @@ impl FileLayoutItem {
             gap: sectors,
             kind: GapKind::Form2,
             subheader: None,
+            form2_edc: None,
+        })
+    }
+
+    pub const fn form2_gap(sectors: u32, form2_edc: bool) -> Self {
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::Form2,
+            subheader: None,
+            form2_edc: Some(form2_edc),
+        })
+    }
+
+    pub const fn mode1_gap(sectors: u32) -> Self {
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::Mode1,
+            subheader: None,
+            form2_edc: None,
         })
     }
 
@@ -562,6 +925,7 @@ impl FileLayoutItem {
             gap: sectors,
             kind: GapKind::Form1,
             subheader: Some(subheader),
+            form2_edc: None,
         })
     }
 
@@ -570,41 +934,65 @@ impl FileLayoutItem {
             gap: sectors,
             kind: GapKind::Xa,
             subheader: None,
+            form2_edc: None,
+        })
+    }
+
+    pub const fn raw_zero_gap(sectors: u32) -> Self {
+        Self::Gap(FileGapItem {
+            gap: sectors,
+            kind: GapKind::RawZero,
+            subheader: None,
+            form2_edc: None,
         })
     }
 
     pub fn as_path(&self) -> Option<&str> {
         match self {
             Self::Path(item) => Some(&item.path),
-            Self::Directory(_) | Self::Gap(_) => None,
+            Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
         }
     }
 
-    pub fn as_directory(&self) -> Option<&str> {
+    pub const fn as_directory_placement(&self) -> Option<(MetadataVolume, &str)> {
         match self {
-            Self::Directory(item) => Some(&item.directory),
-            Self::Path(_) | Self::Gap(_) => None,
+            Self::Directory(item) => Some((item.volume, item.directory.as_str())),
+            Self::Path(_) | Self::XaExtent(_) | Self::Gap(_) => None,
+        }
+    }
+
+    pub const fn as_xa_extent(&self) -> Option<&XaExtentAssets> {
+        match self {
+            Self::XaExtent(item) => Some(&item.xa_extent),
+            Self::Path(_) | Self::Directory(_) | Self::Gap(_) => None,
         }
     }
 
     pub const fn gap_sectors(&self) -> Option<u32> {
         match self {
-            Self::Path(_) | Self::Directory(_) => None,
+            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
             Self::Gap(item) => Some(item.gap),
         }
     }
 
     pub const fn gap_kind(&self) -> Option<GapKind> {
         match self {
-            Self::Path(_) | Self::Directory(_) => None,
+            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
             Self::Gap(item) => Some(item.kind),
         }
     }
 
     pub const fn gap_subheader(&self) -> Option<XaSubheader> {
         match self {
-            Self::Path(_) | Self::Directory(_) => None,
+            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
             Self::Gap(item) => item.subheader,
+        }
+    }
+
+    pub const fn gap_form2_edc(&self) -> Option<bool> {
+        match self {
+            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
+            Self::Gap(item) => item.form2_edc,
         }
     }
 }
@@ -614,13 +1002,25 @@ impl FileLayoutItem {
 pub struct PrimaryVolume {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_space_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_structure_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "PvdU16Encoding::is_default")]
+    pub u16_encoding: PvdU16Encoding,
     #[serde(
         default,
         skip_serializing_if = "PrimaryVolumeApplicationUse::is_default"
     )]
     pub application_use: PrimaryVolumeApplicationUse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_directory_record_length: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_directory_recording_time: Option<String>,
     #[serde(default, skip_serializing_if = "RootDirectoryIdentifier::is_default")]
     pub root_directory_identifier: RootDirectoryIdentifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escape_sequence: Option<JolietLevel>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub system_identifier: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -640,6 +1040,8 @@ pub struct PrimaryVolume {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bibliographic_file_identifier: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modification_time: Option<String>,
@@ -647,6 +1049,20 @@ pub struct PrimaryVolume {
     pub expiration_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PvdU16Encoding {
+    #[default]
+    BothEndian,
+    LittleEndianOnly,
+}
+
+impl PvdU16Encoding {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::BothEndian)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +1105,14 @@ pub struct Entry {
     pub hidden: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub associated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unbacked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_reference: Option<DirectoryReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_slack: Option<DirectorySlack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_padding_hex: Option<String>,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,6 +1121,20 @@ pub struct Entry {
     pub extent: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryReference {
+    pub extent: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectorySlack {
+    pub offset: u32,
+    pub hex: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +1151,20 @@ pub enum EntrySectorSubheader {
 impl EntrySectorSubheader {
     const fn is_default(&self) -> bool {
         matches!(self, Self::Canonical)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XaLengthEncoding {
+    #[default]
+    Logical2048,
+    Mode2_2336,
+}
+
+impl XaLengthEncoding {
+    pub(crate) const fn is_default(&self) -> bool {
+        matches!(self, Self::Logical2048)
     }
 }
 
@@ -737,6 +1189,12 @@ pub struct EntryXa {
     pub index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gap_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_length: Option<u32>,
+    #[serde(skip_serializing_if = "XaLengthEncoding::is_default")]
+    pub length_encoding: XaLengthEncoding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framing_subheader: Option<XaSubheader>,
 }
 
 impl Default for EntryXa {
@@ -751,6 +1209,9 @@ impl Default for EntryXa {
             form2: None,
             index: None,
             gap_index: None,
+            logical_length: None,
+            length_encoding: XaLengthEncoding::default(),
+            framing_subheader: None,
         }
     }
 }
@@ -767,6 +1228,9 @@ struct EntryXaFields {
     form2: Option<String>,
     index: Option<String>,
     gap_index: Option<String>,
+    logical_length: Option<u32>,
+    length_encoding: XaLengthEncoding,
+    framing_subheader: Option<XaSubheader>,
 }
 
 impl Default for EntryXaFields {
@@ -781,6 +1245,9 @@ impl Default for EntryXaFields {
             form2: None,
             index: None,
             gap_index: None,
+            logical_length: None,
+            length_encoding: XaLengthEncoding::default(),
+            framing_subheader: None,
         }
     }
 }
@@ -804,6 +1271,21 @@ impl<'de> Deserialize<'de> for EntryXa {
                 "XA gap index requires form1, form2, and index assets",
             ));
         }
+        if fields.logical_length.is_some() && asset_count != 3 {
+            return Err(de::Error::custom(
+                "XA logical length requires form1, form2, and index assets",
+            ));
+        }
+        if !fields.length_encoding.is_default() && asset_count != 3 {
+            return Err(de::Error::custom(
+                "XA length encoding requires form1, form2, and index assets",
+            ));
+        }
+        if !fields.length_encoding.is_default() && fields.logical_length.is_some() {
+            return Err(de::Error::custom(
+                "XA length encoding cannot be combined with logical_length",
+            ));
+        }
         Ok(Self {
             group_id: fields.group_id,
             user_id: fields.user_id,
@@ -814,6 +1296,9 @@ impl<'de> Deserialize<'de> for EntryXa {
             form2: fields.form2,
             index: fields.index,
             gap_index: fields.gap_index,
+            logical_length: fields.logical_length,
+            length_encoding: fields.length_encoding,
+            framing_subheader: fields.framing_subheader,
         })
     }
 }
@@ -1013,6 +1498,29 @@ mod tests {
             yaml_serde::from_str::<FileLayoutItem>(&xa).unwrap(),
             FileLayoutItem::xa_gap(150)
         );
+
+        let mode1 = yaml_serde::to_string(&FileLayoutItem::mode1_gap(150)).unwrap();
+        assert_eq!(mode1, "gap: 150\nkind: mode1\n");
+        assert_eq!(
+            yaml_serde::from_str::<FileLayoutItem>(&mode1).unwrap(),
+            FileLayoutItem::mode1_gap(150)
+        );
+    }
+
+    #[test]
+    fn unreferenced_xa_extent_assets_round_trip_without_ambiguity() {
+        let item = FileLayoutItem::xa_extent(XaExtentAssets {
+            form1: "disc.unreferenced.000.XA1".to_owned(),
+            form2: "disc.unreferenced.000.XA2".to_owned(),
+            index: "disc.unreferenced.000.XAI".to_owned(),
+            gap_index: Some("disc.unreferenced.000.XAG".to_owned()),
+        });
+        let yaml = yaml_serde::to_string(&item).unwrap();
+        assert_eq!(
+            yaml,
+            "xa_extent:\n  form1: disc.unreferenced.000.XA1\n  form2: disc.unreferenced.000.XA2\n  index: disc.unreferenced.000.XAI\n  gap_index: disc.unreferenced.000.XAG\n"
+        );
+        assert_eq!(yaml_serde::from_str::<FileLayoutItem>(&yaml).unwrap(), item);
     }
 
     #[test]
