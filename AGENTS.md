@@ -18,10 +18,10 @@
 
 ### 1. Pre-Task Protocol
 Before writing or modifying any code for a task:
-* Read `docs/agents-memory/active_context.md` to understand current system architecture, recent changes, and active priorities.
-* Read `docs/agents-memory/learned_patterns.md` to review established project conventions, structural edge cases, and technical quirks.
+* Read `docs/agent-memory/active_context.md` to understand current system architecture, recent changes, and active priorities.
+* Read `docs/agent-memory/learned_patterns.md` to review established project conventions, structural edge cases, and technical quirks.
 
 ### 2. Post-Task Protocol (Definition of Done)
 At the end of every task or feature implementation, you **must**:
-1. Update `docs/agents-memory/active_context.md` with current architecture, newly supported behavior, and remaining work.
-2. Append any reusable technical discoveries, edge cases, or novel implementation patterns to `docs/agents-memory/learned_patterns.md`.
+1. Update `docs/agent-memory/active_context.md` with current architecture, newly supported behavior, and remaining work.
+2. Append any reusable technical discoveries, edge cases, or novel implementation patterns to `docs/agent-memory/learned_patterns.md`.
