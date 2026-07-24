@@ -2,10 +2,10 @@
 
 mod iso9660;
 mod manifest;
-mod ppf;
 mod raw_cd;
 mod workflow;
 
 pub use workflow::{
-    BuildReport, ExtractOptions, ExtractReport, build, extract, extract_with_options,
+    BuildOptions, BuildReport, ExtractOptions, ExtractReport, RecoveryCategory, RecoveryRange,
+    RecoveryWarning, build, build_with_options, extract, extract_with_options,
 };

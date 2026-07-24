@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use anyhow::Context;
+use anyhow::{Context, Result, ensure};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -36,8 +36,40 @@ pub struct Track {
     pub form2_edc: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub noncompliant_trailing_ecc: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ppf: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patches: Vec<SectorPatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SectorPatch {
+    pub lba: i32,
+    pub hex: String,
+}
+
+pub(crate) fn format_sector_patch_hex(bytes: &[u8]) -> String {
+    bytes
+        .chunks(32)
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn decode_sector_patch(patch: &SectorPatch) -> Result<[u8; 2352]> {
+    let compact: String = patch
+        .hex
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    let bytes =
+        hex::decode(&compact).with_context(|| format!("decoding patch at LBA {}", patch.lba))?;
+    ensure!(
+        bytes.len() == 2352,
+        "patch at LBA {} decodes to {} bytes, expected 2352",
+        patch.lba,
+        bytes.len()
+    );
+    Ok(bytes.try_into().expect("validated patch sector length"))
 }
 
 impl Default for Track {
@@ -47,7 +79,7 @@ impl Default for Track {
             start_msf: default_start_msf(),
             form2_edc: default_form2_edc(),
             noncompliant_trailing_ecc: false,
-            ppf: None,
+            patches: Vec::new(),
         }
     }
 }
@@ -58,7 +90,7 @@ impl Track {
             && is_default_start_msf(&self.start_msf)
             && is_default_form2_edc(&self.form2_edc)
             && !self.noncompliant_trailing_ecc
-            && self.ppf.is_none()
+            && self.patches.is_empty()
     }
 }
 
@@ -75,8 +107,12 @@ struct TrackWithDefaults<'a> {
     start_msf: &'a str,
     form2_edc: bool,
     noncompliant_trailing_ecc: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ppf: Option<&'a str>,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    patches: &'a [SectorPatch],
+}
+
+fn slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
 }
 
 #[derive(Serialize)]
@@ -241,7 +277,7 @@ pub(crate) fn serialize_manifest(
                 start_msf: &manifest.track.start_msf,
                 form2_edc: manifest.track.form2_edc,
                 noncompliant_trailing_ecc: manifest.track.noncompliant_trailing_ecc,
-                ppf: manifest.track.ppf.as_deref(),
+                patches: &manifest.track.patches,
             },
             system_area: &manifest.system_area,
             iso9660: Iso9660WithDefaults {
@@ -1427,7 +1463,7 @@ mod tests {
             start_msf: start_msf.to_owned(),
             form2_edc: true,
             noncompliant_trailing_ecc: false,
-            ppf: None,
+            patches: Vec::new(),
         }
     }
 
@@ -1549,15 +1585,49 @@ mod tests {
     }
 
     #[test]
-    fn track_ppf_is_optional_and_round_trips_as_a_relative_asset_path() {
+    fn track_patches_are_optional_and_round_trip_as_multiline_raw_sectors() {
         let mut track = track(TrackMode::Mode2Xa, "00:02:00");
-        assert!(!yaml_serde::to_string(&track).unwrap().contains("ppf:"));
+        assert!(!yaml_serde::to_string(&track).unwrap().contains("patches:"));
 
-        track.ppf = Some("interactive4.ppf".to_owned());
+        track.patches.push(SectorPatch {
+            lba: 123,
+            hex: format_sector_patch_hex(&[0xa5; 2352]),
+        });
         let yaml = yaml_serde::to_string(&track).unwrap();
-        assert!(yaml.lines().any(|line| line == "ppf: interactive4.ppf"));
+        assert!(yaml.lines().any(|line| line == "patches:"));
+        assert!(yaml.lines().any(|line| line == "- lba: 123"));
+        assert!(yaml.lines().any(|line| line == "  hex: |-"));
         let parsed: Track = yaml_serde::from_str(&yaml).unwrap();
-        assert_eq!(parsed.ppf.as_deref(), Some("interactive4.ppf"));
+        assert_eq!(parsed.patches, track.patches);
+        assert_eq!(
+            decode_sector_patch(&parsed.patches[0]).unwrap(),
+            [0xa5; 2352]
+        );
+    }
+
+    #[test]
+    fn patch_hex_ignores_ascii_whitespace_but_requires_one_complete_sector() {
+        let bytes = [0x5a; 2352];
+        let compact = hex::encode(bytes);
+        let spaced = compact
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join(" \n\t");
+        let patch = SectorPatch {
+            lba: -150,
+            hex: spaced,
+        };
+        assert_eq!(decode_sector_patch(&patch).unwrap(), bytes);
+
+        for invalid in ["", "00", &"00".repeat(2353)] {
+            let patch = SectorPatch {
+                lba: 0,
+                hex: invalid.to_owned(),
+            };
+            assert!(decode_sector_patch(&patch).is_err());
+        }
     }
 
     #[test]

@@ -191,7 +191,8 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         pvd.root_directory_record_length = Some(root_record_length);
     }
     let (root_records, mut packing_observation, _) =
-        read_directory(blocks, root_record.extent, root_record.length)?;
+        read_directory(blocks, root_record.extent, root_record.length)
+            .context("reading root directory")?;
     ensure!(root_records.len() >= 2, "root directory lacks dot records");
     let dot = &root_records[0];
     let xa_system_use = !dot.system_use.is_empty();
@@ -231,13 +232,14 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             seen_dirs.insert(extent),
             "directory extent cycle at LBA {extent}"
         );
-        let (records, observation, directory_slack) = read_directory(blocks, extent, length)?;
-        packing_observation.merge(observation);
         let directory_path = if parent.is_empty() {
             ROOT_PATH
         } else {
             parent.as_str()
         };
+        let (records, observation, directory_slack) = read_directory(blocks, extent, length)
+            .with_context(|| format!("reading directory {directory_path} at LBA {extent}"))?;
+        packing_observation.merge(observation);
         entries
             .iter_mut()
             .find(|entry| entry.path == directory_path)
@@ -263,7 +265,9 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                 } else if recorded_time == current_time.as_str() {
                     DirectoryParentRecordingTime::Current
                 } else {
-                    anyhow::bail!("directory parent record has an unsupported recording time")
+                    anyhow::bail!(
+                        "directory parent record has an unsupported recording time: {directory_path} at LBA {extent}"
+                    )
                 };
                 ensure!(
                     directory_parent_recording_time.is_none_or(|value| value == observed),
@@ -1582,7 +1586,19 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
             None => {
                 let record_lengths = directory_record_lengths(path, iso, &file_paths);
                 let records_length = packed_length(&record_lengths, iso.directory_record_packing);
-                let blocks = records_length.div_ceil(LOGICAL_BLOCK_SIZE).max(1) as u32;
+                let allocated_length = if let Some(slack) = &entry.directory_slack {
+                    let slack_length = hex::decode(&slack.hex)
+                        .with_context(|| format!("decoding directory_slack for {path}"))?
+                        .len();
+                    records_length.max(
+                        usize::try_from(slack.offset)?
+                            .checked_add(slack_length)
+                            .context("directory_slack allocation overflow")?,
+                    )
+                } else {
+                    records_length
+                };
+                let blocks = allocated_length.div_ceil(LOGICAL_BLOCK_SIZE).max(1) as u32;
                 let length = match iso.directory_length_policy {
                     DirectoryLengthPolicy::Allocated => blocks * LOGICAL_BLOCK_SIZE as u32,
                     DirectoryLengthPolicy::Records => u32::try_from(records_length)?,

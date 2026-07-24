@@ -37,6 +37,8 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         overwrite: bool,
+        #[arg(long)]
+        no_patches: bool,
     },
 }
 
@@ -61,10 +63,37 @@ fn main() -> Result<()> {
                     include_defaults,
                 },
             )?;
+            for warning in &report.recovery_warnings {
+                let ranges = warning
+                    .ranges
+                    .iter()
+                    .map(|range| {
+                        if range.first_lba == range.last_lba {
+                            format!("LBA {} ({})", range.first_lba, range.first_msf)
+                        } else {
+                            format!(
+                                "LBAs {}-{} ({}-{})",
+                                range.first_lba, range.last_lba, range.first_msf, range.last_msf
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let path = warning
+                    .path
+                    .as_deref()
+                    .map(|path| format!(" [{path}]"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "warning: {} at {}{}: {}",
+                    warning.category, ranges, path, warning.description
+                );
+            }
             println!(
-                "extracted {} sectors; source sha1 {}; manifest {}",
+                "extracted {} sectors; source sha1 {}; recovery warnings {}; manifest {}",
                 report.sectors,
                 report.sha1,
+                report.recovery_warnings.len(),
                 manifest.display()
             );
         }
@@ -73,9 +102,18 @@ fn main() -> Result<()> {
             image,
             data_dir,
             overwrite,
+            no_patches,
         } => {
             let image = image.unwrap_or_else(|| manifest.with_extension("bin"));
-            let report = gcdgold::build(&manifest, &image, &data_dir, overwrite)?;
+            let report = gcdgold::build_with_options(
+                &manifest,
+                &image,
+                &data_dir,
+                gcdgold::BuildOptions {
+                    overwrite,
+                    apply_patches: !no_patches,
+                },
+            )?;
             println!("built {} sectors; sha1 {}", report.sectors, report.sha1);
         }
     }
@@ -137,6 +175,29 @@ mod tests {
                 "--include-defaults",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn no_patches_flag_is_accepted_only_by_build() {
+        let build = Cli::try_parse_from([
+            "gcdgold",
+            "build",
+            "--manifest",
+            "disc.yaml",
+            "--no-patches",
+        ])
+        .unwrap();
+        assert!(matches!(
+            build.command,
+            Command::Build {
+                no_patches: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["gcdgold", "extract", "--image", "disc.bin", "--no-patches",])
+                .is_err()
         );
     }
 }

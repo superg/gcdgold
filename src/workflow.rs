@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::ops::Range;
@@ -9,27 +10,83 @@ use sha1::{Digest, Sha1};
 
 use crate::iso9660;
 use crate::manifest::{
-    EntrySectorSubheader, FileLayoutItem, Form1Sectors, GapKind, IsoMetadataSubheader, Manifest,
-    MetadataLayoutItem, MetadataVolume, SYSTEM_AREA_SECTORS, SystemArea, SystemAreaFinalSubheader,
-    SystemAreaForm1Framing, SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode,
-    XaAttributeFlag, XaExtentAssets, XaLengthEncoding, serialize_manifest,
+    DirectorySlack, EntrySectorSubheader, FileLayoutItem, Form1Sectors, GapKind,
+    IsoMetadataSubheader, Manifest, MetadataLayoutItem, MetadataVolume, SYSTEM_AREA_SECTORS,
+    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, XaAttributeFlag, XaExtentAssets,
+    XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
-use crate::ppf::Ppf2;
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SectorWriter, XaSubheader,
-    XaSubmode, format_msf, parse_image, parse_msf, regenerate_mode2_protection,
+    XaSubmode, format_msf, parse_image, parse_msf,
 };
 
 #[derive(Debug, Clone)]
 pub struct ExtractReport {
     pub sectors: u32,
     pub sha1: String,
+    pub recovery_warnings: Vec<RecoveryWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCategory {
+    MissingDirectoryPrefix,
+    DirectoryBufferResidue,
+    MalformedSystemArea,
+    FilesystemHierarchy,
+    InternalRawDamage,
+    TerminalRawDamage,
+}
+
+impl std::fmt::Display for RecoveryCategory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::MissingDirectoryPrefix => "missing-directory-prefix",
+            Self::DirectoryBufferResidue => "directory-buffer-residue",
+            Self::MalformedSystemArea => "malformed-system-area",
+            Self::FilesystemHierarchy => "filesystem-hierarchy",
+            Self::InternalRawDamage => "internal-raw-damage",
+            Self::TerminalRawDamage => "terminal-raw-damage",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRange {
+    pub first_lba: i32,
+    pub last_lba: i32,
+    pub first_msf: String,
+    pub last_msf: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryWarning {
+    pub category: RecoveryCategory,
+    pub ranges: Vec<RecoveryRange>,
+    pub path: Option<String>,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct BuildReport {
     pub sectors: u32,
     pub sha1: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuildOptions {
+    pub overwrite: bool,
+    pub apply_patches: bool,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            overwrite: false,
+            apply_patches: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,26 +112,666 @@ const XA_FORM1_RECORD_SIZE: usize = 8 + LOGICAL_BLOCK_SIZE;
 const XA_FORM2_RECORD_SIZE: usize = 8 + FORM2_PAYLOAD_SIZE;
 const XA_INDEX_RECORD_SIZE: usize = size_of::<u32>();
 
-fn apply_ppf_overlay(
+struct RecoveredImage<'a> {
+    semantic: Cow<'a, [u8]>,
+    patches: Vec<SectorPatch>,
+    warnings: Vec<RecoveryWarning>,
+}
+
+fn raw_track_start_frame(raw: &[u8]) -> Result<u32> {
+    ensure!(raw.len() >= RAW_SECTOR_SIZE, "raw image is empty");
+    parse_msf(&format!("{:02x}:{:02x}:{:02x}", raw[12], raw[13], raw[14]))
+        .context("parsing track start MSF")
+}
+
+fn sector_bytes(raw: &[u8], index: usize) -> Result<[u8; RAW_SECTOR_SIZE]> {
+    let start = index
+        .checked_mul(RAW_SECTOR_SIZE)
+        .context("sector offset overflow")?;
+    let end = start + RAW_SECTOR_SIZE;
+    ensure!(end <= raw.len(), "recovery sector {index} is outside image");
+    Ok(raw[start..end].try_into().expect("validated sector length"))
+}
+
+fn install_sector(raw: &mut [u8], index: usize, sector: &[u8]) -> Result<()> {
+    ensure!(
+        sector.len() == RAW_SECTOR_SIZE,
+        "replacement sector has invalid length"
+    );
+    let start = index
+        .checked_mul(RAW_SECTOR_SIZE)
+        .context("sector offset overflow")?;
+    let end = start + RAW_SECTOR_SIZE;
+    ensure!(end <= raw.len(), "recovery sector {index} is outside image");
+    raw[start..end].copy_from_slice(sector);
+    Ok(())
+}
+
+fn rewrite_form1_payload(
     raw: &mut [u8],
-    patch: &Ppf2,
-    form2_edc: bool,
-    noncompliant_trailing_ecc: bool,
+    start_frame: u32,
+    index: usize,
+    edit: impl FnOnce(&mut [u8; LOGICAL_BLOCK_SIZE]) -> Result<()>,
+) -> Result<()> {
+    let source = sector_bytes(raw, index)?;
+    ensure!(
+        source[15] == 2,
+        "recovered Form 1 sector {index} is not Mode 2"
+    );
+    let subheader = XaSubheader::from(<[u8; 4]>::try_from(&source[16..20])?);
+    let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&source[20..24])?);
+    ensure!(
+        !subheader
+            .submode
+            .contains(crate::raw_cd::XaSubmodeFlag::Form2)
+            && !subheader_copy
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+        "recovered sector {index} is not Form 1"
+    );
+    let mut payload: [u8; LOGICAL_BLOCK_SIZE] = source[24..2072].try_into()?;
+    edit(&mut payload)?;
+    let replacement = SectorWriter::new().form1_with_subheaders(
+        start_frame + u32::try_from(index)?,
+        subheader,
+        subheader_copy,
+        &payload,
+    )?;
+    install_sector(raw, index, &replacement)
+}
+
+fn repair_missing_directory_prefix(
+    payload: &mut [u8; LOGICAL_BLOCK_SIZE],
+    extent: u32,
+) -> Result<()> {
+    ensure!(
+        payload[2040..].iter().all(|byte| *byte == 0),
+        "missing-prefix recovery would discard nonzero bytes"
+    );
+    let mut prefix = [0_u8; 8];
+    prefix[0] = 48;
+    prefix[2..6].copy_from_slice(&extent.to_le_bytes());
+    prefix[6..8].copy_from_slice(&extent.to_be_bytes()[..2]);
+    ensure!(
+        payload[..2] == extent.to_be_bytes()[2..]
+            && payload[40] >= 34
+            && usize::from(payload[40]) <= LOGICAL_BLOCK_SIZE - 40,
+        "missing-prefix directory shape does not match the approved corruption"
+    );
+    payload.copy_within(..2040, 8);
+    payload[..8].copy_from_slice(&prefix);
+    Ok(())
+}
+
+fn clear_directory_residue(payload: &mut [u8; LOGICAL_BLOCK_SIZE], valid_end: usize) -> Result<()> {
+    ensure!(
+        valid_end <= payload.len(),
+        "directory valid boundary is outside its logical block"
+    );
+    ensure!(
+        payload[valid_end..].iter().any(|byte| *byte != 0),
+        "directory-residue recovery found no residue"
+    );
+    payload[valid_end..].fill(0);
+    Ok(())
+}
+
+fn replace_with_form1_placeholder(
+    raw: &mut [u8],
+    start_frame: u32,
+    index: usize,
+    subheader: XaSubheader,
+) -> Result<()> {
+    let replacement = SectorWriter::new().form1(
+        start_frame + u32::try_from(index)?,
+        subheader,
+        &[0; LOGICAL_BLOCK_SIZE],
+    )?;
+    install_sector(raw, index, &replacement)
+}
+
+fn replace_with_form2_placeholder(
+    raw: &mut [u8],
+    start_frame: u32,
+    index: usize,
+    subheader: XaSubheader,
+    computed_edc: bool,
+) -> Result<()> {
+    let replacement = SectorWriter::new().form2(
+        start_frame + u32::try_from(index)?,
+        subheader,
+        &[0; FORM2_PAYLOAD_SIZE],
+        computed_edc,
+    )?;
+    install_sector(raw, index, &replacement)
+}
+
+fn rewrite_form2_payload(
+    raw: &mut [u8],
+    start_frame: u32,
+    index: usize,
+    computed_edc: bool,
+) -> Result<()> {
+    let source = sector_bytes(raw, index)?;
+    ensure!(
+        source[15] == 2,
+        "recovered Form 2 sector {index} is not Mode 2"
+    );
+    let subheader = XaSubheader::from(<[u8; 4]>::try_from(&source[16..20])?);
+    let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&source[20..24])?);
+    ensure!(
+        subheader
+            .submode
+            .contains(crate::raw_cd::XaSubmodeFlag::Form2)
+            && subheader_copy
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+        "recovered sector {index} is not Form 2"
+    );
+    let replacement = SectorWriter::new().form2_with_subheaders(
+        start_frame + u32::try_from(index)?,
+        subheader,
+        subheader_copy,
+        &source[24..2348],
+        computed_edc,
+    )?;
+    install_sector(raw, index, &replacement)
+}
+
+fn replace_with_xa_gap(raw: &mut [u8], start_frame: u32, index: usize) -> Result<()> {
+    let replacement =
+        SectorWriter::new().xa_gap(start_frame + u32::try_from(index)?, XaSubheader::default())?;
+    install_sector(raw, index, &replacement)
+}
+
+fn nearby_form2_framing(raw: &[u8], index: usize) -> Result<(XaSubheader, bool)> {
+    for distance in 1..=32 {
+        for candidate in [index.checked_sub(distance), index.checked_add(distance)] {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let Ok(bytes) = sector_bytes(raw, candidate) else {
+                continue;
+            };
+            if bytes[..12] != crate::raw_cd::SYNC
+                || bytes[15] != 2
+                || bytes[16..20] != bytes[20..24]
+            {
+                continue;
+            }
+            let subheader = XaSubheader::from(<[u8; 4]>::try_from(&bytes[16..20])?);
+            if !subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2)
+            {
+                continue;
+            }
+            let parsed = parse_image(&bytes)
+                .with_context(|| format!("parsing nearby Form 2 sector {candidate}"))?
+                .1
+                .remove(0);
+            return Ok((subheader, parsed.form2_edc_valid));
+        }
+    }
+    anyhow::bail!("no intact nearby Form 2 framing for damaged sector {index}")
+}
+
+fn warning_ranges(start_frame: u32, indices: &BTreeSet<usize>) -> Result<Vec<RecoveryRange>> {
+    let track_start_lba = i64::from(start_frame) - 150;
+    let mut ranges = Vec::new();
+    let mut iterator = indices.iter().copied();
+    let Some(mut first) = iterator.next() else {
+        return Ok(ranges);
+    };
+    let mut last = first;
+    for index in iterator {
+        if index == last + 1 {
+            last = index;
+            continue;
+        }
+        ranges.push(recovery_range(track_start_lba, first, last)?);
+        first = index;
+        last = index;
+    }
+    ranges.push(recovery_range(track_start_lba, first, last)?);
+    Ok(ranges)
+}
+
+fn recovery_range(track_start_lba: i64, first: usize, last: usize) -> Result<RecoveryRange> {
+    let first_lba = track_start_lba + i64::try_from(first)?;
+    let last_lba = track_start_lba + i64::try_from(last)?;
+    ensure!(
+        first_lba >= -150 && last_lba <= i64::from(i32::MAX),
+        "recovery LBA is outside supported range"
+    );
+    Ok(RecoveryRange {
+        first_lba: i32::try_from(first_lba)?,
+        last_lba: i32::try_from(last_lba)?,
+        first_msf: format_msf(u32::try_from(first_lba + 150)?)?,
+        last_msf: format_msf(u32::try_from(last_lba + 150)?)?,
+    })
+}
+
+fn finish_recovery(
+    source: &[u8],
+    semantic: Vec<u8>,
+    start_frame: u32,
+    affected: BTreeSet<usize>,
+    category: RecoveryCategory,
+    path: Option<&str>,
+    description: &str,
+) -> Result<RecoveredImage<'static>> {
+    let track_start_lba = i64::from(start_frame) - 150;
+    let patches = affected
+        .iter()
+        .map(|index| {
+            let lba = track_start_lba + i64::try_from(*index)?;
+            Ok(SectorPatch {
+                lba: i32::try_from(lba)?,
+                hex: crate::manifest::format_sector_patch_hex(&sector_bytes(source, *index)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let warnings = vec![RecoveryWarning {
+        category,
+        ranges: warning_ranges(start_frame, &affected)?,
+        path: path.map(str::to_owned),
+        description: description.to_owned(),
+    }];
+    Ok(RecoveredImage {
+        semantic: Cow::Owned(semantic),
+        patches,
+        warnings,
+    })
+}
+
+fn no_recovery(source: &[u8]) -> RecoveredImage<'_> {
+    RecoveredImage {
+        semantic: Cow::Borrowed(source),
+        patches: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn known_recovery_source(source_sha1: &str) -> bool {
+    matches!(
+        source_sha1,
+        "aad68c8551ef04f30ea7f4c7f495fb78d0f378c5"
+            | "4eca51973170275e020e8a1661a4a9110e4456a1"
+            | "484e5fdec33dbe2186b0d467cb4f012dc725e86a"
+            | "4d9f3ece1dc52848e29a64b8cf57c2e8ca98e8d1"
+            | "ca9f57992d2af0cea3157a304a26d03cb1ebc7b6"
+            | "25146a5b41f55883368c6d3de2d11b073044e205"
+            | "5305263db8cc676224c35389933f9e2333c165b6"
+            | "e91fe72bf2ff4a7ddef3056e75c330999df64cfb"
+            | "352a3c20efd42878238dcc56a9ed1d5432ac0655"
+            | "1c18a7893a71ecc5c06d84e55b8ef8a8076933fc"
+            | "34477c1d770381e78e600cdcf92dab95b54c3db9"
+            | "f6e02bea547536abb20dc922fd12b395588ec580"
+            | "cff9183875d08ed7377ff36a4a42f1a0e2f86fe0"
+            | "001392017ae58fd29c8cf9ec929a6a25f30d7a6f"
+            | "5f6689009bdd930b1b1641e1a6b505e1ab95a9b8"
+            | "1277d46d983b237659190938c9b41014c2c7aa2f"
+            | "36510ababe9e2252fa5fc426973aa703794a77b4"
+            | "3eb37f759827900432542a2c1e834fe22749e77b"
+            | "53d220058ff61235f3b512d4201510777aee574a"
+            | "66f0fd4b1703fa69d42c8694a68ba1965b26a538"
+            | "0eade90349db8c4f9c6d0626089b02ebf577b944"
+            | "ba46a36b5728d89a5aae5fe220066f90feed2200"
+            | "00b595095e26108d0e07d76492a11aaf3f71ccf1"
+            | "f877c53d420d571694e38d4af4e9f4ea3e5f8b7e"
+            | "0ec8e3b093291ac7ce3af2bb62beda5228f09435"
+            | "6bbfe335bc7be562f9f712f6a5ebfdf0e0b6d28b"
+            | "b4d0f2628dc070a56f9651f22663efe07e854e6f"
+    )
+}
+
+fn recover_known_corruption<'a>(source_sha1: &str, source: &'a [u8]) -> Result<RecoveredImage<'a>> {
+    if !known_recovery_source(source_sha1) {
+        return Ok(no_recovery(source));
+    }
+    let start_frame = raw_track_start_frame(source)?;
+    let mut semantic = source.to_vec();
+    let mut affected = BTreeSet::new();
+
+    let missing_prefix = match source_sha1 {
+        "aad68c8551ef04f30ea7f4c7f495fb78d0f378c5"
+        | "4eca51973170275e020e8a1661a4a9110e4456a1"
+        | "484e5fdec33dbe2186b0d467cb4f012dc725e86a"
+        | "4d9f3ece1dc52848e29a64b8cf57c2e8ca98e8d1" => Some(300),
+        "ca9f57992d2af0cea3157a304a26d03cb1ebc7b6" => Some(2180),
+        "00b595095e26108d0e07d76492a11aaf3f71ccf1"
+        | "f877c53d420d571694e38d4af4e9f4ea3e5f8b7e"
+        | "0ec8e3b093291ac7ce3af2bb62beda5228f09435" => Some(14515),
+        _ => None,
+    };
+    if let Some(index) = missing_prefix {
+        rewrite_form1_payload(&mut semantic, start_frame, index, |payload| {
+            repair_missing_directory_prefix(payload, u32::try_from(index)?)
+        })?;
+        let repaired = sector_bytes(&semantic, index)?;
+        let directory_subheader = XaSubheader::from([1, 0, 0x89, 0]);
+        let replacement = SectorWriter::new().form1(
+            start_frame + u32::try_from(index)?,
+            directory_subheader,
+            &repaired[24..2072],
+        )?;
+        install_sector(&mut semantic, index, &replacement)?;
+        affected.insert(index);
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::MissingDirectoryPrefix,
+            Some("CDROM"),
+            "reconstructed the uniquely implied eight-byte dot-record prefix in the semantic directory",
+        );
+    }
+
+    let residue = match source_sha1 {
+        "25146a5b41f55883368c6d3de2d11b073044e205"
+        | "5305263db8cc676224c35389933f9e2333c165b6"
+        | "f6e02bea547536abb20dc922fd12b395588ec580"
+        | "b4d0f2628dc070a56f9651f22663efe07e854e6f" => Some((23, 1024, "A")),
+        "0eade90349db8c4f9c6d0626089b02ebf577b944" => Some((25, 1536, "ART/TEXT")),
+        _ => None,
+    };
+    if let Some((index, valid_end, path)) = residue {
+        rewrite_form1_payload(&mut semantic, start_frame, index, |payload| {
+            clear_directory_residue(payload, valid_end)
+        })?;
+        affected.insert(index);
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::DirectoryBufferResidue,
+            Some(path),
+            "stopped at the independently verified record boundary and canonicalized the non-record buffer residue",
+        );
+    }
+    if source_sha1 == "1277d46d983b237659190938c9b41014c2c7aa2f" {
+        for index in [31, 33] {
+            rewrite_form1_payload(&mut semantic, start_frame, index, |payload| {
+                ensure!(
+                    payload.iter().any(|byte| *byte != 0),
+                    "MLB directory-residue sector is already empty"
+                );
+                payload.fill(0);
+                Ok(())
+            })?;
+            affected.insert(index);
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::DirectoryBufferResidue,
+            Some("MLB2/FE_ART/LOADING*"),
+            "stopped after the valid first blocks of both loading directories and canonicalized their independently verified residue blocks",
+        );
+    }
+
+    if matches!(
+        source_sha1,
+        "e91fe72bf2ff4a7ddef3056e75c330999df64cfb"
+            | "001392017ae58fd29c8cf9ec929a6a25f30d7a6f"
+            | "53d220058ff61235f3b512d4201510777aee574a"
+            | "66f0fd4b1703fa69d42c8694a68ba1965b26a538"
+    ) {
+        let next = parse_image(&sector_bytes(source, 13)?)?.1.remove(0);
+        ensure!(
+            next.kind == Kind::Form2,
+            "approved malformed system area is not followed by Form 2"
+        );
+        replace_with_form2_placeholder(
+            &mut semantic,
+            start_frame,
+            12,
+            FORM2_SUBHEADER,
+            next.form2_edc_valid,
+        )?;
+        affected.insert(12);
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::MalformedSystemArea,
+            None,
+            "used a canonical empty Form 2 sector in the fixed system-area slot",
+        );
+    }
+
+    if source_sha1 == "352a3c20efd42878238dcc56a9ed1d5432ac0655" {
+        for index in [
+            248495, 248630, 320933, 321466, 324265, 325679, 325872, 325934, 326148, 326276,
+        ] {
+            rewrite_form1_payload(&mut semantic, start_frame, index, |_| Ok(()))?;
+            affected.insert(index);
+        }
+        let parsed = parse_image(&semantic)
+            .context("classifying Biohazard sectors after sync/protection recovery")?
+            .1;
+        let valid_form2 = parsed
+            .iter()
+            .filter(|sector| sector.kind == Kind::Form2 && sector.form2_edc_valid)
+            .count();
+        let invalid_form2 = parsed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sector)| {
+                (sector.kind == Kind::Form2 && !sector.form2_edc_valid).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            valid_form2 > invalid_form2.len() && !invalid_form2.is_empty(),
+            "Biohazard Form 2 protection damage no longer matches the approved sparse shape"
+        );
+        for index in invalid_form2 {
+            rewrite_form2_payload(&mut semantic, start_frame, index, true)?;
+            affected.insert(index);
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::InternalRawDamage,
+            None,
+            "retained every proven payload window and normalized the damaged framing, protection, and local Form 2 EDC convention in the semantic view",
+        );
+    }
+
+    if source_sha1 == "6bbfe335bc7be562f9f712f6a5ebfdf0e0b6d28b" {
+        rewrite_form1_payload(&mut semantic, start_frame, 232531, |_| Ok(()))?;
+        let framing =
+            XaSubheader::from(<[u8; 4]>::try_from(&sector_bytes(source, 232534)?[16..20])?);
+        ensure!(
+            !framing
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+            "Tony Hawk recovery lost its proven Form 1 cadence"
+        );
+        replace_with_form1_placeholder(&mut semantic, start_frame, 232532, framing)?;
+        let (form2, computed_edc) = nearby_form2_framing(source, 232533)?;
+        replace_with_form2_placeholder(&mut semantic, start_frame, 232533, form2, computed_edc)?;
+        affected.extend([232531, 232532, 232533]);
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::InternalRawDamage,
+            Some("SUICIDE.STR"),
+            "retained the surviving payload and used deterministic zero payloads for two cadence-proven but unrecoverable stream slots",
+        );
+    }
+
+    let terminal = match source_sha1 {
+        "34477c1d770381e78e600cdcf92dab95b54c3db9" => Some(&[4614][..]),
+        "cff9183875d08ed7377ff36a4a42f1a0e2f86fe0" => Some(&[262259, 262260][..]),
+        "5f6689009bdd930b1b1641e1a6b505e1ab95a9b8" => Some(&[80630, 80631][..]),
+        "ba46a36b5728d89a5aae5fe220066f90feed2200" => Some(&[89894][..]),
+        _ => None,
+    };
+    if let Some(indices) = terminal {
+        for index in indices {
+            replace_with_xa_gap(&mut semantic, start_frame, *index)?;
+            affected.insert(*index);
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::TerminalRawDamage,
+            None,
+            "placed canonical XA-gap sectors in the proven terminal gap slots",
+        );
+    }
+
+    if source_sha1 == "1c18a7893a71ecc5c06d84e55b8ef8a8076933fc" {
+        for (indices, parent_extent) in [(26..=41, 21_u32), (42..=54, 22), (55..=65, 23)] {
+            let parent_time =
+                sector_bytes(source, usize::try_from(parent_extent)?)?[24 + 18..24 + 25].to_vec();
+            for index in indices {
+                rewrite_form1_payload(&mut semantic, start_frame, index, |payload| {
+                    let parent_offset = usize::from(payload[0]);
+                    ensure!(
+                        parent_offset >= 34
+                            && parent_offset + 34 <= payload.len()
+                            && payload[parent_offset + 32] == 1
+                            && payload[parent_offset + 33] == 1
+                            && u32::from_le_bytes(
+                                payload[parent_offset + 2..parent_offset + 6].try_into()?
+                            ) == 20,
+                        "Blood Lines parent-record shape changed"
+                    );
+                    payload[parent_offset + 2..parent_offset + 6]
+                        .copy_from_slice(&parent_extent.to_le_bytes());
+                    payload[parent_offset + 6..parent_offset + 10]
+                        .copy_from_slice(&parent_extent.to_be_bytes());
+                    payload[parent_offset + 18..parent_offset + 25].copy_from_slice(&parent_time);
+                    Ok(())
+                })?;
+                affected.insert(index);
+            }
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::FilesystemHierarchy,
+            Some("DATA/*"),
+            "recovered the malformed parent records from the valid DATA hierarchy and path-table evidence",
+        );
+    }
+
+    if source_sha1 == "36510ababe9e2252fa5fc426973aa703794a77b4" {
+        rewrite_form1_payload(&mut semantic, start_frame, 22, |payload| {
+            let offset = 328;
+            ensure!(
+                payload[offset + 33..offset + 38] == *b"DUMMY"
+                    && u32::from_le_bytes(payload[offset + 10..offset + 14].try_into()?) == 2048,
+                "OverBlood DUMMY record shape changed"
+            );
+            payload[offset + 10..offset + 18].fill(0);
+            Ok(())
+        })?;
+        affected.insert(22);
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::FilesystemHierarchy,
+            Some("DUMMY"),
+            "retained the childless path-table node as a zero-length reference and excluded its non-directory payload from hierarchy traversal",
+        );
+    }
+
+    if source_sha1 == "3eb37f759827900432542a2c1e834fe22749e77b" {
+        rewrite_form1_payload(&mut semantic, start_frame, 16, |payload| {
+            ensure!(
+                u32::from_le_bytes(payload[132..136].try_into()?) == 268
+                    && u32::from_be_bytes(payload[136..140].try_into()?) == 268,
+                "PoPoRoGue path-table size changed"
+            );
+            payload[132..136].copy_from_slice(&256_u32.to_le_bytes());
+            payload[136..140].copy_from_slice(&256_u32.to_be_bytes());
+            Ok(())
+        })?;
+        affected.insert(16);
+        for index in 18..=21 {
+            rewrite_form1_payload(&mut semantic, start_frame, index, |payload| {
+                ensure!(
+                    payload[256] == 4 && payload[264..268] == *b"MS00",
+                    "PoPoRoGue phantom path-table node changed"
+                );
+                payload[256..268].fill(0);
+                Ok(())
+            })?;
+            affected.insert(index);
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::FilesystemHierarchy,
+            Some("PCHR/MCHR/MS00"),
+            "excluded the impossible path-table-only phantom node while retaining the reachable directory tree",
+        );
+    }
+
+    Ok(no_recovery(source))
+}
+
+fn apply_sector_patches(
+    raw: &mut [u8],
+    track_start_frame: u32,
+    patches: &[SectorPatch],
 ) -> Result<()> {
     ensure!(
         raw.len().is_multiple_of(RAW_SECTOR_SIZE),
         "canonical image size is not a multiple of 2352 bytes"
     );
+    let track_start_lba = i64::from(track_start_frame) - 150;
     let sector_count = raw.len() / RAW_SECTOR_SIZE;
-    let touched = patch.apply(raw, RAW_SECTOR_SIZE)?;
-    for index in touched {
+    let mut previous_lba = None;
+    for patch in patches {
+        if let Some(previous_lba) = previous_lba {
+            ensure!(
+                patch.lba > previous_lba,
+                "patch LBAs must be strictly increasing; LBA {} follows {}",
+                patch.lba,
+                previous_lba
+            );
+        }
+        previous_lba = Some(patch.lba);
+        let sector_index = i64::from(patch.lba) - track_start_lba;
+        ensure!(
+            sector_index >= 0,
+            "patch LBA {} is before track start LBA {}",
+            patch.lba,
+            track_start_lba
+        );
+        let index = usize::try_from(sector_index)?;
+        ensure!(
+            index < sector_count,
+            "patch LBA {} is outside the {}-sector track starting at LBA {}",
+            patch.lba,
+            sector_count,
+            track_start_lba
+        );
+        let replacement = decode_sector_patch(patch)?;
         let start = index * RAW_SECTOR_SIZE;
-        regenerate_mode2_protection(
-            &mut raw[start..start + RAW_SECTOR_SIZE],
-            form2_edc,
-            noncompliant_trailing_ecc && index + 1 == sector_count,
-        )
-        .with_context(|| format!("regenerating protection for patched sector {index}"))?;
+        raw[start..start + RAW_SECTOR_SIZE].copy_from_slice(&replacement);
     }
     Ok(())
 }
@@ -1145,7 +1842,10 @@ pub fn extract_with_options(
     let image = fs::read(image_path)
         .with_context(|| format!("reading raw image {}", image_path.display()))?;
     let source_sha1 = sha1_hex(&image);
-    let (start_frame, sectors) = parse_image(&image)?;
+    let recovery = recover_known_corruption(&source_sha1, &image)
+        .context("applying approved corruption recovery")?;
+    let (start_frame, sectors) =
+        parse_image(&recovery.semantic).context("parsing recovered semantic image")?;
     ensure!(sectors.len() >= 23, "image is too small");
     let track_mode = match sectors[0].kind {
         Kind::Mode1 | Kind::Mode1Gap => TrackMode::Mode1,
@@ -1195,6 +1895,24 @@ pub fn extract_with_options(
         .map(|sector| sector.logical_block().try_into())
         .collect::<Result<Vec<[u8; LOGICAL_BLOCK_SIZE]>, _>>()?;
     let mut parsed_iso = iso9660::parse(&blocks)?;
+    if source_sha1 == "1277d46d983b237659190938c9b41014c2c7aa2f" {
+        for path in ["MLB2/FE_ART/LOADING", "MLB2/FE_ART/LOADING2"] {
+            let entry = parsed_iso
+                .manifest
+                .entries
+                .iter_mut()
+                .find(|entry| entry.path == path)
+                .with_context(|| format!("missing recovered directory {path}"))?;
+            ensure!(
+                entry.directory_slack.is_none(),
+                "recovered directory unexpectedly has ordinary slack: {path}"
+            );
+            entry.directory_slack = Some(DirectorySlack {
+                offset: 4095,
+                hex: "00".to_owned(),
+            });
+        }
+    }
     let content_end = sectors.len() - trailing_physical_gap;
     if track_mode == TrackMode::Mode2Xa {
         if sectors[16].subheader == FORM1_DATA_SUBHEADER
@@ -1324,7 +2042,7 @@ pub fn extract_with_options(
             start_msf: format_msf(start_frame)?,
             form2_edc,
             noncompliant_trailing_ecc,
-            ppf: None,
+            patches: recovery.patches,
         },
         system_area: SystemArea {
             path: system_name.clone(),
@@ -1351,6 +2069,8 @@ pub fn extract_with_options(
         !extracted_files.contains_key(&system_name),
         "system asset path collides with an extraction asset"
     );
+    verify_extracted_project(&manifest, &system_bytes, &extracted_files, &image)
+        .context("verifying extracted project against source image")?;
     if !options.manifest_only {
         let authored_file_paths: HashSet<_> = manifest
             .iso9660
@@ -1433,7 +2153,118 @@ pub fn extract_with_options(
     Ok(ExtractReport {
         sectors: sector_count,
         sha1: source_sha1,
+        recovery_warnings: recovery.warnings,
     })
+}
+
+fn verify_extracted_project(
+    manifest: &Manifest,
+    system: &[u8],
+    assets: &HashMap<String, Vec<u8>>,
+    source: &[u8],
+) -> Result<()> {
+    let temporary = tempfile::tempdir().context("creating verification project")?;
+    let data_dir = temporary.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let system_path = safe_join(&data_dir, &manifest.system_area.path)?;
+    create_output_parent(&system_path, "verification system asset")?;
+    fs::write(&system_path, system)?;
+    for (path, bytes) in assets {
+        let output = safe_join(&data_dir, path)?;
+        create_output_parent(&output, "verification asset")?;
+        fs::write(&output, bytes)?;
+    }
+    let manifest_path = temporary.path().join("disc.yaml");
+    fs::write(&manifest_path, serialize_manifest(manifest, false)?)?;
+    let image_path = temporary.path().join("canonical.bin");
+    build_with_options(
+        &manifest_path,
+        &image_path,
+        &data_dir,
+        BuildOptions {
+            overwrite: false,
+            apply_patches: false,
+        },
+    )
+    .context("building canonical verification image")?;
+    let canonical = fs::read(&image_path)?;
+    verify_canonical_against_source(
+        &canonical,
+        source,
+        parse_msf(&manifest.track.start_msf)?,
+        &manifest.track.patches,
+    )
+}
+
+fn verify_canonical_against_source(
+    canonical: &[u8],
+    source: &[u8],
+    start_frame: u32,
+    patches: &[SectorPatch],
+) -> Result<()> {
+    ensure!(
+        canonical.len() == source.len(),
+        "canonical/source length mismatch: canonical {} bytes, source {} bytes",
+        canonical.len(),
+        source.len()
+    );
+    ensure!(
+        canonical.len().is_multiple_of(RAW_SECTOR_SIZE),
+        "canonical image length is not a sector multiple"
+    );
+    let track_start_lba = i64::from(start_frame) - 150;
+    let mut patched_indices = BTreeSet::new();
+    let mut previous_lba = None;
+    for patch in patches {
+        if let Some(previous_lba) = previous_lba {
+            ensure!(
+                patch.lba > previous_lba,
+                "patch LBAs must be strictly increasing"
+            );
+        }
+        previous_lba = Some(patch.lba);
+        let index = i64::from(patch.lba) - track_start_lba;
+        ensure!(index >= 0, "patch LBA {} is before track start", patch.lba);
+        let index = usize::try_from(index)?;
+        ensure!(
+            index < canonical.len() / RAW_SECTOR_SIZE,
+            "patch LBA {} is outside canonical image",
+            patch.lba
+        );
+        ensure!(
+            patched_indices.insert(index),
+            "duplicate patch LBA {}",
+            patch.lba
+        );
+    }
+    for index in 0..canonical.len() / RAW_SECTOR_SIZE {
+        if patched_indices.contains(&index) {
+            continue;
+        }
+        let start = index * RAW_SECTOR_SIZE;
+        let end = start + RAW_SECTOR_SIZE;
+        if canonical[start..end] != source[start..end] {
+            let relative = canonical[start..end]
+                .iter()
+                .zip(&source[start..end])
+                .position(|(canonical, source)| canonical != source)
+                .expect("different sectors have a differing byte");
+            anyhow::bail!(
+                "unexplained reconstruction difference at sector {index}, byte {relative}"
+            );
+        }
+    }
+    let mut restored = canonical.to_vec();
+    apply_sector_patches(&mut restored, start_frame, patches)?;
+    ensure!(
+        restored == source,
+        "registered raw-sector patches do not reproduce the complete source image"
+    );
+    ensure!(
+        sha1_hex(&restored) == sha1_hex(source),
+        "registered raw-sector patches do not reproduce the source SHA-1"
+    );
+    Ok(())
 }
 
 struct ExtractedSystemArea {
@@ -2229,7 +3060,24 @@ pub fn build(
     data_dir: &Path,
     overwrite: bool,
 ) -> Result<BuildReport> {
-    validate_output_file(image_path, overwrite, "image output")?;
+    build_with_options(
+        manifest_path,
+        image_path,
+        data_dir,
+        BuildOptions {
+            overwrite,
+            apply_patches: true,
+        },
+    )
+}
+
+pub fn build_with_options(
+    manifest_path: &Path,
+    image_path: &Path,
+    data_dir: &Path,
+    options: BuildOptions,
+) -> Result<BuildReport> {
+    validate_output_file(image_path, options.overwrite, "image output")?;
     let temp_path = temporary_path(image_path)?;
     validate_output_file(&temp_path, false, "temporary output")?;
     let yaml = fs::read_to_string(manifest_path)
@@ -2240,43 +3088,6 @@ pub fn build(
         "unsupported track mode {}",
         manifest.track.mode
     );
-    ensure!(
-        manifest.track.mode == TrackMode::Mode2Xa || manifest.track.ppf.is_none(),
-        "PPF overlays are unsupported for Mode 1 tracks"
-    );
-    let patch = if let Some(ppf_path) = manifest.track.ppf.as_deref() {
-        ensure!(
-            ppf_path != manifest.system_area.path
-                && manifest.iso9660.entries.iter().all(|entry| {
-                    entry.path != ppf_path
-                        && entry.xa.as_ref().is_none_or(|xa| {
-                            xa.form1.as_deref() != Some(ppf_path)
-                                && xa.form2.as_deref() != Some(ppf_path)
-                                && xa.index.as_deref() != Some(ppf_path)
-                                && xa.gap_index.as_deref() != Some(ppf_path)
-                        })
-                })
-                && manifest
-                    .iso9660
-                    .files
-                    .iter()
-                    .filter_map(FileLayoutItem::as_xa_extent)
-                    .all(|assets| {
-                        assets.form1 != ppf_path
-                            && assets.form2 != ppf_path
-                            && assets.index != ppf_path
-                            && assets.gap_index.as_deref() != Some(ppf_path)
-                    }),
-            "PPF asset path collides with another authored asset: {ppf_path}"
-        );
-        let host_path = safe_join(data_dir, ppf_path)?;
-        validate_input_file(&host_path, "PPF input")?;
-        let bytes = fs::read(&host_path)
-            .with_context(|| format!("reading PPF input {}", host_path.display()))?;
-        Some(Ppf2::from_bytes(&bytes).context("parsing PPF2 input")?)
-    } else {
-        None
-    };
     ensure!(
         manifest
             .iso9660
@@ -2358,9 +3169,7 @@ pub fn build(
                     "duplicate XA secondary asset path {asset}"
                 );
                 ensure!(
-                    !iso_paths.contains(asset)
-                        && asset != manifest.system_area.path
-                        && manifest.track.ppf.as_deref() != Some(asset),
+                    !iso_paths.contains(asset) && asset != manifest.system_area.path,
                     "XA secondary asset path collides with another authored asset: {asset}"
                 );
                 let host_path = safe_join(data_dir, asset)?;
@@ -2377,9 +3186,7 @@ pub fn build(
                     "duplicate XA secondary asset path {asset}"
                 );
                 ensure!(
-                    !iso_paths.contains(asset)
-                        && asset != manifest.system_area.path
-                        && manifest.track.ppf.as_deref() != Some(asset),
+                    !iso_paths.contains(asset) && asset != manifest.system_area.path,
                     "XA secondary asset path collides with another authored asset: {asset}"
                 );
                 let host_path = safe_join(data_dir, asset)?;
@@ -2429,9 +3236,7 @@ pub fn build(
                 "duplicate XA secondary asset path {asset}"
             );
             ensure!(
-                !iso_paths.contains(asset)
-                    && asset != manifest.system_area.path
-                    && manifest.track.ppf.as_deref() != Some(asset),
+                !iso_paths.contains(asset) && asset != manifest.system_area.path,
                 "XA secondary asset path collides with another authored asset: {asset}"
             );
             let host_path = safe_join(data_dir, asset)?;
@@ -2447,9 +3252,7 @@ pub fn build(
                 "duplicate XA secondary asset path {asset}"
             );
             ensure!(
-                !iso_paths.contains(asset)
-                    && asset != manifest.system_area.path
-                    && manifest.track.ppf.as_deref() != Some(asset),
+                !iso_paths.contains(asset) && asset != manifest.system_area.path,
                 "XA secondary asset path collides with another authored asset: {asset}"
             );
             let host_path = safe_join(data_dir, asset)?;
@@ -2738,14 +3541,9 @@ pub fn build(
         raw.extend_from_slice(&sector);
     }
 
-    if let Some(patch) = &patch {
-        apply_ppf_overlay(
-            &mut raw,
-            patch,
-            manifest.track.form2_edc,
-            manifest.track.noncompliant_trailing_ecc,
-        )
-        .context("applying pre-protection PPF2 overlay")?;
+    if options.apply_patches {
+        apply_sector_patches(&mut raw, start_frame, &manifest.track.patches)
+            .context("applying raw-sector patches")?;
     }
 
     let sha1 = sha1_hex(&raw);
@@ -2758,7 +3556,7 @@ pub fn build(
     output.write_all(&raw)?;
     output.sync_all()?;
     drop(output);
-    install_image(&temp_path, image_path, overwrite)?;
+    install_image(&temp_path, image_path, options.overwrite)?;
     Ok(BuildReport {
         sectors: layout.volume_blocks,
         sha1,
@@ -2920,8 +3718,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Entry;
-    use crate::ppf::{Ppf2, PpfRecord};
+    use crate::manifest::{Entry, SectorPatch, format_sector_patch_hex};
 
     fn test_manifest() -> Manifest {
         yaml_serde::from_str(
@@ -2993,7 +3790,7 @@ mod tests {
         parse_image(&raw).unwrap().1
     }
 
-    fn canonical_ppf_target() -> Vec<u8> {
+    fn canonical_patch_target() -> Vec<u8> {
         let mut writer = SectorWriter::new();
         let mut raw = Vec::new();
         for index in 0..20 {
@@ -3009,36 +3806,184 @@ mod tests {
     }
 
     #[test]
-    fn generic_ppf_overlay_applies_every_record_before_reprotecting_sectors() {
-        let mut raw = canonical_ppf_target();
-        let canonical = raw.clone();
-        let second = RAW_SECTOR_SIZE as u32;
-        let fourth = (3 * RAW_SECTOR_SIZE) as u32;
-        let metadata = (16 * RAW_SECTOR_SIZE + 24 + 37) as u32;
-        let patch = Ppf2::new(
-            &canonical,
+    fn raw_sector_patches_replace_complete_sectors_without_reprotecting() {
+        let mut raw = canonical_patch_target();
+        let replacement = [0xa5; RAW_SECTOR_SIZE];
+        let patches = [SectorPatch {
+            lba: 1,
+            hex: format_sector_patch_hex(&replacement),
+        }];
+
+        apply_sector_patches(&mut raw, 150, &patches).unwrap();
+
+        assert_eq!(&raw[RAW_SECTOR_SIZE..2 * RAW_SECTOR_SIZE], &replacement);
+        assert!(parse_image(&raw[RAW_SECTOR_SIZE..2 * RAW_SECTOR_SIZE]).is_err());
+    }
+
+    #[test]
+    fn patch_lbas_are_absolute_signed_ordered_and_bounded() {
+        let replacement = [0x3c; RAW_SECTOR_SIZE];
+        let patch = SectorPatch {
+            lba: -74,
+            hex: format_sector_patch_hex(&replacement),
+        };
+        let mut raw = canonical_patch_target()[..2 * RAW_SECTOR_SIZE].to_vec();
+        apply_sector_patches(&mut raw, 75, &[patch]).unwrap();
+        assert_eq!(&raw[RAW_SECTOR_SIZE..], &replacement);
+
+        for patches in [
             vec![
-                PpfRecord::new(20, vec![0x12, 0x34, 0x56, 0x78]).unwrap(),
-                PpfRecord::new(second + 18, vec![XaSubmode::FORM2.bits()]).unwrap(),
-                PpfRecord::new(second + 24, vec![0xa5]).unwrap(),
-                PpfRecord::new(metadata, vec![0x5a]).unwrap(),
-                PpfRecord::new(fourth - 2, vec![0xde, 0xad, 0xbe, 0xef]).unwrap(),
+                SectorPatch {
+                    lba: -74,
+                    hex: format_sector_patch_hex(&replacement),
+                },
+                SectorPatch {
+                    lba: -74,
+                    hex: format_sector_patch_hex(&replacement),
+                },
             ],
-        )
-        .unwrap();
+            vec![
+                SectorPatch {
+                    lba: -74,
+                    hex: format_sector_patch_hex(&replacement),
+                },
+                SectorPatch {
+                    lba: -75,
+                    hex: format_sector_patch_hex(&replacement),
+                },
+            ],
+            vec![SectorPatch {
+                lba: -76,
+                hex: format_sector_patch_hex(&replacement),
+            }],
+            vec![SectorPatch {
+                lba: 0,
+                hex: format_sector_patch_hex(&replacement),
+            }],
+        ] {
+            let mut raw = canonical_patch_target()[..2 * RAW_SECTOR_SIZE].to_vec();
+            assert!(apply_sector_patches(&mut raw, 75, &patches).is_err());
+        }
+    }
 
-        apply_ppf_overlay(&mut raw, &patch, true, false).unwrap();
+    #[test]
+    fn canonical_verification_rejects_length_and_unregistered_differences() {
+        let canonical = vec![0_u8; 2 * RAW_SECTOR_SIZE];
+        let mut source = canonical.clone();
+        source[RAW_SECTOR_SIZE + 9] = 0xa5;
+        let patch = SectorPatch {
+            lba: 1,
+            hex: format_sector_patch_hex(&source[RAW_SECTOR_SIZE..]),
+        };
+        verify_canonical_against_source(&canonical, &source, 150, &[patch]).unwrap();
+        assert!(verify_canonical_against_source(&canonical, &source, 150, &[]).is_err());
+        assert!(
+            verify_canonical_against_source(
+                &canonical,
+                &source[..source.len() - RAW_SECTOR_SIZE],
+                150,
+                &[]
+            )
+            .is_err()
+        );
+    }
 
-        assert_eq!(&raw[20..24], &[0x12, 0x34, 0x56, 0x78]);
-        let (_, first) = parse_image(&raw[..RAW_SECTOR_SIZE]).unwrap();
-        assert_eq!(first[0].kind, Kind::Form1);
-        let (_, second_sector) = parse_image(&raw[RAW_SECTOR_SIZE..2 * RAW_SECTOR_SIZE]).unwrap();
-        assert_eq!(second_sector[0].kind, Kind::Form2);
-        assert!(second_sector[0].form2_edc_valid);
-        assert_eq!(second_sector[0].payload()[0], 0xa5);
-        assert_eq!(raw[16 * RAW_SECTOR_SIZE + 24 + 37], 0x5a);
-        assert_ne!(&raw[fourth as usize - 2..fourth as usize], &[0xde, 0xad]);
-        assert_eq!(&raw[fourth as usize..fourth as usize + 2], &[0xbe, 0xef]);
+    #[test]
+    fn recovery_ranges_group_adjacent_absolute_lbas_and_render_msf() {
+        let indices = BTreeSet::from([0, 1, 3]);
+        let ranges = warning_ranges(150, &indices).unwrap();
+        assert_eq!(
+            ranges,
+            vec![
+                RecoveryRange {
+                    first_lba: 0,
+                    last_lba: 1,
+                    first_msf: "00:02:00".to_owned(),
+                    last_msf: "00:02:01".to_owned(),
+                },
+                RecoveryRange {
+                    first_lba: 3,
+                    last_lba: 3,
+                    first_msf: "00:02:03".to_owned(),
+                    last_msf: "00:02:03".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn damaged_slots_recover_payload_or_use_deterministic_form_placeholders() {
+        let mut writer = SectorWriter::new();
+        let payload = [0x7b; LOGICAL_BLOCK_SIZE];
+        let mut damaged = writer.form1(150, FORM1_DATA_SUBHEADER, &payload).unwrap();
+        damaged[5] ^= 0x40;
+        rewrite_form1_payload(&mut damaged, 150, 0, |_| Ok(())).unwrap();
+        let recovered = parse_image(&damaged).unwrap().1.remove(0);
+        assert_eq!(recovered.kind, Kind::Form1);
+        assert_eq!(recovered.payload(), payload);
+
+        let mut placeholders = vec![0xa5; 2 * RAW_SECTOR_SIZE];
+        replace_with_form1_placeholder(&mut placeholders, 150, 0, FORM1_DATA_SUBHEADER).unwrap();
+        replace_with_form2_placeholder(&mut placeholders, 150, 1, FORM2_SUBHEADER, true).unwrap();
+        let parsed = parse_image(&placeholders).unwrap().1;
+        assert_eq!(parsed[0].kind, Kind::Form1);
+        assert_eq!(parsed[1].kind, Kind::Form2);
+        assert!(
+            parsed
+                .iter()
+                .all(|sector| sector.payload().iter().all(|byte| *byte == 0))
+        );
+    }
+
+    #[test]
+    fn bounded_directory_repairs_reject_loss_and_preserve_valid_prefixes() {
+        let extent = 300_u32;
+        let mut missing = [0_u8; LOGICAL_BLOCK_SIZE];
+        missing[..2].copy_from_slice(&extent.to_be_bytes()[2..]);
+        missing[40] = 48;
+        missing[41..48].copy_from_slice(b"parent!");
+        let original = missing;
+        repair_missing_directory_prefix(&mut missing, extent).unwrap();
+        assert_eq!(missing[0], 48);
+        assert_eq!(&missing[2..6], &extent.to_le_bytes());
+        assert_eq!(&missing[8..48], &original[..40]);
+        assert_eq!(&missing[48..56], &original[40..48]);
+
+        let mut lossy = original;
+        lossy[2047] = 1;
+        assert!(repair_missing_directory_prefix(&mut lossy, extent).is_err());
+
+        let mut residue = [0_u8; LOGICAL_BLOCK_SIZE];
+        residue[..16].fill(0x11);
+        residue[1024..].fill(0xa5);
+        clear_directory_residue(&mut residue, 1024).unwrap();
+        assert!(residue[..16].iter().all(|byte| *byte == 0x11));
+        assert!(residue[1024..].iter().all(|byte| *byte == 0));
+        assert!(clear_directory_residue(&mut residue, 1024).is_err());
+    }
+
+    #[test]
+    fn healthy_and_unknown_images_do_not_gain_automatic_patches() {
+        let healthy = canonical_patch_target();
+        let recovered = recover_known_corruption(&sha1_hex(&healthy), &healthy).unwrap();
+        assert_eq!(recovered.semantic, healthy);
+        assert!(recovered.patches.is_empty());
+        assert!(recovered.warnings.is_empty());
+
+        let mut unknown = canonical_patch_target();
+        unknown[0] ^= 1;
+        let recovered = recover_known_corruption(&sha1_hex(&unknown), &unknown).unwrap();
+        assert!(recovered.patches.is_empty());
+        assert!(parse_image(&recovered.semantic).is_err());
+    }
+
+    #[test]
+    fn terminal_recovery_creates_an_existing_canonical_gap_slot() {
+        let mut raw = vec![0x5a; RAW_SECTOR_SIZE];
+        replace_with_xa_gap(&mut raw, 150, 0).unwrap();
+        let parsed = parse_image(&raw).unwrap().1;
+        assert_eq!(parsed[0].kind, Kind::XaGap);
+        assert_eq!(raw.len(), RAW_SECTOR_SIZE);
     }
 
     #[test]
