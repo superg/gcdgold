@@ -11,11 +11,11 @@ use sha1::{Digest, Sha1};
 use crate::iso9660;
 use crate::manifest::{
     DirectorySlack, EntryReference, EntryReferenceKind, EntrySectorSubheader, FileLayoutItem,
-    Form1Sectors, GapKind, IsoMetadataSubheader, Manifest, MetadataSubheader, MetadataVolume,
-    PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS, SectorPatch, SystemArea,
-    SystemAreaFinalSubheader, SystemAreaForm1Framing, SystemAreaSectorKind, SystemAreaSectorRun,
-    Track, TrackMode, VolumeTerminatorSubheader, XaAttributeFlag, XaExtentAssets, XaLengthEncoding,
-    decode_sector_patch, serialize_manifest,
+    Form1Sectors, GCDGOLD_VERSION, GapKind, GcdgoldMetadata, IsoMetadataSubheader, Manifest,
+    MetadataSubheader, MetadataVolume, PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS,
+    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
+    XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorWriter, XaSubheader,
@@ -90,26 +90,14 @@ pub struct Sha1Mismatch {
     pub actual: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BuildOptions {
     pub overwrite: bool,
-    pub apply_patches: bool,
-}
-
-impl Default for BuildOptions {
-    fn default() -> Self {
-        Self {
-            overwrite: false,
-            apply_patches: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtractOptions {
-    pub manifest_only: bool,
     pub overwrite: bool,
-    pub include_hashes: bool,
 }
 
 const FORM1_DATA_SUBHEADER: XaSubheader = XaSubheader::with_submode(XaSubmode::DATA);
@@ -2034,18 +2022,13 @@ pub fn extract(
     image_path: &Path,
     manifest_path: &Path,
     data_dir: &Path,
-    manifest_only: bool,
     overwrite: bool,
 ) -> Result<ExtractReport> {
     extract_with_options(
         image_path,
         manifest_path,
         data_dir,
-        ExtractOptions {
-            manifest_only,
-            overwrite,
-            include_hashes: false,
-        },
+        ExtractOptions { overwrite },
     )
 }
 
@@ -2257,6 +2240,9 @@ pub fn extract_with_options(
         }
     }
     let mut manifest = Manifest {
+        gcdgold: GcdgoldMetadata {
+            version: GCDGOLD_VERSION.to_owned(),
+        },
         track: Track {
             sha1: None,
             mode: track_mode,
@@ -2292,89 +2278,76 @@ pub fn extract_with_options(
         !extracted_files.contains_key(&system_name),
         "system asset path collides with an extraction asset"
     );
-    let write_plan = if options.manifest_only {
-        None
-    } else {
-        Some(plan_extraction_outputs(
-            &mut manifest,
-            &mut extracted_files,
-            &system_bytes,
-            data_dir,
-            options.overwrite,
-        )?)
-    };
-    if options.include_hashes {
-        add_extracted_hashes(&mut manifest, &image, &system_bytes, &extracted_files)?;
+    let write_plan = plan_extraction_outputs(
+        &mut manifest,
+        &mut extracted_files,
+        &system_bytes,
+        data_dir,
+        options.overwrite,
+    )?;
+    add_extracted_hashes(&mut manifest, &image, &system_bytes, &extracted_files)?;
+    let authored_file_paths: HashSet<_> = manifest
+        .iso9660
+        .layout
+        .iter()
+        .filter_map(FileLayoutItem::as_path)
+        .collect();
+    let referenced_file_paths: HashSet<_> = manifest
+        .iso9660
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .reference
+                .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory)
+        })
+        .map(|entry| entry.path.as_str())
+        .collect();
+    for entry in manifest
+        .iso9660
+        .entries
+        .iter()
+        .filter(|entry| entry.path != iso9660::ROOT_PATH)
+    {
+        if !authored_file_paths.contains(entry.path.as_str())
+            && !referenced_file_paths.contains(entry.path.as_str())
+        {
+            let output = safe_join(data_dir, &entry.path)?;
+            validate_output_ancestors(data_dir, &entry.path)?;
+            validate_output_directory(&output, "extraction output")?;
+        }
     }
-    verify_extracted_project(&manifest, &system_bytes, &extracted_files, &image)
-        .context("verifying extracted project against source image")?;
-    if !options.manifest_only {
-        let authored_file_paths: HashSet<_> = manifest
-            .iso9660
-            .layout
-            .iter()
-            .filter_map(FileLayoutItem::as_path)
-            .collect();
-        let referenced_file_paths: HashSet<_> = manifest
-            .iso9660
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .reference
-                    .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory)
-            })
-            .map(|entry| entry.path.as_str())
-            .collect();
-        for entry in manifest
-            .iso9660
-            .entries
-            .iter()
-            .filter(|entry| entry.path != iso9660::ROOT_PATH)
+    create_output_parent(manifest_path, "manifest output")?;
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    for entry in manifest
+        .iso9660
+        .entries
+        .iter()
+        .filter(|entry| entry.path != iso9660::ROOT_PATH)
+    {
+        if !authored_file_paths.contains(entry.path.as_str())
+            && !referenced_file_paths.contains(entry.path.as_str())
         {
-            if !authored_file_paths.contains(entry.path.as_str())
-                && !referenced_file_paths.contains(entry.path.as_str())
-            {
-                let output = safe_join(data_dir, &entry.path)?;
-                validate_output_ancestors(data_dir, &entry.path)?;
-                validate_output_directory(&output, "extraction output")?;
-            }
+            let output = safe_join(data_dir, &entry.path)?;
+            fs::create_dir_all(&output)
+                .with_context(|| format!("creating directory {}", output.display()))?;
         }
-        create_output_parent(manifest_path, "manifest output")?;
-        fs::create_dir_all(data_dir)
-            .with_context(|| format!("creating data directory {}", data_dir.display()))?;
-        for entry in manifest
-            .iso9660
-            .entries
-            .iter()
-            .filter(|entry| entry.path != iso9660::ROOT_PATH)
-        {
-            if !authored_file_paths.contains(entry.path.as_str())
-                && !referenced_file_paths.contains(entry.path.as_str())
-            {
-                let output = safe_join(data_dir, &entry.path)?;
-                fs::create_dir_all(&output)
-                    .with_context(|| format!("creating directory {}", output.display()))?;
-            }
+    }
+    let system_path = safe_join(data_dir, &manifest.system_area.path)?;
+    if write_plan.system {
+        fs::write(&system_path, &system_bytes)
+            .with_context(|| format!("writing {}", system_path.display()))?;
+    }
+    for (path, data) in extracted_files {
+        if !write_plan.assets.contains(&path) {
+            continue;
         }
-        let write_plan = write_plan.expect("non-manifest extraction has a write plan");
-        let system_path = safe_join(data_dir, &manifest.system_area.path)?;
-        if write_plan.system {
-            fs::write(&system_path, &system_bytes)
-                .with_context(|| format!("writing {}", system_path.display()))?;
+        let output = safe_join(data_dir, &path)?;
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
         }
-        for (path, data) in extracted_files {
-            if !write_plan.assets.contains(&path) {
-                continue;
-            }
-            let output = safe_join(data_dir, &path)?;
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&output, data).with_context(|| format!("writing {}", output.display()))?;
-        }
-    } else {
-        create_output_parent(manifest_path, "manifest output")?;
+        fs::write(&output, data).with_context(|| format!("writing {}", output.display()))?;
     }
     let yaml = serialize_manifest(&manifest)?;
     fs::write(manifest_path, yaml)
@@ -2384,118 +2357,6 @@ pub fn extract_with_options(
         sha1: source_sha1,
         recovery_warnings: recovery.warnings,
     })
-}
-
-fn verify_extracted_project(
-    manifest: &Manifest,
-    system: &[u8],
-    assets: &HashMap<String, Vec<u8>>,
-    source: &[u8],
-) -> Result<()> {
-    let temporary = tempfile::tempdir().context("creating verification project")?;
-    let data_dir = temporary.path().join("data");
-    fs::create_dir(&data_dir)?;
-    let system_path = safe_join(&data_dir, &manifest.system_area.path)?;
-    create_output_parent(&system_path, "verification system asset")?;
-    fs::write(&system_path, system)?;
-    for (path, bytes) in assets {
-        let output = safe_join(&data_dir, path)?;
-        create_output_parent(&output, "verification asset")?;
-        fs::write(&output, bytes)?;
-    }
-    let manifest_path = temporary.path().join("disc.yaml");
-    fs::write(&manifest_path, serialize_manifest(manifest)?)?;
-    let image_path = temporary.path().join("canonical.bin");
-    build_with_options(
-        &manifest_path,
-        &image_path,
-        &data_dir,
-        BuildOptions {
-            overwrite: false,
-            apply_patches: false,
-        },
-    )
-    .context("building canonical verification image")?;
-    let canonical = fs::read(&image_path)?;
-    verify_canonical_against_source(
-        &canonical,
-        source,
-        parse_msf(&manifest.track.start_msf)?,
-        &manifest.track.patches,
-    )
-}
-
-fn verify_canonical_against_source(
-    canonical: &[u8],
-    source: &[u8],
-    start_frame: u32,
-    patches: &[SectorPatch],
-) -> Result<()> {
-    ensure!(
-        canonical.len() == source.len(),
-        "canonical/source length mismatch: canonical {} bytes, source {} bytes",
-        canonical.len(),
-        source.len()
-    );
-    ensure!(
-        canonical.len().is_multiple_of(RAW_SECTOR_SIZE),
-        "canonical image length is not a sector multiple"
-    );
-    let track_start_lba = i64::from(start_frame) - 150;
-    let mut patched_indices = BTreeSet::new();
-    let mut previous_lba = None;
-    for patch in patches {
-        if let Some(previous_lba) = previous_lba {
-            ensure!(
-                patch.lba > previous_lba,
-                "patch LBAs must be strictly increasing"
-            );
-        }
-        previous_lba = Some(patch.lba);
-        let index = i64::from(patch.lba) - track_start_lba;
-        ensure!(index >= 0, "patch LBA {} is before track start", patch.lba);
-        let index = usize::try_from(index)?;
-        ensure!(
-            index < canonical.len() / RAW_SECTOR_SIZE,
-            "patch LBA {} is outside canonical image",
-            patch.lba
-        );
-        ensure!(
-            patched_indices.insert(index),
-            "duplicate patch LBA {}",
-            patch.lba
-        );
-    }
-    for index in 0..canonical.len() / RAW_SECTOR_SIZE {
-        if patched_indices.contains(&index) {
-            continue;
-        }
-        let start = index * RAW_SECTOR_SIZE;
-        let end = start + RAW_SECTOR_SIZE;
-        if canonical[start..end] != source[start..end] {
-            let relative = canonical[start..end]
-                .iter()
-                .zip(&source[start..end])
-                .position(|(canonical, source)| canonical != source)
-                .expect("different sectors have a differing byte");
-            anyhow::bail!(
-                "unexplained reconstruction difference at sector {index}, byte {relative}: canonical {:02x}, source {:02x}",
-                canonical[start + relative],
-                source[start + relative]
-            );
-        }
-    }
-    let mut restored = canonical.to_vec();
-    apply_sector_patches(&mut restored, start_frame, patches)?;
-    ensure!(
-        restored == source,
-        "registered raw-sector patches do not reproduce the complete source image"
-    );
-    ensure!(
-        sha1_hex(&restored) == sha1_hex(source),
-        "registered raw-sector patches do not reproduce the source SHA-1"
-    );
-    Ok(())
 }
 
 struct ExtractedSystemArea {
@@ -3312,10 +3173,7 @@ pub fn build(
         manifest_path,
         image_path,
         data_dir,
-        BuildOptions {
-            overwrite,
-            apply_patches: true,
-        },
+        BuildOptions { overwrite },
     )
 }
 
@@ -3331,6 +3189,12 @@ pub fn build_with_options(
     let yaml = fs::read_to_string(manifest_path)
         .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
     let manifest: Manifest = yaml_serde::from_str(&yaml).context("parsing manifest")?;
+    ensure!(
+        manifest.gcdgold.version == GCDGOLD_VERSION,
+        "manifest gcdgold version {} does not match this gcdgold version {}",
+        manifest.gcdgold.version,
+        GCDGOLD_VERSION
+    );
     validate_manifest_hashes(&manifest).context("validating manifest SHA-1 metadata")?;
     ensure!(
         matches!(manifest.track.mode, TrackMode::Mode1 | TrackMode::Mode2Xa),
@@ -3826,10 +3690,8 @@ pub fn build_with_options(
     apply_redump_0x55(&mut raw, start_frame, &manifest.track.redump_0x55)
         .context("applying structural Redump 0x55 runs")?;
 
-    if options.apply_patches {
-        apply_sector_patches(&mut raw, start_frame, &manifest.track.patches)
-            .context("applying raw-sector patches")?;
-    }
+    apply_sector_patches(&mut raw, start_frame, &manifest.track.patches)
+        .context("applying raw-sector patches")?;
 
     let sha1 = sha1_hex(&raw);
     if manifest
@@ -4637,22 +4499,24 @@ mod tests {
     use crate::manifest::{Entry, SectorPatch, format_sector_patch_hex};
 
     fn test_manifest() -> Manifest {
-        yaml_serde::from_str(
-            "track:\n\
+        yaml_serde::from_str(&format!(
+            "gcdgold:\n\
+             \x20 version: {GCDGOLD_VERSION}\n\
+             track:\n\
              \x20 mode: 2xa\n\
              system_area:\n\
              \x20 path: sample.system\n\
              \x20 form1_sectors: auto\n\
              iso9660:\n\
-             \x20 primary_volume: {}\n\
+             \x20 primary_volume: {{}}\n\
              \x20 entries:\n\
              \x20 - path: .\n\
              \x20   recording_time: 1998-03-19T11:58:36+09:00\n\
              \x20 - path: FILE.BIN\n\
              \x20   recording_time: 1998-03-19T11:58:36+09:00\n\
              \x20 layout:\n\
-             \x20 - path: FILE.BIN\n",
-        )
+             \x20 - path: FILE.BIN\n"
+        ))
         .unwrap()
     }
 
@@ -4917,28 +4781,6 @@ mod tests {
             let mut raw = canonical_patch_target()[..2 * RAW_SECTOR_SIZE].to_vec();
             assert!(apply_sector_patches(&mut raw, 75, &patches).is_err());
         }
-    }
-
-    #[test]
-    fn canonical_verification_rejects_length_and_unregistered_differences() {
-        let canonical = vec![0_u8; 2 * RAW_SECTOR_SIZE];
-        let mut source = canonical.clone();
-        source[RAW_SECTOR_SIZE + 9] = 0xa5;
-        let patch = SectorPatch {
-            lba: 1,
-            hex: format_sector_patch_hex(&source[RAW_SECTOR_SIZE..]),
-        };
-        verify_canonical_against_source(&canonical, &source, 150, &[patch]).unwrap();
-        assert!(verify_canonical_against_source(&canonical, &source, 150, &[]).is_err());
-        assert!(
-            verify_canonical_against_source(
-                &canonical,
-                &source[..source.len() - RAW_SECTOR_SIZE],
-                150,
-                &[]
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -6512,10 +6354,11 @@ mod tests {
     }
 
     #[test]
-    fn manifests_are_always_compact_but_include_track_mode() {
+    fn manifests_are_compact_and_include_required_version_and_track_mode() {
         let mut manifest = test_manifest();
         manifest.iso9660.entries[1].xa_system_use = Some(false);
         let compact = serialize_manifest(&manifest).unwrap();
+        assert!(compact.starts_with(&format!("gcdgold:\n  version: {GCDGOLD_VERSION}\n")));
         assert!(compact.contains("track:\n  mode: 2xa\n"));
         assert!(!compact.contains("sha1"));
         assert!(!compact.contains("source:"));
@@ -6528,6 +6371,23 @@ mod tests {
         assert!(compact.contains("  layout:\n"));
         assert!(!compact.contains("  files:\n"));
         assert!(yaml_serde::from_str::<Manifest>(&compact).is_ok());
+        let missing_gcdgold =
+            compact.replacen(&format!("gcdgold:\n  version: {GCDGOLD_VERSION}\n"), "", 1);
+        assert!(yaml_serde::from_str::<Manifest>(&missing_gcdgold).is_err());
+        let missing_version = compact.replacen(&format!("  version: {GCDGOLD_VERSION}\n"), "", 1);
+        assert!(yaml_serde::from_str::<Manifest>(&missing_version).is_err());
+        let numeric_version = compact.replacen(
+            &format!("  version: {GCDGOLD_VERSION}\n"),
+            "  version: 1\n",
+            1,
+        );
+        assert!(yaml_serde::from_str::<Manifest>(&numeric_version).is_err());
+        let unknown_metadata = compact.replacen(
+            &format!("  version: {GCDGOLD_VERSION}\n"),
+            &format!("  version: {GCDGOLD_VERSION}\n  schema: 1\n"),
+            1,
+        );
+        assert!(yaml_serde::from_str::<Manifest>(&unknown_metadata).is_err());
         let missing_track = compact.replacen("track:\n  mode: 2xa\n", "", 1);
         assert!(yaml_serde::from_str::<Manifest>(&missing_track).is_err());
 
@@ -6745,6 +6605,74 @@ mod tests {
         .unwrap();
         assert!(unchanged.sha1_mismatches.is_empty());
 
+        let mut warning_only_manifest = manifest.clone();
+        warning_only_manifest.system_area.sha1 = Some("0".repeat(40));
+        warning_only_manifest.iso9660.entries[1]
+            .xa
+            .as_mut()
+            .unwrap()
+            .form1_sha1 = Some("1".repeat(40));
+        let warning_only_manifest_path = project.path().join("warning-only.yaml");
+        fs::write(
+            &warning_only_manifest_path,
+            serialize_manifest(&warning_only_manifest).unwrap(),
+        )
+        .unwrap();
+        let warning_only = build(
+            &warning_only_manifest_path,
+            &project.path().join("warning-only.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert_eq!(warning_only.sha1_mismatches.len(), 2);
+        assert!(
+            warning_only
+                .sha1_mismatches
+                .iter()
+                .all(|mismatch| mismatch.target != Sha1Target::Track)
+        );
+
+        let mut no_track_hash_manifest = manifest.clone();
+        no_track_hash_manifest.track.sha1 = None;
+        let no_track_hash_manifest_path = project.path().join("no-track-hash.yaml");
+        fs::write(
+            &no_track_hash_manifest_path,
+            serialize_manifest(&no_track_hash_manifest).unwrap(),
+        )
+        .unwrap();
+        let no_track_hash = build(
+            &no_track_hash_manifest_path,
+            &project.path().join("no-track-hash.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(no_track_hash.sha1_mismatches.is_empty());
+
+        let mut wrong_track_hash_manifest = manifest.clone();
+        wrong_track_hash_manifest.track.sha1 = Some("f".repeat(40));
+        let wrong_track_hash_manifest_path = project.path().join("wrong-track-hash.yaml");
+        fs::write(
+            &wrong_track_hash_manifest_path,
+            serialize_manifest(&wrong_track_hash_manifest).unwrap(),
+        )
+        .unwrap();
+        let wrong_track_image = project.path().join("wrong-track-hash.bin");
+        let wrong_track_hash = build(
+            &wrong_track_hash_manifest_path,
+            &wrong_track_image,
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(wrong_track_image.is_file());
+        assert_eq!(wrong_track_hash.sha1_mismatches.len(), 1);
+        assert_eq!(
+            wrong_track_hash.sha1_mismatches[0].target,
+            Sha1Target::Track
+        );
+
         let mut form1 = assets.form1.clone();
         form1[8] ^= 1;
         fs::write(data_dir.join("FILE.XA1"), form1).unwrap();
@@ -6806,7 +6734,41 @@ mod tests {
     }
 
     #[test]
-    fn optional_extracted_hashes_warn_without_blocking_build() {
+    fn build_rejects_a_different_gcdgold_version_before_creating_the_image() {
+        let project = tempfile::tempdir().unwrap();
+        let _ = build_redump_integration_fixture(project.path());
+        let source_image = project.path().join("source.bin");
+        let data_dir = project.path().join("extracted");
+        let manifest_path = project.path().join("extracted.yaml");
+        extract_with_options(
+            &source_image,
+            &manifest_path,
+            &data_dir,
+            ExtractOptions { overwrite: false },
+        )
+        .unwrap();
+
+        let mut manifest: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.gcdgold.version, GCDGOLD_VERSION);
+        manifest.gcdgold.version = "different-version".to_owned();
+        fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
+
+        let image_path = project.path().join("mismatched.bin");
+        let error = build(&manifest_path, &image_path, &data_dir, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "manifest gcdgold version different-version does not match this gcdgold version {GCDGOLD_VERSION}"
+            )
+        );
+        assert!(!image_path.exists());
+    }
+
+    #[test]
+    fn extracted_hashes_are_always_emitted_and_warn_without_blocking_build() {
         let project = tempfile::tempdir().unwrap();
         let (raw, _) = build_redump_integration_fixture(project.path());
         let source_image = project.path().join("source.bin");
@@ -6816,24 +6778,21 @@ mod tests {
             &source_image,
             &plain_manifest_path,
             &project.path().join("plain-assets"),
-            ExtractOptions {
-                manifest_only: true,
-                overwrite: false,
-                include_hashes: false,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap();
         let plain: Manifest =
             yaml_serde::from_str(&fs::read_to_string(plain_manifest_path).unwrap()).unwrap();
-        assert!(plain.track.sha1.is_none());
-        assert!(plain.system_area.sha1.is_none());
+        assert_eq!(plain.gcdgold.version, GCDGOLD_VERSION);
+        assert_eq!(plain.track.sha1, Some(sha1_hex(&raw)));
+        assert!(plain.system_area.sha1.is_some());
         assert!(
             plain
                 .iso9660
                 .layout
                 .iter()
                 .filter_map(FileLayoutItem::as_path_source_with_sha1)
-                .all(|(_, _, sha1)| sha1.is_none())
+                .all(|(_, _, sha1)| sha1.is_some())
         );
 
         let data_dir = project.path().join("hashed-assets");
@@ -6842,24 +6801,14 @@ mod tests {
             &source_image,
             &manifest_path,
             &data_dir,
-            ExtractOptions {
-                manifest_only: false,
-                overwrite: false,
-                include_hashes: true,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap();
         let manifest: Manifest =
             yaml_serde::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
-        assert_eq!(
-            manifest.track.sha1.as_deref(),
-            Some(sha1_hex(&raw).as_str())
-        );
+        assert_eq!(manifest.track.sha1, Some(sha1_hex(&raw)));
         let system = fs::read(data_dir.join(&manifest.system_area.path)).unwrap();
-        assert_eq!(
-            manifest.system_area.sha1.as_deref(),
-            Some(sha1_hex(&system).as_str())
-        );
+        assert_eq!(manifest.system_area.sha1, Some(sha1_hex(&system)));
         let file_sha1 = manifest
             .iso9660
             .layout
@@ -6906,19 +6855,6 @@ mod tests {
         )
         .unwrap();
         assert!(patched.sha1_mismatches.is_empty());
-        let no_patches = build_with_options(
-            &patched_manifest_path,
-            &project.path().join("no-patches.bin"),
-            &data_dir,
-            BuildOptions {
-                overwrite: false,
-                apply_patches: false,
-            },
-        )
-        .unwrap();
-        assert_eq!(no_patches.sha1_mismatches.len(), 1);
-        assert_eq!(no_patches.sha1_mismatches[0].target, Sha1Target::Track);
-
         fs::write(data_dir.join(&manifest.system_area.path), [1]).unwrap();
         let mut file = fs::read(data_dir.join("FILE.BIN")).unwrap();
         file[0] ^= 0xff;
@@ -6957,11 +6893,7 @@ mod tests {
             &image_path,
             &manifest_path,
             &project.path().join("extracted"),
-            ExtractOptions {
-                manifest_only: true,
-                overwrite: false,
-                include_hashes: true,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap();
         assert!(report.recovery_warnings.is_empty());
@@ -6995,11 +6927,7 @@ mod tests {
             &image_path,
             &project.path().join("metadata-damaged.yaml"),
             &project.path().join("extracted"),
-            ExtractOptions {
-                manifest_only: true,
-                overwrite: false,
-                include_hashes: false,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap_err();
         assert!(
@@ -7215,11 +7143,7 @@ mod tests {
             &image_path,
             &first_manifest,
             &data_dir,
-            ExtractOptions {
-                manifest_only: false,
-                overwrite: false,
-                include_hashes: true,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap();
         let first: Manifest =
@@ -7255,11 +7179,7 @@ mod tests {
             &image_path,
             &second_manifest,
             &data_dir,
-            ExtractOptions {
-                manifest_only: false,
-                overwrite: false,
-                include_hashes: false,
-            },
+            ExtractOptions { overwrite: false },
         )
         .unwrap();
         let second: Manifest =
@@ -7276,44 +7196,12 @@ mod tests {
         };
         assert_eq!(file.source.as_deref(), Some("FILE.BIN.1"));
 
-        let manifest_only_path = project.path().join("third/shared.yaml");
-        extract_with_options(
-            &image_path,
-            &manifest_only_path,
-            &data_dir,
-            ExtractOptions {
-                manifest_only: true,
-                overwrite: false,
-                include_hashes: false,
-            },
-        )
-        .unwrap();
-        let manifest_only: Manifest =
-            yaml_serde::from_str(&fs::read_to_string(manifest_only_path).unwrap()).unwrap();
-        assert_eq!(manifest_only.system_area.path, "shared.system");
-        let FileLayoutItem::Path(file) = manifest_only
-            .iso9660
-            .layout
-            .iter()
-            .find(|item| item.as_path() == Some("FILE.BIN"))
-            .unwrap()
-        else {
-            panic!("expected ordinary file")
-        };
-        assert!(file.source.is_none());
-        assert!(!data_dir.join("shared.system.2").exists());
-        assert!(!data_dir.join("FILE.BIN.2").exists());
-
         let overwrite_manifest_path = project.path().join("fourth/shared.yaml");
         extract_with_options(
             &image_path,
             &overwrite_manifest_path,
             &data_dir,
-            ExtractOptions {
-                manifest_only: false,
-                overwrite: true,
-                include_hashes: false,
-            },
+            ExtractOptions { overwrite: true },
         )
         .unwrap();
         let overwritten: Manifest =

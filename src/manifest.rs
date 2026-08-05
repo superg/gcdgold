@@ -8,13 +8,53 @@ use crate::raw_cd::XaSubheader;
 
 pub const SYSTEM_AREA_SECTORS: usize = 16;
 pub const DEFAULT_XA_PERMISSIONS: u16 = 0x0555;
+pub(crate) const GCDGOLD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    pub gcdgold: GcdgoldMetadata,
     pub track: Track,
     pub system_area: SystemArea,
     pub iso9660: Iso9660,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcdgoldMetadata {
+    #[serde(deserialize_with = "deserialize_version_string")]
+    pub version: String,
+}
+
+fn deserialize_version_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct VersionStringVisitor;
+
+    impl Visitor<'_> for VersionStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a gcdgold version string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(VersionStringVisitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -22,6 +22,12 @@ fn format_sha1_warning(mismatch: &gcdgold::Sha1Mismatch) -> String {
     )
 }
 
+fn has_track_sha1_mismatch(mismatches: &[gcdgold::Sha1Mismatch]) -> bool {
+    mismatches
+        .iter()
+        .any(|mismatch| mismatch.target == gcdgold::Sha1Target::Track)
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Extract a CD-ROM data track into an editable project.
@@ -33,11 +39,7 @@ enum Command {
         #[arg(long, default_value = ".")]
         data_dir: PathBuf,
         #[arg(long)]
-        manifest_only: bool,
-        #[arg(long)]
         overwrite: bool,
-        #[arg(long)]
-        include_hashes: bool,
     },
     /// Author a CD-ROM data track from an editable project.
     Build {
@@ -49,8 +51,6 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         overwrite: bool,
-        #[arg(long)]
-        no_patches: bool,
     },
 }
 
@@ -60,20 +60,14 @@ fn main() -> Result<()> {
             image,
             manifest,
             data_dir,
-            manifest_only,
             overwrite,
-            include_hashes,
         } => {
             let manifest = manifest.unwrap_or_else(|| image.with_extension("yaml"));
             let report = gcdgold::extract_with_options(
                 &image,
                 &manifest,
                 &data_dir,
-                gcdgold::ExtractOptions {
-                    manifest_only,
-                    overwrite,
-                    include_hashes,
-                },
+                gcdgold::ExtractOptions { overwrite },
             )?;
             for warning in &report.recovery_warnings {
                 let ranges = warning
@@ -114,17 +108,13 @@ fn main() -> Result<()> {
             image,
             data_dir,
             overwrite,
-            no_patches,
         } => {
             let image = image.unwrap_or_else(|| manifest.with_extension("bin"));
             let report = gcdgold::build_with_options(
                 &manifest,
                 &image,
                 &data_dir,
-                gcdgold::BuildOptions {
-                    overwrite,
-                    apply_patches: !no_patches,
-                },
+                gcdgold::BuildOptions { overwrite },
             )?;
             for mismatch in &report.sha1_mismatches {
                 eprintln!("{}", format_sha1_warning(mismatch));
@@ -135,6 +125,9 @@ fn main() -> Result<()> {
                 report.sha1,
                 report.sha1_mismatches.len()
             );
+            if has_track_sha1_mismatch(&report.sha1_mismatches) {
+                anyhow::bail!("built track SHA-1 does not match manifest track.sha1");
+            }
         }
     }
     Ok(())
@@ -216,29 +209,34 @@ mod tests {
     }
 
     #[test]
-    fn include_hashes_flag_is_accepted_only_by_extract() {
-        let extract = Cli::try_parse_from([
-            "gcdgold",
-            "extract",
-            "--image",
-            "disc.bin",
-            "--include-hashes",
-        ])
-        .unwrap();
-        assert!(matches!(
-            extract.command,
-            Command::Extract {
-                include_hashes: true,
-                ..
-            }
-        ));
+    fn removed_hash_and_patch_switches_are_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "gcdgold",
+                "extract",
+                "--image",
+                "disc.bin",
+                "--manifest-only",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gcdgold",
+                "extract",
+                "--image",
+                "disc.bin",
+                "--include-hashes",
+            ])
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "gcdgold",
                 "build",
                 "--manifest",
                 "disc.yaml",
-                "--include-hashes",
+                "--no-patches",
             ])
             .is_err()
         );
@@ -260,25 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn no_patches_flag_is_accepted_only_by_build() {
-        let build = Cli::try_parse_from([
-            "gcdgold",
-            "build",
-            "--manifest",
-            "disc.yaml",
-            "--no-patches",
-        ])
-        .unwrap();
-        assert!(matches!(
-            build.command,
-            Command::Build {
-                no_patches: true,
-                ..
-            }
-        ));
-        assert!(
-            Cli::try_parse_from(["gcdgold", "extract", "--image", "disc.bin", "--no-patches",])
-                .is_err()
-        );
+    fn only_track_sha1_mismatches_change_cli_success() {
+        let asset = gcdgold::Sha1Mismatch {
+            target: gcdgold::Sha1Target::Asset {
+                path: "FILE.BIN".to_owned(),
+            },
+            expected: "1".repeat(40),
+            actual: "2".repeat(40),
+        };
+        assert!(!has_track_sha1_mismatch(&[]));
+        assert!(!has_track_sha1_mismatch(std::slice::from_ref(&asset)));
+
+        let track = gcdgold::Sha1Mismatch {
+            target: gcdgold::Sha1Target::Track,
+            expected: "1".repeat(40),
+            actual: "2".repeat(40),
+        };
+        assert!(has_track_sha1_mismatch(&[asset, track]));
     }
 }
