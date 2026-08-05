@@ -5388,6 +5388,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -5699,6 +5700,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -5717,6 +5719,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -5794,6 +5797,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -5814,6 +5818,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -5885,6 +5890,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6041,6 +6047,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6195,6 +6202,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6251,6 +6259,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6292,6 +6301,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6336,6 +6346,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -6517,17 +6528,20 @@ mod tests {
 
     #[test]
     fn compact_and_explicit_manifest_views_are_serialized_from_values() {
-        let manifest = test_manifest();
+        let mut manifest = test_manifest();
+        manifest.iso9660.entries[1].xa_system_use = Some(false);
         let compact = serialize_manifest(&manifest, false).unwrap();
         assert!(!compact.contains("track:"));
         assert!(!compact.contains("sha1"));
         assert!(!compact.contains("source:"));
         assert!(!compact.contains("metadata_subheader:"));
         assert!(!compact.contains("sector_subheader:"));
+        assert!(compact.contains("xa_system_use: false"));
 
         let explicit = serialize_manifest(&manifest, true).unwrap();
         assert!(!explicit.contains("sha1"));
         assert!(!explicit.contains("source:"));
+        assert!(explicit.contains("xa_system_use: false"));
         for expected in [
             "  mode: 2xa",
             "  start_msf: 00:02:00",

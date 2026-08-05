@@ -141,7 +141,6 @@ struct Iso9660WithDefaults<'a> {
     supplementary_volumes: &'a [JolietVolume],
     metadata_layout: &'a [MetadataLayoutItem],
     xa_system_use: bool,
-    xa_system_use_omissions: &'a [String],
     metadata_subheader: IsoMetadataSubheader,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata_framing_subheader: Option<XaSubheader>,
@@ -173,6 +172,8 @@ struct EntryWithDefaults<'a> {
     hidden: bool,
     associated: bool,
     unbacked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xa_system_use: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     directory_reference: Option<DirectoryReference>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,6 +278,7 @@ pub(crate) fn serialize_manifest(
                     hidden: entry.hidden,
                     associated: entry.associated,
                     unbacked: entry.unbacked,
+                    xa_system_use: entry.xa_system_use,
                     directory_reference: entry.directory_reference,
                     directory_slack: entry.directory_slack.as_ref(),
                     allocation_padding_hex: entry.allocation_padding_hex.as_deref(),
@@ -377,7 +379,6 @@ pub(crate) fn serialize_manifest(
                 supplementary_volumes: &manifest.iso9660.supplementary_volumes,
                 metadata_layout: &manifest.iso9660.metadata_layout,
                 xa_system_use: manifest.iso9660.xa_system_use,
-                xa_system_use_omissions: &manifest.iso9660.xa_system_use_omissions,
                 metadata_subheader: manifest.iso9660.metadata_subheader,
                 metadata_framing_subheader: manifest.iso9660.metadata_framing_subheader,
                 volume_terminator_subheader: manifest.iso9660.volume_terminator_subheader,
@@ -605,8 +606,6 @@ pub struct Iso9660 {
     pub metadata_layout: Vec<MetadataLayoutItem>,
     #[serde(default = "default_xa_system_use", skip_serializing_if = "is_true")]
     pub xa_system_use: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub xa_system_use_omissions: Vec<String>,
     #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
     pub metadata_subheader: IsoMetadataSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1228,6 +1227,8 @@ pub struct Entry {
     pub associated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub unbacked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xa_system_use: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_reference: Option<DirectoryReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -206,6 +206,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         hidden: root_record.flags & 1 != 0,
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
         unbacked: false,
+        xa_system_use: None,
         directory_reference: None,
         directory_slack: None,
         allocation_padding_hex: None,
@@ -218,7 +219,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
 
     let mut entries = vec![root];
     let mut files = Vec::new();
-    let mut xa_system_use_omissions = Vec::new();
     let mut directories = vec![ParsedDirectory {
         path: ROOT_PATH.to_owned(),
         extent: root_record.extent,
@@ -327,9 +327,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             }
             let record_uses_xa = xa_system_use && !record.system_use.is_empty();
             let xa = entry_xa(&record, is_dir, record_uses_xa)?;
-            if xa_system_use && !record_uses_xa {
-                xa_system_use_omissions.push(path.clone());
-            }
             let external_cdda = !is_dir && xa.as_ref().is_some_and(entry_xa_is_cdda);
             let directory_reference =
                 (is_dir && record.length == 0).then_some(DirectoryReference {
@@ -342,6 +339,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                 hidden: record.flags & 1 != 0,
                 associated: record.flags & ASSOCIATED_FLAG != 0,
                 unbacked: false,
+                xa_system_use: (xa_system_use && !record_uses_xa).then_some(false),
                 directory_reference,
                 directory_slack: None,
                 allocation_padding_hex: (!is_dir && !external_cdda)
@@ -482,7 +480,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         supplementary_volumes: Vec::new(),
         metadata_layout: Vec::new(),
         xa_system_use,
-        xa_system_use_omissions,
         metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
         metadata_framing_subheader: None,
         volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
@@ -2533,21 +2530,6 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         .union(&referenced_paths)
         .copied()
         .collect::<HashSet<_>>();
-    let mut xa_system_use_omissions = HashSet::new();
-    for path in &iso.xa_system_use_omissions {
-        ensure!(
-            iso.xa_system_use,
-            "xa_system_use_omissions requires xa_system_use"
-        );
-        ensure!(
-            xa_system_use_omissions.insert(path.as_str()),
-            "duplicate XA system-use omission {path}"
-        );
-        ensure!(
-            file_paths.contains(path.as_str()),
-            "XA system-use omission must name a file entry: {path}"
-        );
-    }
     let directory_paths: HashSet<_> = paths.difference(&file_paths).copied().collect();
     for (volume, path) in explicit_directories {
         let is_directory = match volume {
@@ -2734,6 +2716,16 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         );
         let is_file = file_paths.contains(entry.path.as_str());
         ensure!(
+            entry.xa_system_use != Some(true),
+            "entry xa_system_use supports only false: {}",
+            entry.path
+        );
+        ensure!(
+            entry.xa_system_use.is_none() || (iso.xa_system_use && is_file),
+            "entry xa_system_use: false requires global XA system use and a file entry: {}",
+            entry.path
+        );
+        ensure!(
             !unbacked || is_file,
             "unbacked is supported only for files: {}",
             entry.path
@@ -2770,7 +2762,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         serialize_directory_record_system_use(
             entry,
             !is_file,
-            iso.xa_system_use && !xa_system_use_omissions.contains(entry.path.as_str()),
+            entry_uses_xa_system_use(iso, entry),
         )?;
         ensure!(
             is_file
@@ -3021,6 +3013,10 @@ fn joliet_directory_order(entries: &[JolietEntry]) -> Result<Vec<(String, Vec<u8
     Ok(result)
 }
 
+fn entry_uses_xa_system_use(iso: &Iso9660, entry: &Entry) -> bool {
+    entry.xa_system_use.unwrap_or(iso.xa_system_use)
+}
+
 fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str>) -> Vec<usize> {
     let system_use_size = usize::from(iso.xa_system_use) * XA_SYSTEM_USE_SIZE;
     let mut lengths = vec![
@@ -3033,15 +3029,8 @@ fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str
         .filter(|entry| entry.path != ROOT_PATH && parent_path(&entry.path) == path)
     {
         let name = identifier(entry, file_paths.contains(entry.path.as_str()));
-        let entry_system_use_size = if iso
-            .xa_system_use_omissions
-            .iter()
-            .any(|path| path == &entry.path)
-        {
-            0
-        } else {
-            system_use_size
-        };
+        let entry_system_use_size =
+            usize::from(entry_uses_xa_system_use(iso, entry)) * XA_SYSTEM_USE_SIZE;
         lengths.push(record_size(name.len(), entry_system_use_size));
     }
     lengths
@@ -3652,11 +3641,7 @@ fn serialize_directory(
             identifier(entry, is_file).into_bytes(),
             !is_file,
             trailing_system_use_padding,
-            iso.xa_system_use
-                && !iso
-                    .xa_system_use_omissions
-                    .iter()
-                    .any(|path| path == &entry.path),
+            entry_uses_xa_system_use(iso, entry),
         )?);
     }
     let mut result = vec![0_u8; usize::try_from(directory.blocks)? * LOGICAL_BLOCK_SIZE];
@@ -4309,6 +4294,7 @@ mod tests {
             hidden: false,
             associated: false,
             unbacked: false,
+            xa_system_use: None,
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
@@ -4327,7 +4313,6 @@ mod tests {
             supplementary_volumes: Vec::new(),
             metadata_layout: Vec::new(),
             xa_system_use: true,
-            xa_system_use_omissions: Vec::new(),
             metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             metadata_framing_subheader: None,
             volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
@@ -5230,17 +5215,135 @@ mod tests {
             vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
             vec!["FILE.BIN"],
         );
-        iso.xa_system_use_omissions = vec![String::from("FILE.BIN")];
+        iso.entries[1].xa_system_use = Some(false);
         let lengths = HashMap::from([(String::from("FILE.BIN"), 1_u64)]);
 
         let authored = layout(&iso, &lengths).unwrap();
         let parsed = parse(&authored.blocks).unwrap();
 
-        assert_eq!(parsed.manifest.xa_system_use_omissions, vec!["FILE.BIN"]);
+        assert_eq!(parsed.manifest.entries[1].xa_system_use, Some(false));
         assert_eq!(
             layout(&parsed.manifest, &lengths).unwrap().blocks,
             authored.blocks
         );
+
+        let ordinary = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        let ordinary_lengths =
+            directory_record_lengths(ROOT_PATH, &ordinary, &HashSet::from(["FILE.BIN"]));
+        let omitted_lengths =
+            directory_record_lengths(ROOT_PATH, &iso, &HashSet::from(["FILE.BIN"]));
+        let ordinary_file_length = ordinary_lengths[2];
+        let omitted_file_length = omitted_lengths[2];
+        assert_eq!(
+            ordinary_file_length - omitted_file_length,
+            XA_SYSTEM_USE_SIZE
+        );
+        let prefix = LOGICAL_BLOCK_SIZE - omitted_file_length;
+        assert_eq!(
+            packed_blocks(&[prefix, omitted_file_length], DirectoryRecordPacking::Fill),
+            1
+        );
+        assert_eq!(
+            packed_blocks(
+                &[prefix, ordinary_file_length],
+                DirectoryRecordPacking::Fill
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn entry_xa_system_use_rejects_unsupported_placements_and_values() {
+        let mut explicit_true = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        explicit_true.entries[1].xa_system_use = Some(true);
+        assert!(
+            validate(&explicit_true)
+                .unwrap_err()
+                .to_string()
+                .contains("supports only false")
+        );
+
+        let mut directory = test_iso(vec![test_entry(ROOT_PATH), test_entry("DIR")], vec![]);
+        directory.entries[1].xa_system_use = Some(false);
+        assert!(
+            validate(&directory)
+                .unwrap_err()
+                .to_string()
+                .contains("requires global XA system use and a file entry")
+        );
+
+        let mut global_false = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        global_false.xa_system_use = false;
+        global_false.entries[1].xa_system_use = Some(false);
+        assert!(
+            validate(&global_false)
+                .unwrap_err()
+                .to_string()
+                .contains("requires global XA system use and a file entry")
+        );
+
+        let mut with_xa = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        with_xa.entries[1].xa_system_use = Some(false);
+        with_xa.entries[1].xa = Some(EntryXa {
+            file_number: 7,
+            ..EntryXa::default()
+        });
+        validate(&with_xa).unwrap();
+    }
+
+    #[test]
+    fn multiple_files_can_omit_xa_system_use_locally() {
+        let mut iso = test_iso(
+            vec![
+                test_entry(ROOT_PATH),
+                test_entry("FIRST.BIN"),
+                test_entry("SECOND.BIN"),
+            ],
+            vec!["FIRST.BIN", "SECOND.BIN"],
+        );
+        iso.entries[1].xa_system_use = Some(false);
+        iso.entries[2].xa_system_use = Some(false);
+        let lengths = HashMap::from([
+            (String::from("FIRST.BIN"), 1_u64),
+            (String::from("SECOND.BIN"), 1_u64),
+        ]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+        assert_eq!(parsed.manifest.entries[1].xa_system_use, Some(false));
+        assert_eq!(parsed.manifest.entries[2].xa_system_use, Some(false));
+        assert_eq!(
+            layout(&parsed.manifest, &lengths).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
+    fn legacy_xa_system_use_omissions_field_is_rejected() {
+        let iso = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        let yaml = format!(
+            "{}xa_system_use_omissions:\n- FILE.BIN\n",
+            yaml_serde::to_string(&iso).unwrap()
+        );
+        let error = yaml_serde::from_str::<Iso9660>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field") && error.contains("xa_system_use_omissions"));
     }
 
     #[test]
@@ -5852,6 +5955,7 @@ mod tests {
                     hidden: false,
                     associated: false,
                     unbacked: false,
+                    xa_system_use: None,
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
@@ -5894,6 +5998,7 @@ mod tests {
                     hidden: false,
                     associated: false,
                     unbacked: false,
+                    xa_system_use: None,
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
@@ -5935,6 +6040,7 @@ mod tests {
                     hidden: false,
                     associated: false,
                     unbacked: false,
+                    xa_system_use: None,
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
