@@ -5,10 +5,10 @@ use anyhow::{Context, Result, ensure};
 use crate::manifest::{
     DEFAULT_XA_PERMISSIONS, DirectoryLengthPolicy, DirectoryParentRecordingTime,
     DirectoryRecordPacking, DirectoryReference, DirectorySlack, Entry, EntrySectorSubheader,
-    EntryXa, FileLayoutItem, GapKind, IdentifierPolicy, Iso9660, JolietEntry, JolietLevel,
-    JolietVolume, MetadataLayoutItem, MetadataPathTable, MetadataVolume, PathTableCopies,
-    PathTableOrder, PrimaryVolume, PrimaryVolumeApplicationUse, PvdU16Encoding,
-    RootDirectoryIdentifier, VolumeTerminatorSubheader, XaAttributes, XaLengthEncoding,
+    EntryXa, FileLayoutItem, GapKind, Iso9660, JolietEntry, JolietLevel, JolietVolume,
+    MetadataLayoutItem, MetadataPathTable, MetadataVolume, PathTableCopies, PathTableOrder,
+    PrimaryVolume, PrimaryVolumeApplicationUse, PvdU16Encoding, RootDirectoryIdentifier,
+    VolumeTerminatorSubheader, XaAttributes, XaLengthEncoding,
 };
 use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader};
 
@@ -224,7 +224,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         extent: root_record.extent,
         length: root_record.length,
     }];
-    let mut identifier_policy = IdentifierPolicy::IsoLevel1;
     let mut directory_parent_recording_time = None;
     let mut queue = VecDeque::from([(String::new(), root_record.extent, root_record.length)]);
     let mut seen_dirs = HashSet::new();
@@ -323,7 +322,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                     valid_nonstandard_ascii_identifier(component),
                     "unsupported non-ASCII ISO identifier: {component}"
                 );
-                identifier_policy = IdentifierPolicy::NonstandardAscii;
             }
             let record_uses_xa = xa_system_use && !record.system_use.is_empty();
             let xa = entry_xa(&record, is_dir, record_uses_xa)?;
@@ -483,7 +481,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
         metadata_framing_subheader: None,
         volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
-        identifier_policy,
         directory_record_packing: if packing_observation.skipped_exact_fit {
             DirectoryRecordPacking::AvoidExactFit
         } else {
@@ -500,7 +497,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         path_table_subheader: EntrySectorSubheader::Canonical,
         path_table_framing_subheader: None,
         entries,
-        files: file_order,
+        layout: file_order,
     };
     let mut supplementary_directories = Vec::new();
     let mut supplementary_path_tables = None;
@@ -628,7 +625,7 @@ fn derive_metadata_layout(
                 "unsupported nonzero sectors between ISO metadata extents"
             );
             let sectors = object.start - cursor;
-            layout.push(MetadataLayoutItem::gap(sectors, GapKind::Xa));
+            layout.push(MetadataLayoutItem::gap(sectors));
             gaps.push(GapPlacement {
                 start: cursor,
                 sectors,
@@ -649,7 +646,7 @@ fn infer_directory_length_policy(
     joliet: &[ParsedDirectory],
 ) -> Result<DirectoryLengthPolicy> {
     let primary_files = iso
-        .files
+        .layout
         .iter()
         .filter_map(FileLayoutItem::as_path)
         .collect::<HashSet<_>>();
@@ -1542,7 +1539,20 @@ struct JolietLayout<'a> {
     path_table_size: u32,
 }
 
+#[cfg(test)]
 pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layout> {
+    layout_with_metadata_gap_kind(iso, file_lengths, GapKind::Xa)
+}
+
+pub(crate) fn layout_with_metadata_gap_kind(
+    iso: &Iso9660,
+    file_lengths: &HashMap<String, u64>,
+    metadata_gap_kind: GapKind,
+) -> Result<Layout> {
+    ensure!(
+        matches!(metadata_gap_kind, GapKind::Mode1 | GapKind::Xa),
+        "metadata gap kind must match a supported track mode"
+    );
     let file_paths = validate_entries(iso)?;
     let directories = directory_order(&iso.entries, &file_paths)?;
     let path_table_size: usize = directories
@@ -1755,7 +1765,7 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
                         start: next_extent,
                         sectors: item.gap,
                         form2_edc: None,
-                        kind: item.kind,
+                        kind: metadata_gap_kind,
                         subheader: None,
                     });
                     next_extent = next_extent
@@ -1777,7 +1787,7 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
         placed_directories[0] = true;
     }
     let explicit_directory_paths = iso
-        .files
+        .layout
         .iter()
         .filter_map(FileLayoutItem::as_directory_placement)
         .collect::<HashSet<_>>();
@@ -1808,7 +1818,7 @@ pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layo
     let mut gaps = path_table_padding_gaps;
     let mut pending_gaps = Vec::new();
     let mut trailing_gap = None;
-    for item in &iso.files {
+    for item in &iso.layout {
         if let Some((volume, path)) = item.as_directory_placement() {
             match volume {
                 MetadataVolume::Primary => {
@@ -2349,10 +2359,9 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                     metadata_directory_groups.insert(item.directories),
                     "duplicate metadata directory placement"
                 ),
-                MetadataLayoutItem::Gap(item) => ensure!(
-                    item.gap > 0 && matches!(item.kind, GapKind::Mode1 | GapKind::Xa),
-                    "Joliet metadata gaps must be nonempty Mode 1 or XA gaps"
-                ),
+                MetadataLayoutItem::Gap(item) => {
+                    ensure!(item.gap > 0, "Joliet metadata gaps must be nonempty")
+                }
             }
         }
         ensure!(
@@ -2427,13 +2436,13 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     let mut explicit_directories = HashSet::new();
     let mut xa_extent_asset_paths = HashSet::new();
     let mut previous_gap = None;
-    for (index, item) in iso.files.iter().enumerate() {
+    for (index, item) in iso.layout.iter().enumerate() {
         if let Some(path) = item.as_path() {
             ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
             ensure!(paths.contains(path), "unknown file entry {path}");
             ensure!(
                 !referenced_paths.contains(path),
-                "fixed-reference entry cannot appear in files: {path}"
+                "fixed-reference entry cannot appear in layout: {path}"
             );
             ensure!(
                 authored_file_paths.insert(path),
@@ -2503,8 +2512,8 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             );
             if matches!(kind, GapKind::Xa | GapKind::RawZero) {
                 ensure!(
-                    index + 1 == iso.files.len(),
-                    "XA and raw-zero gaps must end files list"
+                    index + 1 == iso.layout.len(),
+                    "XA and raw-zero gaps must end layout"
                 );
             }
             match kind {
@@ -2861,7 +2870,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             entry.path
         );
         if index != 0 {
-            validate_path(&entry.path, is_file, iso.identifier_policy)?;
+            validate_path(&entry.path, is_file)?;
             let parent = parent_path(&entry.path);
             ensure!(
                 directory_paths.contains(parent.as_str()),
@@ -2872,7 +2881,7 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     Ok(file_paths)
 }
 
-fn validate_path(path: &str, is_file: bool, identifier_policy: IdentifierPolicy) -> Result<()> {
+fn validate_path(path: &str, is_file: bool) -> Result<()> {
     ensure!(
         !path.is_empty() && !path.starts_with('/') && !path.ends_with('/'),
         "invalid relative ISO path"
@@ -2881,26 +2890,11 @@ fn validate_path(path: &str, is_file: bool, identifier_policy: IdentifierPolicy)
     for (index, part) in parts.iter().enumerate() {
         ensure!(*part != "." && *part != "..", "path traversal is forbidden");
         let file_component = is_file && index + 1 == parts.len();
-        match identifier_policy {
-            IdentifierPolicy::IsoLevel1 if file_component => {
-                let (stem, extension) = part.rsplit_once('.').unwrap_or((part, ""));
-                ensure!(
-                    !stem.is_empty() && stem.len() <= 8 && extension.len() <= 3,
-                    "file name is not ISO Level 1: {part}"
-                );
-                ensure!(
-                    valid_d_chars(stem) && valid_d_chars(extension),
-                    "invalid ISO file characters: {part}"
-                );
-            }
-            IdentifierPolicy::IsoLevel1 => ensure!(
-                part.len() <= 8 && valid_d_chars(part),
-                "directory name is not ISO Level 1: {part}"
-            ),
-            IdentifierPolicy::NonstandardAscii => ensure!(
+        if !identifier_is_iso_level1(part, file_component) {
+            ensure!(
                 valid_nonstandard_ascii_identifier(part),
                 "invalid nonstandard ASCII ISO identifier: {part}"
-            ),
+            );
         }
     }
     Ok(())
@@ -4316,7 +4310,6 @@ mod tests {
             metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             metadata_framing_subheader: None,
             volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
-            identifier_policy: IdentifierPolicy::IsoLevel1,
             directory_record_packing: DirectoryRecordPacking::Fill,
             directory_parent_recording_time: DirectoryParentRecordingTime::Parent,
             directory_length_policy: DirectoryLengthPolicy::Allocated,
@@ -4329,7 +4322,7 @@ mod tests {
             path_table_subheader: EntrySectorSubheader::Canonical,
             path_table_framing_subheader: None,
             entries,
-            files: files.into_iter().map(FileLayoutItem::path).collect(),
+            layout: files.into_iter().map(FileLayoutItem::path).collect(),
         }
     }
 
@@ -4662,7 +4655,7 @@ mod tests {
     fn explicit_volume_space_size_may_exceed_the_authored_data_track() {
         let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
         iso.primary_volume.volume_space_size = Some(294_418);
-        iso.files.push(FileLayoutItem::xa_gap(150));
+        iso.layout.push(FileLayoutItem::xa_gap(150));
         let lengths = HashMap::new();
 
         let authored = layout(&iso, &lengths).unwrap();
@@ -4690,7 +4683,7 @@ mod tests {
     fn explicit_volume_space_size_can_exclude_terminal_form2_gap() {
         let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
         iso.primary_volume.volume_space_size = Some(23);
-        iso.files.push(FileLayoutItem::gap(300));
+        iso.layout.push(FileLayoutItem::gap(300));
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
 
@@ -4892,10 +4885,33 @@ mod tests {
     }
 
     #[test]
+    fn metadata_gap_physical_kind_comes_from_the_track() {
+        let mut iso = test_joliet_iso();
+        iso.metadata_layout.insert(1, MetadataLayoutItem::gap(2));
+        let lengths = HashMap::from([("FILE.BIN".to_owned(), 17_u64)]);
+
+        let mode1 = layout_with_metadata_gap_kind(&iso, &lengths, GapKind::Mode1).unwrap();
+        assert!(
+            mode1
+                .gaps
+                .iter()
+                .any(|gap| gap.sectors == 2 && gap.kind == GapKind::Mode1)
+        );
+
+        let mode2_xa = layout(&iso, &lengths).unwrap();
+        assert!(
+            mode2_xa
+                .gaps
+                .iter()
+                .any(|gap| gap.sectors == 2 && gap.kind == GapKind::Xa)
+        );
+    }
+
+    #[test]
     fn joliet_directories_can_use_the_ordered_file_layout() {
         let mut iso = test_joliet_iso();
         iso.metadata_layout.truncate(4);
-        iso.files = vec![
+        iso.layout = vec![
             FileLayoutItem::directory(ROOT_PATH),
             FileLayoutItem::volume_directory(MetadataVolume::Joliet, ROOT_PATH),
             FileLayoutItem::path("FILE.BIN"),
@@ -4981,7 +4997,7 @@ mod tests {
         iso.entries[2].extent = Some(100);
         iso.entries[2].length = Some(17);
         iso.entries[2].unbacked = true;
-        iso.files.clear();
+        iso.layout.clear();
         let volume = &mut iso.supplementary_volumes[0];
         volume.entries.insert(
             1,
@@ -5459,15 +5475,18 @@ mod tests {
     }
 
     #[test]
-    fn level_one_names_are_validated() {
-        validate_path("DIR/FILE.BIN", true, IdentifierPolicy::IsoLevel1).unwrap();
-        assert!(validate_path("dir/file.bin", true, IdentifierPolicy::IsoLevel1).is_err());
-        assert!(validate_path("../FILE.BIN", true, IdentifierPolicy::IsoLevel1).is_err());
-        assert!(validate_path("TOO_LONG_NAME.BIN", true, IdentifierPolicy::IsoLevel1).is_err());
+    fn supported_ascii_names_are_inferred_without_a_policy() {
+        validate_path("DIR/FILE.BIN", true).unwrap();
+        validate_path("dir/file.bin", true).unwrap();
+        validate_path("TOO_LONG_NAME.BIN", true).unwrap();
+        validate_path("DIR.WITH.DOTS/ALPHA~5V.BAK", true).unwrap();
+        assert!(validate_path("../FILE.BIN", true).is_err());
+        assert!(validate_path("DIR/BAD\\NAME.BIN", true).is_err());
+        assert!(validate_path("DIR/CAFÉ.BIN", true).is_err());
     }
 
     #[test]
-    fn files_list_declares_kind_and_physical_order() {
+    fn layout_declares_kind_and_physical_order() {
         let root = test_entry(".");
         let file = test_entry("FILE.BIN");
         validate_entries(&test_iso(
@@ -5558,7 +5577,7 @@ mod tests {
             ],
             vec!["FILE.BIN"],
         );
-        iso.files.insert(0, FileLayoutItem::directory("EMPTY"));
+        iso.layout.insert(0, FileLayoutItem::directory("EMPTY"));
         let lengths = HashMap::from([("FILE.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64)]);
 
         let authored = layout(&iso, &lengths).unwrap();
@@ -5580,7 +5599,7 @@ mod tests {
             ],
             vec!["DD/A.BIN"],
         );
-        iso.files.push(FileLayoutItem::directory("DD"));
+        iso.layout.push(FileLayoutItem::directory("DD"));
         let lengths = HashMap::from([("DD/A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64)]);
 
         let authored = layout(&iso, &lengths).unwrap();
@@ -5612,7 +5631,7 @@ mod tests {
             gap_index: None,
             gap_index_sha1: None,
         };
-        iso.files
+        iso.layout
             .insert(1, FileLayoutItem::xa_extent(assets.clone()));
         let lengths = HashMap::from([
             ("A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
@@ -5646,7 +5665,7 @@ mod tests {
             ],
             vec!["A.BIN", "B.BIN"],
         );
-        iso.files.insert(1, FileLayoutItem::gap(3));
+        iso.layout.insert(1, FileLayoutItem::gap(3));
         let lengths = HashMap::from([
             ("A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
             ("B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
@@ -5667,7 +5686,7 @@ mod tests {
             ],
             vec!["A.BIN", "B.BIN"],
         );
-        iso.files.splice(
+        iso.layout.splice(
             1..1,
             [
                 FileLayoutItem::form1_gap(1, crate::raw_cd::XaSubheader::default()),
@@ -5701,7 +5720,7 @@ mod tests {
             file_number: 1,
             ..crate::raw_cd::XaSubheader::default()
         };
-        iso.files.splice(
+        iso.layout.splice(
             1..1,
             [
                 FileLayoutItem::form1_gap(1, crate::raw_cd::XaSubheader::default()),
@@ -5750,7 +5769,7 @@ mod tests {
             ],
         ] {
             let mut iso = base.clone();
-            iso.files = files;
+            iso.layout = files;
             assert!(validate(&iso).is_err());
         }
     }
@@ -5850,15 +5869,35 @@ mod tests {
     }
 
     #[test]
-    fn explicit_nonstandard_ascii_identifier_policy_accepts_tilde() {
-        let mut iso = test_iso(
+    fn nonstandard_ascii_identifier_round_trips_without_a_policy() {
+        let iso = test_iso(
             vec![test_entry(ROOT_PATH), test_entry("ALPHA~5V.BAK")],
             vec!["ALPHA~5V.BAK"],
         );
-        iso.identifier_policy = IdentifierPolicy::NonstandardAscii;
         let lengths = HashMap::from([("ALPHA~5V.BAK".to_owned(), 1)]);
 
-        layout(&iso, &lengths).unwrap();
+        let authored = layout(&iso, &lengths).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+        assert_eq!(
+            layout(&parsed.manifest, &lengths).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
+    fn removed_identifier_policy_field_is_rejected() {
+        let iso = test_iso(
+            vec![test_entry(ROOT_PATH), test_entry("FILE.BIN")],
+            vec!["FILE.BIN"],
+        );
+        let yaml = format!(
+            "{}identifier_policy: nonstandard_ascii\n",
+            yaml_serde::to_string(&iso).unwrap()
+        );
+        let error = yaml_serde::from_str::<Iso9660>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field") && error.contains("identifier_policy"));
     }
 
     #[test]
@@ -6135,7 +6174,7 @@ mod tests {
             layout(&iso, &HashMap::new()).unwrap_err().to_string(),
             "fixed XA reference is not backed by a physical XA extent: FIRST.XA"
         );
-        iso.files
+        iso.layout
             .push(FileLayoutItem::xa_extent(crate::manifest::XaExtentAssets {
                 form1: "stream.XA1".to_owned(),
                 form1_sha1: None,

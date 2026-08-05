@@ -11,8 +11,8 @@ use sha1::{Digest, Sha1};
 use crate::iso9660;
 use crate::manifest::{
     DirectorySlack, EntrySectorSubheader, FileLayoutItem, Form1Sectors, GapKind,
-    IsoMetadataSubheader, Manifest, MetadataLayoutItem, MetadataVolume, Redump0x55Run,
-    SYSTEM_AREA_SECTORS, SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    IsoMetadataSubheader, Manifest, MetadataVolume, Redump0x55Run, SYSTEM_AREA_SECTORS,
+    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
     SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
     XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
@@ -108,7 +108,6 @@ impl Default for BuildOptions {
 pub struct ExtractOptions {
     pub manifest_only: bool,
     pub overwrite: bool,
-    pub include_defaults: bool,
     pub include_hashes: bool,
 }
 
@@ -2039,7 +2038,6 @@ pub fn extract(
         ExtractOptions {
             manifest_only,
             overwrite,
-            include_defaults: false,
             include_hashes: false,
         },
     )
@@ -2161,12 +2159,6 @@ pub fn extract_with_options(
         detach_overlapping_form2_xa_files(&sectors[..content_end], &mut parsed_iso)?;
         prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
-    } else {
-        for item in &mut parsed_iso.manifest.metadata_layout {
-            if let MetadataLayoutItem::Gap(gap) = item {
-                gap.kind = GapKind::Mode1;
-            }
-        }
     }
     let detected_layout = detect_file_layout(
         &sectors[..content_end],
@@ -2185,9 +2177,9 @@ pub fn extract_with_options(
             &redump_ranges,
         )?;
     }
-    parsed_iso.manifest.files = detected_layout.items;
+    parsed_iso.manifest.layout = detected_layout.items;
     if trailing_gap > 0 {
-        parsed_iso.manifest.files.push(match track_mode {
+        parsed_iso.manifest.layout.push(match track_mode {
             TrackMode::Mode1 => FileLayoutItem::mode1_gap(u32::try_from(trailing_gap)?),
             TrackMode::Mode2Xa => FileLayoutItem::xa_gap(u32::try_from(trailing_gap)?),
             TrackMode::Mode2 => unreachable!("raw parser does not accept non-XA Mode 2"),
@@ -2196,7 +2188,7 @@ pub fn extract_with_options(
     if trailing_raw_zero > 0 {
         parsed_iso
             .manifest
-            .files
+            .layout
             .push(FileLayoutItem::raw_zero_gap(u32::try_from(
                 trailing_raw_zero,
             )?));
@@ -2313,7 +2305,7 @@ pub fn extract_with_options(
     if !options.manifest_only {
         let authored_file_paths: HashSet<_> = manifest
             .iso9660
-            .files
+            .layout
             .iter()
             .filter_map(FileLayoutItem::as_path)
             .collect();
@@ -2374,7 +2366,7 @@ pub fn extract_with_options(
     } else {
         create_output_parent(manifest_path, "manifest output")?;
     }
-    let yaml = serialize_manifest(&manifest, options.include_defaults)?;
+    let yaml = serialize_manifest(&manifest)?;
     fs::write(manifest_path, yaml)
         .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
     Ok(ExtractReport {
@@ -2402,7 +2394,7 @@ fn verify_extracted_project(
         fs::write(&output, bytes)?;
     }
     let manifest_path = temporary.path().join("disc.yaml");
-    fs::write(&manifest_path, serialize_manifest(manifest, false)?)?;
+    fs::write(&manifest_path, serialize_manifest(manifest)?)?;
     let image_path = temporary.path().join("canonical.bin");
     build_with_options(
         &manifest_path,
@@ -2692,21 +2684,11 @@ fn validate_track_structure(
     system_sector_layout: &[SystemAreaSectorKind],
 ) -> Result<()> {
     validate_redump_0x55_runs(&manifest.track.redump_0x55, &manifest.track.patches)?;
-    let file_gap_kinds = manifest
+    let mut file_gap_kinds = manifest
         .iso9660
-        .files
+        .layout
         .iter()
         .filter_map(FileLayoutItem::gap_kind);
-    let metadata_gap_kinds =
-        manifest
-            .iso9660
-            .metadata_layout
-            .iter()
-            .filter_map(|item| match item {
-                MetadataLayoutItem::Gap(gap) => Some(gap.kind),
-                MetadataLayoutItem::PathTable(_) | MetadataLayoutItem::Directories(_) => None,
-            });
-
     match manifest.track.mode {
         TrackMode::Mode1 => {
             ensure!(
@@ -2755,23 +2737,19 @@ fn validate_track_structure(
             ensure!(
                 manifest
                     .iso9660
-                    .files
+                    .layout
                     .iter()
                     .all(|item| item.as_xa_extent().is_none()),
                 "unreferenced XA extents are not applicable to Mode 1 tracks"
             );
             ensure!(
-                file_gap_kinds
-                    .chain(metadata_gap_kinds)
-                    .all(|kind| matches!(kind, GapKind::Mode1 | GapKind::RawZero)),
+                file_gap_kinds.all(|kind| matches!(kind, GapKind::Mode1 | GapKind::RawZero)),
                 "Mode 1 tracks may contain only Mode 1 or terminal raw-zero gaps"
             );
         }
         TrackMode::Mode2Xa => {
             ensure!(
-                file_gap_kinds
-                    .chain(metadata_gap_kinds)
-                    .all(|kind| kind != GapKind::Mode1),
+                file_gap_kinds.all(|kind| kind != GapKind::Mode1),
                 "Mode 1 gaps require a Mode 1 track"
             );
         }
@@ -3396,7 +3374,7 @@ pub fn build_with_options(
     let mut secondary_paths = HashSet::new();
     for (file, source, ordinary_sha1) in manifest
         .iso9660
-        .files
+        .layout
         .iter()
         .filter_map(FileLayoutItem::as_path_source_with_sha1)
     {
@@ -3495,7 +3473,7 @@ pub fn build_with_options(
     }
     for assets in manifest
         .iso9660
-        .files
+        .layout
         .iter()
         .filter_map(FileLayoutItem::as_xa_extent)
     {
@@ -3573,7 +3551,15 @@ pub fn build_with_options(
             assets.index
         );
     }
-    let mut layout = iso9660::layout(&manifest.iso9660, &file_lengths)?;
+    let metadata_gap_kind = match manifest.track.mode {
+        TrackMode::Mode1 => GapKind::Mode1,
+        TrackMode::Mode2 | TrackMode::Mode2Xa => GapKind::Xa,
+    };
+    let mut layout = iso9660::layout_with_metadata_gap_kind(
+        &manifest.iso9660,
+        &file_lengths,
+        metadata_gap_kind,
+    )?;
     for placement in &layout.files {
         if mixed_extents.contains_key(&placement.path) {
             continue;
@@ -3928,7 +3914,7 @@ fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<HashMap<_, _>>();
     let mut paths = vec![manifest.system_area.path.clone()];
-    for item in &manifest.iso9660.files {
+    for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
                 let entry = entries_by_path
@@ -4157,8 +4143,8 @@ fn plan_extraction_outputs(
     )?;
     manifest.system_area.path = system_path;
 
-    for item_index in 0..manifest.iso9660.files.len() {
-        let snapshot = manifest.iso9660.files[item_index].clone();
+    for item_index in 0..manifest.iso9660.layout.len() {
+        let snapshot = manifest.iso9660.layout[item_index].clone();
         match snapshot {
             FileLayoutItem::Path(file) => {
                 let entry_index = manifest
@@ -4203,14 +4189,16 @@ fn plan_extraction_outputs(
                         &mut selected,
                         &mut writes,
                     )?;
-                    let FileLayoutItem::Path(item) = &mut manifest.iso9660.files[item_index] else {
+                    let FileLayoutItem::Path(item) = &mut manifest.iso9660.layout[item_index]
+                    else {
                         unreachable!("snapshot preserves file layout kind")
                     };
                     item.source = (resolved != item.path).then_some(resolved);
                 }
             }
             FileLayoutItem::XaExtent(_) => {
-                let FileLayoutItem::XaExtent(item) = &mut manifest.iso9660.files[item_index] else {
+                let FileLayoutItem::XaExtent(item) = &mut manifest.iso9660.layout[item_index]
+                else {
                     unreachable!("snapshot preserves file layout kind")
                 };
                 let xa = &mut item.xa_extent;
@@ -4405,7 +4393,7 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<HashMap<_, _>>();
-    for item in &manifest.iso9660.files {
+    for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
                 validate_optional_sha1(file.sha1.as_deref(), &format!("asset {} sha1", file.path))?;
@@ -4501,7 +4489,7 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
         Ok(())
     };
     register(&manifest.system_area.path, "system area")?;
-    for item in &manifest.iso9660.files {
+    for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
                 let entry = entries_by_path
@@ -4597,7 +4585,7 @@ fn add_extracted_hashes(
         .map(|entry| entry.path.clone())
         .collect::<HashSet<_>>();
     let mut hashed_paths = HashSet::new();
-    for item in &mut manifest.iso9660.files {
+    for item in &mut manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) if !indexed_paths.contains(&file.path) => {
                 let path = file.source.as_deref().unwrap_or(&file.path);
@@ -4649,7 +4637,9 @@ mod tests {
 
     fn test_manifest() -> Manifest {
         yaml_serde::from_str(
-            "system_area:\n\
+            "track:\n\
+             \x20 mode: 2xa\n\
+             system_area:\n\
              \x20 path: sample.system\n\
              \x20 form1_sectors: auto\n\
              iso9660:\n\
@@ -4659,7 +4649,7 @@ mod tests {
              \x20   recording_time: 1998-03-19T11:58:36+09:00\n\
              \x20 - path: FILE.BIN\n\
              \x20   recording_time: 1998-03-19T11:58:36+09:00\n\
-             \x20 files:\n\
+             \x20 layout:\n\
              \x20 - path: FILE.BIN\n",
         )
         .unwrap()
@@ -4669,13 +4659,13 @@ mod tests {
     fn mode1_track_accepts_only_mode1_physical_framing() {
         let mut manifest = test_manifest();
         manifest.track.mode = TrackMode::Mode1;
-        manifest.iso9660.files.push(FileLayoutItem::mode1_gap(150));
+        manifest.iso9660.layout.push(FileLayoutItem::mode1_gap(150));
         let system_layout = vec![SystemAreaSectorKind::Form1; SYSTEM_AREA_SECTORS];
 
         validate_track_structure(&manifest, &system_layout).unwrap();
 
-        manifest.iso9660.files.pop();
-        manifest.iso9660.files.push(FileLayoutItem::gap(150));
+        manifest.iso9660.layout.pop();
+        manifest.iso9660.layout.push(FileLayoutItem::gap(150));
         assert_eq!(
             validate_track_structure(&manifest, &system_layout)
                 .unwrap_err()
@@ -5587,7 +5577,7 @@ mod tests {
         let sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER]);
         let mut parsed = parsed_iso();
         parsed.files.clear();
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         parsed.manifest.entries.truncate(1);
         let mut reference = parsed.manifest.entries[0].clone();
         reference.path = "OLD".to_owned();
@@ -5845,7 +5835,7 @@ mod tests {
         assert!(parsed.manifest.entries[3].unbacked);
         assert!(parsed.manifest.entries[1].allocation_padding_hex.is_none());
 
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         assert!(iso9660::layout(&parsed.manifest, &HashMap::new()).is_ok());
     }
 
@@ -5874,7 +5864,7 @@ mod tests {
         assert!(xa.form1.is_none());
         assert!(xa.form2.is_none());
         assert!(xa.index.is_none());
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         iso9660::layout(&parsed.manifest, &HashMap::new()).unwrap();
     }
 
@@ -6105,7 +6095,7 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.files.clear();
         parsed.manifest.entries.truncate(1);
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
@@ -6147,7 +6137,7 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
         parsed.manifest.entries.truncate(1);
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         parsed.files.clear();
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
@@ -6163,7 +6153,7 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.manifest.metadata_framing_subheader = Some(custom);
         parsed.manifest.entries.truncate(1);
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         parsed.files.clear();
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
@@ -6178,7 +6168,7 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.manifest.primary_volume_copies = 3;
         parsed.manifest.entries.truncate(1);
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         parsed.files.clear();
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
@@ -6463,7 +6453,7 @@ mod tests {
         sectors[21] = parsed_xa_gap_sector();
         let mut parsed = parsed_iso();
         parsed.manifest.entries.truncate(1);
-        parsed.manifest.files.clear();
+        parsed.manifest.layout.clear();
         parsed.manifest.path_table_copies = crate::manifest::PathTableCopies::Single;
         parsed.manifest.path_table_padding = 1;
         parsed.files.clear();
@@ -6527,50 +6517,47 @@ mod tests {
     }
 
     #[test]
-    fn compact_and_explicit_manifest_views_are_serialized_from_values() {
+    fn manifests_are_always_compact_but_include_track_mode() {
         let mut manifest = test_manifest();
         manifest.iso9660.entries[1].xa_system_use = Some(false);
-        let compact = serialize_manifest(&manifest, false).unwrap();
-        assert!(!compact.contains("track:"));
+        let compact = serialize_manifest(&manifest).unwrap();
+        assert!(compact.contains("track:\n  mode: 2xa\n"));
         assert!(!compact.contains("sha1"));
         assert!(!compact.contains("source:"));
+        assert!(!compact.contains("start_msf:"));
+        assert!(!compact.contains("form2_edc:"));
+        assert!(!compact.contains("noncompliant_trailing_ecc:"));
         assert!(!compact.contains("metadata_subheader:"));
         assert!(!compact.contains("sector_subheader:"));
         assert!(compact.contains("xa_system_use: false"));
-
-        let explicit = serialize_manifest(&manifest, true).unwrap();
-        assert!(!explicit.contains("sha1"));
-        assert!(!explicit.contains("source:"));
-        assert!(explicit.contains("xa_system_use: false"));
-        for expected in [
-            "  mode: 2xa",
-            "  start_msf: 00:02:00",
-            "  form2_edc: true",
-            "  noncompliant_trailing_ecc: false",
-            "  metadata_subheader: canonical",
-            "    hidden: false",
-            "    sector_subheader: canonical",
-            "      permissions: 1365",
-        ] {
-            assert!(explicit.lines().any(|line| line == expected));
-        }
-        assert!(yaml_serde::from_str::<Manifest>(&explicit).is_ok());
+        assert!(compact.contains("  layout:\n"));
+        assert!(!compact.contains("  files:\n"));
+        assert!(yaml_serde::from_str::<Manifest>(&compact).is_ok());
+        let missing_track = compact.replacen("track:\n  mode: 2xa\n", "", 1);
+        assert!(yaml_serde::from_str::<Manifest>(&missing_track).is_err());
 
         let mut sourced = manifest;
-        let FileLayoutItem::Path(file) = &mut sourced.iso9660.files[0] else {
+        let FileLayoutItem::Path(file) = &mut sourced.iso9660.layout[0] else {
             panic!("expected ordinary file")
         };
         file.source = Some("FILE.BIN.1".to_owned());
         assert!(
-            serialize_manifest(&sourced, false)
+            serialize_manifest(&sourced)
                 .unwrap()
                 .contains("source: FILE.BIN.1")
         );
-        assert!(
-            serialize_manifest(&sourced, true)
-                .unwrap()
-                .contains("source: FILE.BIN.1")
-        );
+    }
+
+    #[test]
+    fn removed_files_layout_key_is_rejected() {
+        let yaml = serialize_manifest(&test_manifest()).unwrap();
+        let legacy = yaml.replacen("  layout:\n", "  files:\n", 1);
+        let error = yaml_serde::from_str::<Manifest>(&legacy)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("files"));
     }
 
     #[test]
@@ -6579,7 +6566,7 @@ mod tests {
         let mut manifest = test_manifest();
         manifest.track.sha1 = Some(uppercase.to_owned());
         manifest.system_area.sha1 = Some(uppercase.to_owned());
-        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
             file.sha1 = Some(uppercase.to_owned());
         }
         validate_manifest_hashes(&manifest).unwrap();
@@ -6598,13 +6585,13 @@ mod tests {
             "indexed XA file FILE.BIN cannot declare an ordinary-file sha1"
         );
 
-        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
             file.sha1 = None;
         }
         manifest.iso9660.entries[1].xa = None;
         manifest
             .iso9660
-            .files
+            .layout
             .push(FileLayoutItem::xa_extent(XaExtentAssets {
                 form1: "EXTRA.XA1".to_owned(),
                 form1_sha1: None,
@@ -6626,7 +6613,7 @@ mod tests {
         manifest.iso9660.entries.push(ordinary);
         manifest
             .iso9660
-            .files
+            .layout
             .push(FileLayoutItem::path("ORDINARY.BIN"));
         manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
             form1: Some("FILE.BIN.XA1".to_owned()),
@@ -6637,7 +6624,7 @@ mod tests {
         });
         manifest
             .iso9660
-            .files
+            .layout
             .push(FileLayoutItem::xa_extent(XaExtentAssets {
                 form1: "EXTRA.XA1".to_owned(),
                 form1_sha1: None,
@@ -6680,13 +6667,13 @@ mod tests {
         assert!(xa.form2_sha1.is_some());
         assert!(xa.index_sha1.is_some());
         assert!(xa.gap_index_sha1.is_some());
-        if let FileLayoutItem::Path(file) = &manifest.iso9660.files[1] {
+        if let FileLayoutItem::Path(file) = &manifest.iso9660.layout[1] {
             let expected = sha1_hex(&[1]);
             assert_eq!(file.sha1.as_deref(), Some(expected.as_str()));
         } else {
             panic!("ordinary asset is not a path item");
         }
-        if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.files[2] {
+        if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.layout[2] {
             assert!(item.xa_extent.form1_sha1.is_some());
             assert!(item.xa_extent.form2_sha1.is_some());
             assert!(item.xa_extent.index_sha1.is_some());
@@ -6694,10 +6681,10 @@ mod tests {
         } else {
             panic!("unreferenced asset is not an XA extent");
         }
-        let explicit = serialize_manifest(&manifest, true).unwrap();
-        assert!(explicit.contains(&format!("sha1: {track_sha1}")));
-        assert!(explicit.contains("form1_sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));
-        let reparsed: Manifest = yaml_serde::from_str(&explicit).unwrap();
+        let yaml = serialize_manifest(&manifest).unwrap();
+        assert!(yaml.contains(&format!("sha1: {track_sha1}")));
+        assert!(yaml.contains("form1_sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+        let reparsed: Manifest = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(reparsed.track.sha1, manifest.track.sha1);
     }
 
@@ -6745,11 +6732,7 @@ mod tests {
             ..crate::manifest::EntryXa::default()
         });
         let manifest_path = project.path().join("disc.yaml");
-        fs::write(
-            &manifest_path,
-            serialize_manifest(&manifest, false).unwrap(),
-        )
-        .unwrap();
+        fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
         let unchanged = build(
             &manifest_path,
             &project.path().join("unchanged.bin"),
@@ -6802,14 +6785,10 @@ mod tests {
         )
         .unwrap();
         let mut manifest = test_manifest();
-        manifest.iso9660.files.insert(0, FileLayoutItem::gap(3));
-        manifest.iso9660.files.push(FileLayoutItem::xa_gap(4));
+        manifest.iso9660.layout.insert(0, FileLayoutItem::gap(3));
+        manifest.iso9660.layout.push(FileLayoutItem::xa_gap(4));
         let manifest_path = project.join("source.yaml");
-        fs::write(
-            &manifest_path,
-            serialize_manifest(&manifest, false).unwrap(),
-        )
-        .unwrap();
+        fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
         let image_path = project.join("source.bin");
         build(&manifest_path, &image_path, &data_dir, false).unwrap();
         let raw = fs::read(image_path).unwrap();
@@ -6837,7 +6816,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: true,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: false,
             },
         )
@@ -6849,7 +6827,7 @@ mod tests {
         assert!(
             plain
                 .iso9660
-                .files
+                .layout
                 .iter()
                 .filter_map(FileLayoutItem::as_path_source_with_sha1)
                 .all(|(_, _, sha1)| sha1.is_none())
@@ -6864,7 +6842,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: false,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: true,
             },
         )
@@ -6882,7 +6859,7 @@ mod tests {
         );
         let file_sha1 = manifest
             .iso9660
-            .files
+            .layout
             .iter()
             .filter_map(FileLayoutItem::as_path_source_with_sha1)
             .find(|(path, _, _)| *path == "FILE.BIN")
@@ -6915,7 +6892,7 @@ mod tests {
         let patched_manifest_path = project.path().join("patched.yaml");
         fs::write(
             &patched_manifest_path,
-            serialize_manifest(&patched_manifest, false).unwrap(),
+            serialize_manifest(&patched_manifest).unwrap(),
         )
         .unwrap();
         let patched = build(
@@ -6980,7 +6957,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: true,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: true,
             },
         )
@@ -7019,7 +6995,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: true,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: false,
             },
         )
@@ -7172,7 +7147,7 @@ mod tests {
         });
         manifest
             .iso9660
-            .files
+            .layout
             .push(FileLayoutItem::xa_extent(XaExtentAssets {
                 form1: "EXTRA.XA1".to_owned(),
                 form1_sha1: None,
@@ -7207,7 +7182,7 @@ mod tests {
         assert_eq!(xa.gap_index.as_deref(), Some("FILE.XAG.1"));
         let extra = manifest
             .iso9660
-            .files
+            .layout
             .last()
             .unwrap()
             .as_xa_extent()
@@ -7240,7 +7215,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: false,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: true,
             },
         )
@@ -7250,7 +7224,7 @@ mod tests {
         assert_eq!(first.system_area.path, "shared.system.1");
         let FileLayoutItem::Path(file) = first
             .iso9660
-            .files
+            .layout
             .iter()
             .find(|item| item.as_path() == Some("FILE.BIN"))
             .unwrap()
@@ -7281,7 +7255,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: false,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: false,
             },
         )
@@ -7291,7 +7264,7 @@ mod tests {
         assert_eq!(second.system_area.path, "shared.system.1");
         let FileLayoutItem::Path(file) = second
             .iso9660
-            .files
+            .layout
             .iter()
             .find(|item| item.as_path() == Some("FILE.BIN"))
             .unwrap()
@@ -7308,7 +7281,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: true,
                 overwrite: false,
-                include_defaults: false,
                 include_hashes: false,
             },
         )
@@ -7318,7 +7290,7 @@ mod tests {
         assert_eq!(manifest_only.system_area.path, "shared.system");
         let FileLayoutItem::Path(file) = manifest_only
             .iso9660
-            .files
+            .layout
             .iter()
             .find(|item| item.as_path() == Some("FILE.BIN"))
             .unwrap()
@@ -7337,7 +7309,6 @@ mod tests {
             ExtractOptions {
                 manifest_only: false,
                 overwrite: true,
-                include_defaults: false,
                 include_hashes: false,
             },
         )
@@ -7347,7 +7318,7 @@ mod tests {
         assert_eq!(overwritten.system_area.path, "shared.system");
         let FileLayoutItem::Path(file) = overwritten
             .iso9660
-            .files
+            .layout
             .iter()
             .find(|item| item.as_path() == Some("FILE.BIN"))
             .unwrap()
@@ -7383,19 +7354,19 @@ mod tests {
             index: Some("FILE.XAI".to_owned()),
             ..crate::manifest::EntryXa::default()
         });
-        let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] else {
+        let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] else {
             panic!("expected path item")
         };
         file.source = Some("OTHER.BIN".to_owned());
         assert!(validate_manifest_hashes(&manifest).is_err());
 
         manifest.iso9660.entries[1].xa = None;
-        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
             file.source = Some("../escape".to_owned());
         }
         assert!(validate_manifest_asset_paths(&manifest).is_err());
 
-        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
             file.source = Some("sample.system".to_owned());
         }
         assert!(validate_manifest_asset_paths(&manifest).is_err());

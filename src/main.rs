@@ -37,8 +37,6 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
         #[arg(long)]
-        include_defaults: bool,
-        #[arg(long)]
         include_hashes: bool,
     },
     /// Build a raw MODE2/2352 image from an editable project.
@@ -64,7 +62,6 @@ fn main() -> Result<()> {
             data_dir,
             manifest_only,
             overwrite,
-            include_defaults,
             include_hashes,
         } => {
             let manifest = manifest.unwrap_or_else(|| image.with_extension("yaml"));
@@ -75,7 +72,6 @@ fn main() -> Result<()> {
                 gcdgold::ExtractOptions {
                     manifest_only,
                     overwrite,
-                    include_defaults,
                     include_hashes,
                 },
             )?;
@@ -174,22 +170,17 @@ mod tests {
     }
 
     #[test]
-    fn include_defaults_flag_is_accepted_only_by_extract() {
-        let extract = Cli::try_parse_from([
-            "gcdgold",
-            "extract",
-            "--image",
-            "disc.bin",
-            "--include-defaults",
-        ])
-        .unwrap();
-        assert!(matches!(
-            extract.command,
-            Command::Extract {
-                include_defaults: true,
-                ..
-            }
-        ));
+    fn removed_include_defaults_flag_is_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "gcdgold",
+                "extract",
+                "--image",
+                "disc.bin",
+                "--include-defaults",
+            ])
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "gcdgold",
