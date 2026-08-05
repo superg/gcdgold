@@ -2285,7 +2285,7 @@ pub fn extract_with_options(
         data_dir,
         options.overwrite,
     )?;
-    add_extracted_hashes(&mut manifest, &image, &system_bytes, &extracted_files)?;
+    add_extracted_hashes(&mut manifest, &source_sha1, &system_bytes, &extracted_files)?;
     let authored_file_paths: HashSet<_> = manifest
         .iso9660
         .layout
@@ -4434,11 +4434,11 @@ fn set_extracted_asset_sha1(
 
 fn add_extracted_hashes(
     manifest: &mut Manifest,
-    source: &[u8],
+    source_sha1: &str,
     system: &[u8],
     assets: &HashMap<String, Vec<u8>>,
 ) -> Result<()> {
-    manifest.track.sha1 = Some(sha1_hex(source));
+    manifest.track.sha1 = Some(source_sha1.to_owned());
     manifest.system_area.sha1 = Some(sha1_hex(system));
     let indexed_paths = manifest
         .iso9660
@@ -6513,9 +6513,9 @@ mod tests {
         .map(|(path, bytes)| (path.to_owned(), bytes))
         .collect::<HashMap<_, _>>();
 
-        add_extracted_hashes(&mut manifest, b"track", b"system", &assets).unwrap();
-
         let track_sha1 = sha1_hex(b"track");
+        add_extracted_hashes(&mut manifest, &track_sha1, b"system", &assets).unwrap();
+
         let system_sha1 = sha1_hex(b"system");
         assert_eq!(manifest.track.sha1.as_deref(), Some(track_sha1.as_str()));
         assert_eq!(
