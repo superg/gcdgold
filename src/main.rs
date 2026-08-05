@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Extract and author raw CD-ROM XA data tracks")]
+#[command(version, about = "Extract and author CD-ROM data tracks")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -24,7 +24,7 @@ fn format_sha1_warning(mismatch: &gcdgold::Sha1Mismatch) -> String {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Extract a raw MODE2/2352 image into an editable project.
+    /// Extract a CD-ROM data track into an editable project.
     Extract {
         #[arg(long)]
         image: PathBuf,
@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         include_hashes: bool,
     },
-    /// Build a raw MODE2/2352 image from an editable project.
+    /// Author a CD-ROM data track from an editable project.
     Build {
         #[arg(long)]
         manifest: PathBuf,
@@ -143,6 +143,28 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_text_is_format_neutral() {
+        let mut command = Cli::command();
+        let top_level = command.render_long_help().to_string();
+        assert!(top_level.contains("Extract and author CD-ROM data tracks"));
+        assert!(top_level.contains("Extract a CD-ROM data track into an editable project"));
+        assert!(top_level.contains("Author a CD-ROM data track from an editable project"));
+        for narrow_term in ["MODE1", "MODE2", "/2352", "CD-ROM XA"] {
+            assert!(!top_level.contains(narrow_term));
+        }
+
+        for name in ["extract", "build"] {
+            let mut command = Cli::command();
+            let subcommand = command.find_subcommand_mut(name).unwrap();
+            let help = subcommand.render_long_help().to_string();
+            for narrow_term in ["MODE1", "MODE2", "/2352", "CD-ROM XA"] {
+                assert!(!help.contains(narrow_term));
+            }
+        }
+    }
 
     #[test]
     fn overwrite_flag_is_accepted_by_both_commands() {

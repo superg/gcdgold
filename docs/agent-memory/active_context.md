@@ -2,6 +2,8 @@
 
 Milestone 1 is implemented as a Rust 2024 library and CLI. `gcdgold extract` reads canonical raw `MODE1/2352` and `MODE2/2352` BINs directly into an unversioned YAML manifest, a compact `.system` asset, ordinary ISO 9660 payload files, and, for Mode 2 XA, explicit indexed assets for mixed Form 1/Form 2 extents. `gcdgold build` regenerates ISO layout, raw sector framing, MSF, EDC, and ECC. A project extracted and rebuilt without edits must reproduce its source BIN byte-for-byte.
 
+User-facing CLI help is intentionally format-neutral: gcdgold extracts and authors CD-ROM data tracks. Help descriptions must not advertise the current raw mode, sector size, XA subset, or BIN implementation as the permanent product boundary.
+
 Repository testing convention: do not write tests for anything under `scripts/`. Product behavior remains covered by Rust library and CLI tests outside that directory.
 
 The project is in active development. Do not preserve backward compatibility for schema, CLI, or behavior changes unless the user explicitly requests compatibility for that change; remove superseded interfaces and reject their old forms.
