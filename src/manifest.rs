@@ -294,10 +294,8 @@ pub struct Iso9660 {
     pub metadata_layout: Vec<MetadataLayoutItem>,
     #[serde(default = "default_xa_system_use", skip_serializing_if = "is_true")]
     pub xa_system_use: bool,
-    #[serde(default, skip_serializing_if = "IsoMetadataSubheader::is_default")]
-    pub metadata_subheader: IsoMetadataSubheader,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata_framing_subheader: Option<XaSubheader>,
+    #[serde(default, skip_serializing_if = "MetadataSubheader::is_default")]
+    pub metadata_subheader: MetadataSubheader,
     #[serde(default, skip_serializing_if = "VolumeTerminatorSubheader::is_default")]
     pub volume_terminator_subheader: VolumeTerminatorSubheader,
     #[serde(default, skip_serializing_if = "DirectoryRecordPacking::is_default")]
@@ -321,10 +319,8 @@ pub struct Iso9660 {
     pub path_table_copies: PathTableCopies,
     #[serde(default, skip_serializing_if = "PathTableOrder::is_default")]
     pub path_table_order: PathTableOrder,
-    #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
-    pub path_table_subheader: EntrySectorSubheader,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_table_framing_subheader: Option<XaSubheader>,
+    #[serde(default, skip_serializing_if = "PathTableSubheader::is_default")]
+    pub path_table_subheader: PathTableSubheader,
     pub entries: Vec<Entry>,
     pub layout: Vec<FileLayoutItem>,
 }
@@ -559,9 +555,41 @@ impl VolumeTerminatorSubheader {
     }
 }
 
-impl IsoMetadataSubheader {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MetadataSubheader {
+    Named(IsoMetadataSubheader),
+    Explicit(XaSubheader),
+}
+
+impl Default for MetadataSubheader {
+    fn default() -> Self {
+        Self::Named(IsoMetadataSubheader::Canonical)
+    }
+}
+
+impl MetadataSubheader {
     const fn is_default(&self) -> bool {
-        matches!(self, Self::Canonical)
+        matches!(self, Self::Named(IsoMetadataSubheader::Canonical))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PathTableSubheader {
+    Named(EntrySectorSubheader),
+    Explicit(XaSubheader),
+}
+
+impl Default for PathTableSubheader {
+    fn default() -> Self {
+        Self::Named(EntrySectorSubheader::Canonical)
+    }
+}
+
+impl PathTableSubheader {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Named(EntrySectorSubheader::Canonical))
     }
 }
 
@@ -895,12 +923,10 @@ pub struct Entry {
     pub hidden: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub associated: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unbacked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<EntryReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xa_system_use: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directory_reference: Option<DirectoryReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_slack: Option<DirectorySlack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -911,17 +937,23 @@ pub struct Entry {
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xa: Option<EntryXa>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extent: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub length: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DirectoryReference {
+pub struct EntryReference {
+    pub kind: EntryReferenceKind,
     pub extent: u32,
     pub length: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryReferenceKind {
+    Layout,
+    RecordOnly,
+    External,
+    Directory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1630,5 +1662,46 @@ mod tests {
                 "unexpectedly accepted {yaml:?}"
             );
         }
+    }
+
+    #[test]
+    fn entry_references_are_explicit_and_removed_fields_are_rejected() {
+        for (kind, extent, length) in [
+            ("layout", 48_050, 362_496),
+            ("record_only", 0, 61_922_688),
+            ("external", 30_692, 0),
+            ("directory", 0, 0),
+        ] {
+            let yaml = format!(
+                "path: FILE.XA\nrecording_time: 1998-01-01T00:00:00+00:00\nreference:\n  kind: {kind}\n  extent: {extent}\n  length: {length}\n"
+            );
+            let entry: Entry = yaml_serde::from_str(&yaml).unwrap();
+            assert_eq!(yaml_serde::to_string(&entry).unwrap(), yaml);
+        }
+
+        for removed in [
+            "extent: 1\nlength: 2\n",
+            "directory_reference:\n  extent: 0\n  length: 0\n",
+            "unbacked: true\n",
+        ] {
+            let yaml =
+                format!("path: FILE.XA\nrecording_time: 1998-01-01T00:00:00+00:00\n{removed}");
+            assert!(yaml_serde::from_str::<Entry>(&yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_and_path_table_subheaders_use_scalar_or_map_values() {
+        let named: MetadataSubheader = yaml_serde::from_str("end_of_file_data\n").unwrap();
+        assert_eq!(
+            named,
+            MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData)
+        );
+        let explicit_yaml = "file_number: 1\nsubmode:\n- data\n";
+        let explicit: MetadataSubheader = yaml_serde::from_str(explicit_yaml).unwrap();
+        assert_eq!(yaml_serde::to_string(&explicit).unwrap(), explicit_yaml);
+
+        let path: PathTableSubheader = yaml_serde::from_str(explicit_yaml).unwrap();
+        assert_eq!(yaml_serde::to_string(&path).unwrap(), explicit_yaml);
     }
 }

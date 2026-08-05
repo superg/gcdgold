@@ -10,11 +10,12 @@ use sha1::{Digest, Sha1};
 
 use crate::iso9660;
 use crate::manifest::{
-    DirectorySlack, EntrySectorSubheader, FileLayoutItem, Form1Sectors, GapKind,
-    IsoMetadataSubheader, Manifest, MetadataVolume, Redump0x55Run, SYSTEM_AREA_SECTORS,
-    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
-    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
-    XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
+    DirectorySlack, EntryReference, EntryReferenceKind, EntrySectorSubheader, FileLayoutItem,
+    Form1Sectors, GapKind, IsoMetadataSubheader, Manifest, MetadataSubheader, MetadataVolume,
+    PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS, SectorPatch, SystemArea,
+    SystemAreaFinalSubheader, SystemAreaForm1Framing, SystemAreaSectorKind, SystemAreaSectorRun,
+    Track, TrackMode, VolumeTerminatorSubheader, XaAttributeFlag, XaExtentAssets, XaLengthEncoding,
+    decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorWriter, XaSubheader,
@@ -1349,10 +1350,12 @@ fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 
-fn mark_entry_unbacked(entry: &mut crate::manifest::Entry, extent: u32, length: u32) {
-    entry.extent = Some(extent);
-    entry.length = Some(length);
-    entry.unbacked = true;
+fn mark_entry_record_only(entry: &mut crate::manifest::Entry, extent: u32, length: u32) {
+    entry.reference = Some(EntryReference {
+        kind: EntryReferenceKind::RecordOnly,
+        extent,
+        length,
+    });
     entry.allocation_padding_hex = None;
     if let Some(xa) = &mut entry.xa {
         xa.form1 = None;
@@ -1365,7 +1368,10 @@ fn mark_entry_unbacked(entry: &mut crate::manifest::Entry, extent: u32, length: 
     }
 }
 
-fn detach_unbacked_files(sector_count: usize, parsed_iso: &mut iso9660::ParsedIso) -> Result<()> {
+fn detach_record_only_files(
+    sector_count: usize,
+    parsed_iso: &mut iso9660::ParsedIso,
+) -> Result<()> {
     let entry_indices = parsed_iso
         .manifest
         .entries
@@ -1382,11 +1388,11 @@ fn detach_unbacked_files(sector_count: usize, parsed_iso: &mut iso9660::ParsedIs
         }
         let entry = &mut parsed_iso.manifest.entries[entry_indices[file.path.as_str()]];
         ensure!(
-            entry.extent.is_none() && entry.length.is_none() && !entry.unbacked,
-            "unbacked entry already has a fixed reference: {}",
+            entry.reference.is_none(),
+            "record-only entry already has a reference: {}",
             file.path
         );
-        mark_entry_unbacked(entry, file.extent, file.length);
+        mark_entry_record_only(entry, file.extent, file.length);
         detached_paths.insert(file.path.clone());
     }
     parsed_iso
@@ -1433,11 +1439,11 @@ fn detach_remaining_overlapping_files(parsed_iso: &mut iso9660::ParsedIso) -> Re
             .find(|entry| entry.path == file.path)
             .context("overlapping file has no manifest entry")?;
         ensure!(
-            entry.extent.is_none() && entry.length.is_none() && !entry.unbacked,
-            "overlapping entry already has a fixed reference: {}",
+            entry.reference.is_none(),
+            "overlapping entry already has a reference: {}",
             file.path
         );
-        mark_entry_unbacked(entry, file.extent, file.length);
+        mark_entry_record_only(entry, file.extent, file.length);
     }
     parsed_iso
         .files
@@ -1445,11 +1451,11 @@ fn detach_remaining_overlapping_files(parsed_iso: &mut iso9660::ParsedIso) -> Re
     Ok(())
 }
 
-fn detach_overlapping_form2_xa_files(
+fn detach_overlapping_xa_files(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
 ) -> Result<()> {
-    detach_unbacked_files(sectors.len(), parsed_iso)?;
+    detach_record_only_files(sectors.len(), parsed_iso)?;
     let mut ordered = (0..parsed_iso.files.len()).collect::<Vec<_>>();
     ordered.sort_by_key(|index| parsed_iso.files[*index].extent);
     let mut components = Vec::new();
@@ -1524,14 +1530,11 @@ fn detach_overlapping_form2_xa_files(
                 .iter()
                 .any(|directory| ranges_overlap(range, directory))
         });
-        let physical_range_is_form2 = end <= sectors.len()
+        let physical_range_is_xa = end <= sectors.len()
             && sectors[start..end]
                 .iter()
-                .all(|sector| sector.kind == Kind::Form2);
-        if start < root_end
-            || overlaps_directory
-            || !entries_are_form2_xa
-            || !physical_range_is_form2
+                .all(|sector| matches!(sector.kind, Kind::Form1 | Kind::Form2 | Kind::XaGap));
+        if start < root_end || overlaps_directory || !entries_are_form2_xa || !physical_range_is_xa
         {
             continue;
         }
@@ -1539,12 +1542,15 @@ fn detach_overlapping_form2_xa_files(
             let file = &parsed_iso.files[index];
             let entry = &mut parsed_iso.manifest.entries[entry_indices[file.path.as_str()]];
             ensure!(
-                entry.extent.is_none() && entry.length.is_none(),
-                "overlapping XA entry already has a fixed reference: {}",
+                entry.reference.is_none(),
+                "overlapping XA entry already has a reference: {}",
                 file.path
             );
-            entry.extent = Some(file.extent);
-            entry.length = Some(file.length);
+            entry.reference = Some(EntryReference {
+                kind: EntryReferenceKind::Layout,
+                extent: file.extent,
+                length: file.length,
+            });
             entry.allocation_padding_hex = None;
             detached_paths.insert(file.path.clone());
         }
@@ -1671,15 +1677,15 @@ fn detect_metadata_subheader(
     if sectors[16].subheader == FORM1_DATA_SUBHEADER
         && sectors[16].subheader_copy == FORM1_DATA_SUBHEADER
     {
-        manifest.metadata_subheader = IsoMetadataSubheader::Data;
+        manifest.metadata_subheader = MetadataSubheader::Named(IsoMetadataSubheader::Data);
     } else if sectors[16].subheader == SYSTEM_END_OF_FILE_SUBHEADER
         && sectors[16].subheader_copy == SYSTEM_END_OF_FILE_SUBHEADER
     {
-        manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
+        manifest.metadata_subheader = MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData);
     } else if sectors[16].subheader == ISO_METADATA_SUBHEADER
         && sectors[16].subheader_copy == ISO_METADATA_SUBHEADER
     {
-        manifest.metadata_subheader = IsoMetadataSubheader::IsoMetadata;
+        manifest.metadata_subheader = MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata);
     } else if sectors[16].subheader == PVD_SUBHEADER && sectors[16].subheader_copy == PVD_SUBHEADER
     {
         let terminator_uses_pvd_framing =
@@ -1694,7 +1700,7 @@ fn detect_metadata_subheader(
         }
     } else if sectors[16].kind == Kind::Form1 && sectors[16].subheader == sectors[16].subheader_copy
     {
-        manifest.metadata_framing_subheader = Some(sectors[16].subheader);
+        manifest.metadata_subheader = MetadataSubheader::Explicit(sectors[16].subheader);
     }
 }
 
@@ -2156,7 +2162,7 @@ pub fn extract_with_options(
         );
         detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_mode2_2336_file_lengths(content_end, &mut parsed_iso)?;
-        detach_overlapping_form2_xa_files(&sectors[..content_end], &mut parsed_iso)?;
+        detach_overlapping_xa_files(&sectors[..content_end], &mut parsed_iso)?;
         prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
     }
@@ -2313,7 +2319,11 @@ pub fn extract_with_options(
             .iso9660
             .entries
             .iter()
-            .filter(|entry| entry.extent.is_some())
+            .filter(|entry| {
+                entry
+                    .reference
+                    .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory)
+            })
             .map(|entry| entry.path.as_str())
             .collect();
         for entry in manifest
@@ -2711,12 +2721,12 @@ fn validate_track_structure(
                 "XA system-area framing is not applicable to Mode 1 tracks"
             );
             ensure!(
-                manifest.iso9660.metadata_subheader == IsoMetadataSubheader::Canonical
-                    && manifest.iso9660.metadata_framing_subheader.is_none()
+                manifest.iso9660.metadata_subheader
+                    == MetadataSubheader::Named(IsoMetadataSubheader::Canonical)
                     && manifest.iso9660.volume_terminator_subheader
                         == VolumeTerminatorSubheader::Metadata
-                    && manifest.iso9660.path_table_subheader == EntrySectorSubheader::Canonical
-                    && manifest.iso9660.path_table_framing_subheader.is_none(),
+                    && manifest.iso9660.path_table_subheader
+                        == PathTableSubheader::Named(EntrySectorSubheader::Canonical),
                 "XA metadata framing is not applicable to Mode 1 tracks"
             );
             ensure!(
@@ -2758,11 +2768,11 @@ fn validate_track_structure(
     Ok(())
 }
 
-fn path_table_subheader(
-    policy: EntrySectorSubheader,
-    block_index: u32,
-    blocks: u32,
-) -> XaSubheader {
+fn path_table_subheader(setting: PathTableSubheader, block_index: u32, blocks: u32) -> XaSubheader {
+    let policy = match setting {
+        PathTableSubheader::Named(policy) => policy,
+        PathTableSubheader::Explicit(subheader) => return subheader,
+    };
     match policy {
         EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => {
             ISO_METADATA_SUBHEADER
@@ -2772,6 +2782,30 @@ fn path_table_subheader(
         EntrySectorSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
         EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => FORM1_DATA_SUBHEADER,
         EntrySectorSubheader::DataUntilFinal => ISO_METADATA_SUBHEADER,
+    }
+}
+
+fn descriptor_metadata_subheader(setting: MetadataSubheader) -> XaSubheader {
+    match setting {
+        MetadataSubheader::Explicit(subheader) => subheader,
+        MetadataSubheader::Named(IsoMetadataSubheader::Canonical) => PVD_SUBHEADER,
+        MetadataSubheader::Named(IsoMetadataSubheader::Data) => FORM1_DATA_SUBHEADER,
+        MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData) => {
+            SYSTEM_END_OF_FILE_SUBHEADER
+        }
+        MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata) => ISO_METADATA_SUBHEADER,
+    }
+}
+
+fn ordinary_metadata_subheader(setting: MetadataSubheader) -> XaSubheader {
+    match setting {
+        MetadataSubheader::Explicit(subheader) => subheader,
+        MetadataSubheader::Named(IsoMetadataSubheader::Canonical)
+        | MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata) => ISO_METADATA_SUBHEADER,
+        MetadataSubheader::Named(IsoMetadataSubheader::Data) => FORM1_DATA_SUBHEADER,
+        MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData) => {
+            SYSTEM_END_OF_FILE_SUBHEADER
+        }
     }
 }
 
@@ -2804,12 +2838,16 @@ fn detect_path_table_subheader(
                     let Some(sector) = sectors.get(lba) else {
                         return false;
                     };
-                    let expected = path_table_subheader(policy, block_index, path_tables.blocks);
+                    let expected = path_table_subheader(
+                        PathTableSubheader::Named(policy),
+                        block_index,
+                        path_tables.blocks,
+                    );
                     sector.subheader == expected && sector.subheader_copy == expected
                 })
             });
         if matches {
-            parsed_iso.manifest.path_table_subheader = policy;
+            parsed_iso.manifest.path_table_subheader = PathTableSubheader::Named(policy);
             return Ok(());
         }
     }
@@ -2841,8 +2879,8 @@ fn detect_path_table_subheader(
             })
         });
     if matches_custom {
-        parsed_iso.manifest.path_table_subheader = EntrySectorSubheader::Data;
-        parsed_iso.manifest.path_table_framing_subheader = custom;
+        parsed_iso.manifest.path_table_subheader =
+            PathTableSubheader::Explicit(custom.expect("custom path-table match has a sector"));
         return Ok(());
     }
     anyhow::bail!("path-table sectors use an unsupported XA subheader policy")
@@ -3088,21 +3126,14 @@ fn validate_iso_subheaders_with_xa_extents(
                 let lba = usize::try_from(extent + block_index)?;
                 ensure!(
                     path_table_sector_info
-                        .insert(lba, {
-                            let subheader = path_table_subheader(
+                        .insert(
+                            lba,
+                            path_table_subheader(
                                 parsed_iso.manifest.path_table_subheader,
                                 block_index,
                                 path_tables.blocks,
-                            );
-                            if subheader == FORM1_DATA_SUBHEADER {
-                                parsed_iso
-                                    .manifest
-                                    .path_table_framing_subheader
-                                    .unwrap_or(subheader)
-                            } else {
-                                subheader
-                            }
-                        },)
+                            ),
+                        )
                         .is_none(),
                     "overlapping path-table extents at LBA {lba}"
                 );
@@ -3198,14 +3229,7 @@ fn validate_iso_subheaders_with_xa_extents(
         let volume_descriptor = primary_descriptor || supplementary_descriptor;
         let volume_terminator = sector.payload().starts_with(b"\xffCD001\x01");
         let expected = if volume_descriptor {
-            parsed_iso.manifest.metadata_framing_subheader.unwrap_or(
-                match parsed_iso.manifest.metadata_subheader {
-                    IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
-                    IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
-                    IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
-                    IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
-                },
-            )
+            descriptor_metadata_subheader(parsed_iso.manifest.metadata_subheader)
         } else if volume_terminator
             && parsed_iso.manifest.volume_terminator_subheader == VolumeTerminatorSubheader::Pvd
         {
@@ -3237,15 +3261,7 @@ fn validate_iso_subheaders_with_xa_extents(
         } else if let Some(subheader) = path_table_sector_info.get(&lba) {
             *subheader
         } else {
-            parsed_iso.manifest.metadata_framing_subheader.unwrap_or(
-                match parsed_iso.manifest.metadata_subheader {
-                    IsoMetadataSubheader::Canonical | IsoMetadataSubheader::IsoMetadata => {
-                        ISO_METADATA_SUBHEADER
-                    }
-                    IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
-                    IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
-                },
-            )
+            ordinary_metadata_subheader(parsed_iso.manifest.metadata_subheader)
         };
         if sector.kind == Kind::Form2
             && sector.subheader == FORM2_SUBHEADER
@@ -3747,14 +3763,7 @@ pub fn build_with_options(
         let mut subheader = if let Some(subheader) = framing_subheader {
             subheader
         } else if volume_descriptor {
-            manifest.iso9660.metadata_framing_subheader.unwrap_or(
-                match manifest.iso9660.metadata_subheader {
-                    IsoMetadataSubheader::Canonical => PVD_SUBHEADER,
-                    IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
-                    IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
-                    IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
-                },
-            )
+            descriptor_metadata_subheader(manifest.iso9660.metadata_subheader)
         } else if volume_terminator
             && manifest.iso9660.volume_terminator_subheader == VolumeTerminatorSubheader::Pvd
         {
@@ -3764,10 +3773,10 @@ pub fn build_with_options(
         } else if layout.end_of_file_data_subheader_sectors.contains(&lba) {
             SYSTEM_END_OF_FILE_SUBHEADER
         } else if layout.metadata_subheader_sectors.contains(&lba) {
-            manifest
-                .iso9660
-                .metadata_framing_subheader
-                .unwrap_or(ISO_METADATA_SUBHEADER)
+            match manifest.iso9660.metadata_subheader {
+                MetadataSubheader::Explicit(subheader) => subheader,
+                MetadataSubheader::Named(_) => ISO_METADATA_SUBHEADER,
+            }
         } else if let Some((_, _, is_last)) = file_sector_info.get(&lba) {
             if *is_last {
                 ISO_METADATA_SUBHEADER
@@ -3775,15 +3784,7 @@ pub fn build_with_options(
                 FORM1_DATA_SUBHEADER
             }
         } else {
-            manifest.iso9660.metadata_framing_subheader.unwrap_or(
-                match manifest.iso9660.metadata_subheader {
-                    IsoMetadataSubheader::Canonical | IsoMetadataSubheader::IsoMetadata => {
-                        ISO_METADATA_SUBHEADER
-                    }
-                    IsoMetadataSubheader::Data => FORM1_DATA_SUBHEADER,
-                    IsoMetadataSubheader::EndOfFileData => SYSTEM_END_OF_FILE_SUBHEADER,
-                },
-            )
+            ordinary_metadata_subheader(manifest.iso9660.metadata_subheader)
         };
         if framing_subheader.is_none()
             && let Some(file_number) = layout.sector_file_numbers.get(&lba)
@@ -4664,6 +4665,10 @@ mod tests {
 
         validate_track_structure(&manifest, &system_layout).unwrap();
 
+        manifest.iso9660.metadata_subheader = MetadataSubheader::Explicit(XaSubheader::default());
+        assert!(validate_track_structure(&manifest, &system_layout).is_err());
+        manifest.iso9660.metadata_subheader = MetadataSubheader::default();
+
         manifest.iso9660.layout.pop();
         manifest.iso9660.layout.push(FileLayoutItem::gap(150));
         assert_eq!(
@@ -5377,16 +5382,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "NEXT.BIN".to_owned(),
@@ -5400,7 +5402,7 @@ mod tests {
         });
 
         detect_mode2_2336_file_lengths(sectors.len(), &mut parsed).unwrap();
-        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+        detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
         prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
@@ -5581,7 +5583,8 @@ mod tests {
         parsed.manifest.entries.truncate(1);
         let mut reference = parsed.manifest.entries[0].clone();
         reference.path = "OLD".to_owned();
-        reference.directory_reference = Some(crate::manifest::DirectoryReference {
+        reference.reference = Some(EntryReference {
+            kind: EntryReferenceKind::Directory,
             extent: 0,
             length: 0,
         });
@@ -5675,104 +5678,106 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_form2_xa_files_become_fixed_references_to_one_physical_extent() {
-        let sectors = (0..6)
-            .map(|marker| parsed_xa_sector(true, marker))
-            .collect::<Vec<_>>();
-        let mut parsed = parsed_iso();
-        parsed.manifest.entries[1].xa = Some(crate::manifest::EntryXa {
-            attributes: Some(crate::manifest::XaAttributes::INTERLEAVED),
-            ..crate::manifest::EntryXa::default()
-        });
-        parsed.manifest.entries.push(Entry {
-            path: "B.XA".to_owned(),
-            recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
-            hidden: false,
-            associated: false,
-            unbacked: false,
-            xa_system_use: None,
-            directory_reference: None,
-            directory_slack: None,
-            allocation_padding_hex: None,
-            directory_self_xa: None,
-            sector_subheader: EntrySectorSubheader::Canonical,
-            xa: Some(crate::manifest::EntryXa {
+    fn overlapping_xa_files_become_layout_references_for_form2_and_mixed_unions() {
+        for mixed in [false, true] {
+            let sectors = (0..6)
+                .map(|marker| parsed_xa_sector(!mixed || marker % 2 == 0, marker))
+                .collect::<Vec<_>>();
+            let mut parsed = parsed_iso();
+            parsed.manifest.entries[1].xa = Some(crate::manifest::EntryXa {
                 attributes: Some(crate::manifest::XaAttributes::INTERLEAVED),
                 ..crate::manifest::EntryXa::default()
-            }),
-            extent: None,
-            length: None,
-        });
-        parsed.manifest.entries.push(Entry {
-            path: "NEXT.BIN".to_owned(),
-            recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
-            hidden: false,
-            associated: false,
-            unbacked: false,
-            xa_system_use: None,
-            directory_reference: None,
-            directory_slack: None,
-            allocation_padding_hex: None,
-            directory_self_xa: None,
-            sector_subheader: EntrySectorSubheader::Canonical,
-            xa: None,
-            extent: None,
-            length: None,
-        });
-        parsed.files = vec![
-            iso9660::ParsedFile {
-                path: "FILE.BIN".to_owned(),
-                extent: 1,
-                length: 4 * LOGICAL_BLOCK_SIZE as u32,
-            },
-            iso9660::ParsedFile {
+            });
+            parsed.manifest.entries.push(Entry {
                 path: "B.XA".to_owned(),
-                extent: 2,
-                length: 3 * LOGICAL_BLOCK_SIZE as u32,
-            },
-            iso9660::ParsedFile {
+                recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
+                hidden: false,
+                associated: false,
+                reference: None,
+                xa_system_use: None,
+                directory_slack: None,
+                allocation_padding_hex: None,
+                directory_self_xa: None,
+                sector_subheader: EntrySectorSubheader::Canonical,
+                xa: Some(crate::manifest::EntryXa {
+                    attributes: Some(crate::manifest::XaAttributes::INTERLEAVED),
+                    ..crate::manifest::EntryXa::default()
+                }),
+            });
+            parsed.manifest.entries.push(Entry {
                 path: "NEXT.BIN".to_owned(),
-                extent: 5,
+                recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
+                hidden: false,
+                associated: false,
+                reference: None,
+                xa_system_use: None,
+                directory_slack: None,
+                allocation_padding_hex: None,
+                directory_self_xa: None,
+                sector_subheader: EntrySectorSubheader::Canonical,
+                xa: None,
+            });
+            parsed.files = vec![
+                iso9660::ParsedFile {
+                    path: "FILE.BIN".to_owned(),
+                    extent: 1,
+                    length: 4 * LOGICAL_BLOCK_SIZE as u32,
+                },
+                iso9660::ParsedFile {
+                    path: "B.XA".to_owned(),
+                    extent: 2,
+                    length: 3 * LOGICAL_BLOCK_SIZE as u32,
+                },
+                iso9660::ParsedFile {
+                    path: "NEXT.BIN".to_owned(),
+                    extent: 5,
+                    length: LOGICAL_BLOCK_SIZE as u32,
+                },
+            ];
+            parsed.directories = vec![iso9660::ParsedDirectory {
+                path: iso9660::ROOT_PATH.to_owned(),
+                extent: 0,
                 length: LOGICAL_BLOCK_SIZE as u32,
-            },
-        ];
-        parsed.directories = vec![iso9660::ParsedDirectory {
-            path: iso9660::ROOT_PATH.to_owned(),
-            extent: 0,
-            length: LOGICAL_BLOCK_SIZE as u32,
-        }];
+            }];
 
-        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+            detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
 
-        assert_eq!(
-            parsed
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["NEXT.BIN"]
-        );
-        assert_eq!(parsed.manifest.entries[1].extent, Some(1));
-        assert_eq!(
-            parsed.manifest.entries[1].length,
-            Some(4 * LOGICAL_BLOCK_SIZE as u32)
-        );
-        assert_eq!(parsed.manifest.entries[2].extent, Some(2));
-        assert_eq!(
-            parsed.manifest.entries[2].length,
-            Some(3 * LOGICAL_BLOCK_SIZE as u32)
-        );
-        let layout = detect_file_layout(
-            &sectors,
-            &parsed.files,
-            &parsed.directories,
-            &[],
-            true,
-            "test",
-        )
-        .unwrap();
-        assert!(layout.items[0].as_xa_extent().is_some());
-        assert_eq!(layout.items[1], FileLayoutItem::path("NEXT.BIN"));
+            assert_eq!(
+                parsed
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["NEXT.BIN"]
+            );
+            assert_eq!(
+                parsed.manifest.entries[1].reference,
+                Some(EntryReference {
+                    kind: EntryReferenceKind::Layout,
+                    extent: 1,
+                    length: 4 * LOGICAL_BLOCK_SIZE as u32,
+                })
+            );
+            assert_eq!(
+                parsed.manifest.entries[2].reference,
+                Some(EntryReference {
+                    kind: EntryReferenceKind::Layout,
+                    extent: 2,
+                    length: 3 * LOGICAL_BLOCK_SIZE as u32,
+                })
+            );
+            let layout = detect_file_layout(
+                &sectors,
+                &parsed.files,
+                &parsed.directories,
+                &[],
+                true,
+                "test",
+            )
+            .unwrap();
+            assert!(layout.items[0].as_xa_extent().is_some());
+            assert_eq!(layout.items[1], FileLayoutItem::path("NEXT.BIN"));
+        }
     }
 
     #[test]
@@ -5786,16 +5791,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "OUTSIDE.BIN".to_owned(),
@@ -5807,16 +5809,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "PARTIAL.BIN".to_owned(),
@@ -5824,15 +5823,17 @@ mod tests {
             length: 2 * LOGICAL_BLOCK_SIZE as u32,
         });
 
-        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+        detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
 
         assert!(parsed.files.is_empty());
-        assert_eq!(parsed.manifest.entries[1].extent, Some(0));
-        assert_eq!(parsed.manifest.entries[2].extent, Some(100));
-        assert_eq!(parsed.manifest.entries[3].extent, Some(17));
-        assert!(parsed.manifest.entries[1].unbacked);
-        assert!(parsed.manifest.entries[2].unbacked);
-        assert!(parsed.manifest.entries[3].unbacked);
+        assert_eq!(parsed.manifest.entries[1].reference.unwrap().extent, 0);
+        assert_eq!(parsed.manifest.entries[2].reference.unwrap().extent, 100);
+        assert_eq!(parsed.manifest.entries[3].reference.unwrap().extent, 17);
+        assert!(
+            parsed.manifest.entries[1..4]
+                .iter()
+                .all(|entry| { entry.reference.unwrap().kind == EntryReferenceKind::RecordOnly })
+        );
         assert!(parsed.manifest.entries[1].allocation_padding_hex.is_none());
 
         parsed.manifest.layout.clear();
@@ -5840,7 +5841,7 @@ mod tests {
     }
 
     #[test]
-    fn unbacked_form2_xa_file_retains_only_directory_record_xa_fields() {
+    fn record_only_form2_xa_file_retains_only_directory_record_xa_fields() {
         let sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER; 18]);
         let mut parsed = parsed_iso();
         parsed.files[0].extent = 100;
@@ -5854,10 +5855,13 @@ mod tests {
             ..crate::manifest::EntryXa::default()
         });
 
-        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+        detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
 
         let entry = &parsed.manifest.entries[1];
-        assert!(entry.unbacked);
+        assert_eq!(
+            entry.reference.unwrap().kind,
+            EntryReferenceKind::RecordOnly
+        );
         let xa = entry.xa.as_ref().unwrap();
         assert_eq!(xa.attributes, Some(attributes));
         assert_eq!(xa.length_encoding, XaLengthEncoding::Logical2048);
@@ -5869,7 +5873,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_ordinary_files_become_unbacked_references() {
+    fn overlapping_ordinary_files_become_record_only_references() {
         let sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER; 8]);
         let mut parsed = parsed_iso();
         parsed.files[0].extent = 1;
@@ -5879,16 +5883,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -5896,13 +5897,19 @@ mod tests {
             length: 2 * LOGICAL_BLOCK_SIZE as u32,
         });
 
-        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+        detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
 
         assert!(parsed.files.is_empty());
-        assert!(parsed.manifest.entries[1].unbacked);
-        assert!(parsed.manifest.entries[2].unbacked);
-        assert_eq!(parsed.manifest.entries[1].extent, Some(1));
-        assert_eq!(parsed.manifest.entries[2].extent, Some(3));
+        assert_eq!(
+            parsed.manifest.entries[1].reference.unwrap().kind,
+            EntryReferenceKind::RecordOnly
+        );
+        assert_eq!(
+            parsed.manifest.entries[2].reference.unwrap().kind,
+            EntryReferenceKind::RecordOnly
+        );
+        assert_eq!(parsed.manifest.entries[1].reference.unwrap().extent, 1);
+        assert_eq!(parsed.manifest.entries[2].reference.unwrap().extent, 3);
         let detected = detect_file_layout(
             &sectors,
             &parsed.files,
@@ -6036,16 +6043,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -6123,7 +6127,8 @@ mod tests {
         subheaders[17] = ISO_METADATA_SUBHEADER;
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
-        parsed.manifest.metadata_subheader = IsoMetadataSubheader::IsoMetadata;
+        parsed.manifest.metadata_subheader =
+            MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata);
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
@@ -6135,7 +6140,8 @@ mod tests {
         subheaders[17] = SYSTEM_END_OF_FILE_SUBHEADER;
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
-        parsed.manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
+        parsed.manifest.metadata_subheader =
+            MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData);
         parsed.manifest.entries.truncate(1);
         parsed.manifest.layout.clear();
         parsed.files.clear();
@@ -6151,7 +6157,7 @@ mod tests {
         subheaders[17] = custom;
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
-        parsed.manifest.metadata_framing_subheader = Some(custom);
+        parsed.manifest.metadata_subheader = MetadataSubheader::Explicit(custom);
         parsed.manifest.entries.truncate(1);
         parsed.manifest.layout.clear();
         parsed.files.clear();
@@ -6184,23 +6190,21 @@ mod tests {
         subheaders[20] = ISO_METADATA_SUBHEADER;
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
-        parsed.manifest.metadata_subheader = IsoMetadataSubheader::IsoMetadata;
+        parsed.manifest.metadata_subheader =
+            MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata);
         parsed.files[0].length = (2 * LOGICAL_BLOCK_SIZE) as u32;
         parsed.manifest.entries.push(crate::manifest::Entry {
             path: "SECOND.BIN".to_owned(),
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -6248,16 +6252,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         directory_iso.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -6290,16 +6291,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -6335,16 +6333,13 @@ mod tests {
             recording_time: "1998-03-19T11:58:36+09:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         });
         parsed.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -6388,7 +6383,7 @@ mod tests {
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
-            EntrySectorSubheader::DataUntilFinal
+            PathTableSubheader::Named(EntrySectorSubheader::DataUntilFinal)
         );
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
@@ -6413,7 +6408,7 @@ mod tests {
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
-            EntrySectorSubheader::EndOfFileData
+            PathTableSubheader::Named(EntrySectorSubheader::EndOfFileData)
         );
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
@@ -6421,25 +6416,25 @@ mod tests {
     #[test]
     fn custom_path_table_form1_subheader_is_detected_in_memory() {
         let custom = XaSubheader::default();
-        let mut subheaders = vec![ISO_METADATA_SUBHEADER; 20];
+        let mut subheaders = vec![ISO_METADATA_SUBHEADER; 32];
         subheaders[..16].fill(FORM1_DATA_SUBHEADER);
         subheaders[16] = PVD_SUBHEADER;
-        subheaders[18] = custom;
-        subheaders[19] = custom;
+        for lba in [18, 19, 22, 23, 26, 27, 30, 31] {
+            subheaders[lba] = custom;
+        }
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
         parsed.path_tables = Some(iso9660::ParsedPathTables {
-            extents: [18, 0, 19, 0],
-            blocks: 1,
+            extents: [18, 22, 26, 30],
+            blocks: 2,
         });
 
         detect_path_table_subheader(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
-            EntrySectorSubheader::Data
+            PathTableSubheader::Explicit(custom)
         );
-        assert_eq!(parsed.manifest.path_table_framing_subheader, Some(custom));
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
@@ -6558,6 +6553,14 @@ mod tests {
 
         assert!(error.contains("unknown field"));
         assert!(error.contains("files"));
+
+        for removed in [
+            "  metadata_framing_subheader: {}\n",
+            "  path_table_framing_subheader: {}\n",
+        ] {
+            let legacy = yaml.replacen("  entries:\n", &format!("{removed}  entries:\n"), 1);
+            assert!(yaml_serde::from_str::<Manifest>(&legacy).is_err());
+        }
     }
 
     #[test]

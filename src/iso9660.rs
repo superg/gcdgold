@@ -4,10 +4,11 @@ use anyhow::{Context, Result, ensure};
 
 use crate::manifest::{
     DEFAULT_XA_PERMISSIONS, DirectoryLengthPolicy, DirectoryParentRecordingTime,
-    DirectoryRecordPacking, DirectoryReference, DirectorySlack, Entry, EntrySectorSubheader,
-    EntryXa, FileLayoutItem, GapKind, Iso9660, JolietEntry, JolietLevel, JolietVolume,
-    MetadataLayoutItem, MetadataPathTable, MetadataVolume, PathTableCopies, PathTableOrder,
-    PrimaryVolume, PrimaryVolumeApplicationUse, PvdU16Encoding, RootDirectoryIdentifier,
+    DirectoryRecordPacking, DirectorySlack, Entry, EntryReference, EntryReferenceKind,
+    EntrySectorSubheader, EntryXa, FileLayoutItem, GapKind, Iso9660, JolietEntry, JolietLevel,
+    JolietVolume, MetadataLayoutItem, MetadataPathTable, MetadataSubheader, MetadataVolume,
+    PathTableCopies, PathTableOrder, PathTableSubheader, PrimaryVolume,
+    PrimaryVolumeApplicationUse, PvdU16Encoding, RootDirectoryIdentifier,
     VolumeTerminatorSubheader, XaAttributes, XaLengthEncoding,
 };
 use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader};
@@ -205,16 +206,13 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         recording_time: root_recording_time,
         hidden: root_record.flags & 1 != 0,
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
-        unbacked: false,
+        reference: None,
         xa_system_use: None,
-        directory_reference: None,
         directory_slack: None,
         allocation_padding_hex: None,
         directory_self_xa: None,
         sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, xa_system_use)?,
-        extent: None,
-        length: None,
     };
 
     let mut entries = vec![root];
@@ -326,19 +324,28 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             let record_uses_xa = xa_system_use && !record.system_use.is_empty();
             let xa = entry_xa(&record, is_dir, record_uses_xa)?;
             let external_cdda = !is_dir && xa.as_ref().is_some_and(entry_xa_is_cdda);
-            let directory_reference =
-                (is_dir && record.length == 0).then_some(DirectoryReference {
+            let reference = if is_dir && record.length == 0 {
+                Some(EntryReference {
+                    kind: EntryReferenceKind::Directory,
                     extent: record.extent,
                     length: record.length,
-                });
+                })
+            } else if external_cdda {
+                Some(EntryReference {
+                    kind: EntryReferenceKind::External,
+                    extent: record.extent,
+                    length: record.length,
+                })
+            } else {
+                None
+            };
             let entry = Entry {
                 path: path.clone(),
                 recording_time: parse_recording_time(record.recording_time)?,
                 hidden: record.flags & 1 != 0,
                 associated: record.flags & ASSOCIATED_FLAG != 0,
-                unbacked: false,
+                reference,
                 xa_system_use: (xa_system_use && !record_uses_xa).then_some(false),
-                directory_reference,
                 directory_slack: None,
                 allocation_padding_hex: (!is_dir && !external_cdda)
                     .then(|| file_allocation_padding_hex(blocks, &record))
@@ -346,8 +353,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                 directory_self_xa: None,
                 sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                 xa,
-                extent: external_cdda.then_some(record.extent),
-                length: external_cdda.then_some(record.length),
             };
             entries.push(entry);
             if is_dir {
@@ -356,7 +361,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                     extent: record.extent,
                     length: record.length,
                 });
-                if directory_reference.is_none() {
+                if reference.is_none() {
                     queue.push_back((path, record.extent, record.length));
                 }
             } else if !external_cdda {
@@ -382,15 +387,16 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     let inferred_volume_space_size = entries.iter().try_fold(
         u32::try_from(blocks.len())?,
         |maximum, entry| -> Result<u32> {
-            let Some(extent) = entry.extent else {
+            let Some(reference) = entry.reference else {
                 return Ok(maximum);
             };
-            let blocks = entry
-                .length
-                .context("external CDDA entry has no length")?
-                .div_ceil(LOGICAL_BLOCK_SIZE as u32);
+            if reference.kind != EntryReferenceKind::External {
+                return Ok(maximum);
+            }
+            let blocks = reference.length.div_ceil(LOGICAL_BLOCK_SIZE as u32);
             Ok(maximum.max(
-                extent
+                reference
+                    .extent
                     .checked_add(blocks)
                     .context("external CDDA extent overflow")?,
             ))
@@ -478,8 +484,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         supplementary_volumes: Vec::new(),
         metadata_layout: Vec::new(),
         xa_system_use,
-        metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
-        metadata_framing_subheader: None,
+        metadata_subheader: MetadataSubheader::default(),
         volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
         directory_record_packing: if packing_observation.skipped_exact_fit {
             DirectoryRecordPacking::AvoidExactFit
@@ -494,8 +499,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         path_table_big_hex,
         path_table_copies,
         path_table_order,
-        path_table_subheader: EntrySectorSubheader::Canonical,
-        path_table_framing_subheader: None,
+        path_table_subheader: PathTableSubheader::default(),
         entries,
         layout: file_order,
     };
@@ -1622,7 +1626,10 @@ pub(crate) fn layout_with_metadata_gap_kind(
     let mut placements = Vec::with_capacity(directories.len());
     for (path, name, parent) in &directories {
         let entry = entry_by_path[path.as_str()];
-        let (extent, blocks, length) = match entry.directory_reference {
+        let (extent, blocks, length) = match entry
+            .reference
+            .filter(|reference| reference.kind == EntryReferenceKind::Directory)
+        {
             Some(reference) => (reference.extent, 0, reference.length),
             None => {
                 let record_lengths = directory_record_lengths(path, iso, &file_paths);
@@ -1665,8 +1672,8 @@ pub(crate) fn layout_with_metadata_gap_kind(
         .iter()
         .map(|directory| {
             entry_by_path[directory.path.as_str()]
-                .directory_reference
-                .is_some()
+                .reference
+                .is_some_and(|reference| reference.kind == EntryReferenceKind::Directory)
         })
         .collect::<Vec<_>>();
     let mut joliet_layout = None;
@@ -1793,7 +1800,11 @@ pub(crate) fn layout_with_metadata_gap_kind(
         .collect::<HashSet<_>>();
 
     let mut external_ancestors = HashSet::new();
-    for entry in iso.entries.iter().filter(|entry| entry.extent.is_some()) {
+    for entry in iso.entries.iter().filter(|entry| {
+        entry
+            .reference
+            .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory)
+    }) {
         let mut ancestor = parent_path(&entry.path);
         while ancestor != ROOT_PATH {
             let index = directory_index[ancestor.as_str()];
@@ -2022,20 +2033,23 @@ pub(crate) fn layout_with_metadata_gap_kind(
         .entries
         .iter()
         .filter_map(|entry| {
-            entry.extent.map(|extent| FilePlacement {
-                path: entry.path.clone(),
-                extent,
-                length: u64::from(entry.length.expect("validated fixed-reference length")),
-                blocks: entry
-                    .length
-                    .expect("validated fixed-reference length")
-                    .div_ceil(LOGICAL_BLOCK_SIZE as u32),
-            })
+            entry
+                .reference
+                .filter(|reference| reference.kind != EntryReferenceKind::Directory)
+                .map(|reference| FilePlacement {
+                    path: entry.path.clone(),
+                    extent: reference.extent,
+                    length: u64::from(reference.length),
+                    blocks: reference.length.div_ceil(LOGICAL_BLOCK_SIZE as u32),
+                })
         })
         .collect::<Vec<_>>();
     for reference in &referenced_files {
         let entry = entry_by_path[reference.path.as_str()];
-        if !entry.unbacked && !entry.xa.as_ref().is_some_and(entry_xa_is_cdda) {
+        if entry
+            .reference
+            .is_some_and(|reference| reference.kind == EntryReferenceKind::Layout)
+        {
             let reference_end = reference
                 .extent
                 .checked_add(reference.blocks)
@@ -2082,7 +2096,11 @@ pub(crate) fn layout_with_metadata_gap_kind(
     let mut metadata_subheader_sectors = HashSet::new();
     let mut framing_subheader_sectors = HashMap::new();
     let mut sector_file_numbers = HashMap::new();
-    let path_table_data_blocks = match iso.path_table_subheader {
+    let (path_table_policy, explicit_path_table_subheader) = match iso.path_table_subheader {
+        PathTableSubheader::Named(policy) => (policy, None),
+        PathTableSubheader::Explicit(subheader) => (EntrySectorSubheader::Data, Some(subheader)),
+    };
+    let path_table_data_blocks = match path_table_policy {
         EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => 0,
         EntrySectorSubheader::Data => path_blocks,
         EntrySectorSubheader::EndOfFileData | EntrySectorSubheader::DataUntilFinal => {
@@ -2095,14 +2113,14 @@ pub(crate) fn layout_with_metadata_gap_kind(
     {
         for lba in pointer..pointer + path_table_data_blocks {
             data_subheader_sectors.insert(lba);
-            if let Some(subheader) = iso.path_table_framing_subheader {
+            if let Some(subheader) = explicit_path_table_subheader {
                 framing_subheader_sectors.insert(lba, subheader);
             }
         }
         for lba in pointer + path_table_data_blocks..pointer + path_blocks {
             metadata_subheader_sectors.insert(lba);
         }
-        if iso.path_table_subheader == EntrySectorSubheader::EndOfFileData {
+        if path_table_policy == EntrySectorSubheader::EndOfFileData {
             let final_lba = pointer + path_blocks - 1;
             metadata_subheader_sectors.remove(&final_lba);
             end_of_file_data_subheader_sectors.insert(final_lba);
@@ -2240,8 +2258,8 @@ pub(crate) fn layout_with_metadata_gap_kind(
     }
     for directory in &placements {
         if entry_by_path[directory.path.as_str()]
-            .directory_reference
-            .is_some()
+            .reference
+            .is_some_and(|reference| reference.kind == EntryReferenceKind::Directory)
         {
             continue;
         }
@@ -2375,26 +2393,22 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             "metadata_layout must place every primary and Joliet path table exactly once"
         );
     }
-    ensure!(
-        iso.metadata_framing_subheader.is_none()
-            || (iso.metadata_subheader == crate::manifest::IsoMetadataSubheader::Canonical
-                && iso.metadata_framing_subheader.is_none_or(|subheader| {
-                    !subheader
-                        .submode
-                        .contains(crate::raw_cd::XaSubmodeFlag::Form2)
-                })),
-        "custom metadata framing requires the canonical Form 1 metadata policy"
-    );
-    ensure!(
-        iso.path_table_framing_subheader.is_none()
-            || (iso.path_table_subheader == EntrySectorSubheader::Data
-                && iso.path_table_framing_subheader.is_none_or(|subheader| {
-                    !subheader
-                        .submode
-                        .contains(crate::raw_cd::XaSubmodeFlag::Form2)
-                })),
-        "custom path-table framing requires a Form 1 data policy"
-    );
+    if let MetadataSubheader::Explicit(subheader) = iso.metadata_subheader {
+        ensure!(
+            !subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+            "explicit metadata_subheader must be Form 1"
+        );
+    }
+    if let PathTableSubheader::Explicit(subheader) = iso.path_table_subheader {
+        ensure!(
+            !subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+            "explicit path_table_subheader must be Form 1"
+        );
+    }
     let root = iso
         .entries
         .first()
@@ -2402,6 +2416,10 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     ensure!(
         root.path == ROOT_PATH,
         "filesystem root must be the first entry with path ."
+    );
+    ensure!(
+        root.reference.is_none(),
+        "filesystem root cannot declare a reference"
     );
     let mut paths = HashSet::new();
     for entry in &iso.entries {
@@ -2414,12 +2432,22 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     let directory_reference_paths = iso
         .entries
         .iter()
-        .filter_map(|entry| entry.directory_reference.map(|_| entry.path.as_str()))
+        .filter_map(|entry| {
+            entry
+                .reference
+                .filter(|reference| reference.kind == EntryReferenceKind::Directory)
+                .map(|_| entry.path.as_str())
+        })
         .collect::<HashSet<_>>();
     let referenced_paths = iso
         .entries
         .iter()
-        .filter_map(|entry| entry.extent.map(|_| entry.path.as_str()))
+        .filter_map(|entry| {
+            entry
+                .reference
+                .filter(|reference| reference.kind != EntryReferenceKind::Directory)
+                .map(|_| entry.path.as_str())
+        })
         .collect::<HashSet<_>>();
     let joliet_paths = iso
         .supplementary_volumes
@@ -2661,55 +2689,10 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         }
     }
     for (index, entry) in iso.entries.iter().enumerate() {
-        let has_extent = entry.extent.is_some();
-        let has_length = entry.length.is_some();
-        if let Some(reference) = entry.directory_reference {
-            ensure!(
-                index != 0 && !file_paths.contains(entry.path.as_str()),
-                "directory_reference is supported only for non-root directories: {}",
-                entry.path
-            );
-            ensure!(
-                reference.length == 0,
-                "directory_reference currently requires a zero length: {}",
-                entry.path
-            );
-            ensure!(
-                !has_extent && !has_length,
-                "directory_reference cannot be combined with a file fixed reference: {}",
-                entry.path
-            );
-            ensure!(
-                entry.directory_slack.is_none()
-                    && entry.sector_subheader == EntrySectorSubheader::Canonical,
-                "directory_reference cannot have physical directory data: {}",
-                entry.path
-            );
-            ensure!(
-                !iso.entries.iter().any(|candidate| {
-                    candidate.path != entry.path && parent_path(&candidate.path) == entry.path
-                }),
-                "directory_reference must be childless: {}",
-                entry.path
-            );
-        }
-        ensure!(
-            has_extent == has_length,
-            "fixed-reference entry requires both extent and length: {}",
-            entry.path
-        );
+        let has_file_reference = entry
+            .reference
+            .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory);
         let cdda = entry.xa.as_ref().is_some_and(entry_xa_is_cdda);
-        let unbacked = entry.unbacked;
-        ensure!(
-            !cdda || has_extent,
-            "external CDDA entry requires a fixed extent and length: {}",
-            entry.path
-        );
-        ensure!(
-            !unbacked || (has_extent && entry.length.is_some_and(|length| length > 0) && !cdda),
-            "unbacked entry requires a nonempty non-CDDA fixed reference: {}",
-            entry.path
-        );
         let form2_xa = entry
             .xa
             .as_ref()
@@ -2718,12 +2701,63 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 attributes.contains(crate::manifest::XaAttributeFlag::Interleaved)
                     || attributes.contains(crate::manifest::XaAttributeFlag::Mode2Form2)
             });
-        ensure!(
-            !has_extent || cdda || form2_xa || unbacked,
-            "fixed extent and length require external CDDA, Form 2 XA attributes, or unbacked: {}",
-            entry.path
-        );
         let is_file = file_paths.contains(entry.path.as_str());
+        match entry.reference {
+            Some(EntryReference {
+                kind: EntryReferenceKind::Layout,
+                ..
+            }) => ensure!(
+                is_file && form2_xa && !cdda,
+                "layout reference requires a non-CDDA file with interleaved or Form 2 XA attributes: {}",
+                entry.path
+            ),
+            Some(EntryReference {
+                kind: EntryReferenceKind::RecordOnly,
+                length,
+                ..
+            }) => ensure!(
+                is_file && length > 0 && !cdda,
+                "record_only reference requires a nonempty non-CDDA file: {}",
+                entry.path
+            ),
+            Some(EntryReference {
+                kind: EntryReferenceKind::External,
+                ..
+            }) => ensure!(
+                is_file && cdda,
+                "external reference requires a file with the XA cdda attribute: {}",
+                entry.path
+            ),
+            Some(EntryReference {
+                kind: EntryReferenceKind::Directory,
+                length,
+                ..
+            }) => {
+                ensure!(
+                    index != 0 && !is_file && length == 0,
+                    "directory reference requires a non-root zero-length directory: {}",
+                    entry.path
+                );
+                ensure!(
+                    entry.directory_slack.is_none()
+                        && entry.sector_subheader == EntrySectorSubheader::Canonical,
+                    "directory reference cannot have physical directory data: {}",
+                    entry.path
+                );
+                ensure!(
+                    !iso.entries.iter().any(|candidate| {
+                        candidate.path != entry.path && parent_path(&candidate.path) == entry.path
+                    }),
+                    "directory reference must be childless: {}",
+                    entry.path
+                );
+            }
+            None => ensure!(
+                !cdda,
+                "CDDA entry requires an external reference: {}",
+                entry.path
+            ),
+        }
         ensure!(
             entry.xa_system_use != Some(true),
             "entry xa_system_use supports only false: {}",
@@ -2732,11 +2766,6 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         ensure!(
             entry.xa_system_use.is_none() || (iso.xa_system_use && is_file),
             "entry xa_system_use: false requires global XA system use and a file entry: {}",
-            entry.path
-        );
-        ensure!(
-            !unbacked || is_file,
-            "unbacked is supported only for files: {}",
             entry.path
         );
         ensure!(
@@ -2811,13 +2840,14 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         );
         let indexed_assets = entry.xa.as_ref().is_some_and(|xa| xa.form1.is_some());
         ensure!(
-            entry.allocation_padding_hex.is_none() || (!has_extent && !indexed_assets),
+            entry.allocation_padding_hex.is_none()
+                || (entry.reference.is_none() && !indexed_assets),
             "allocation_padding_hex is unsupported for fixed-reference or mixed XA entry: {}",
             entry.path
         );
         ensure!(
-            !unbacked || !indexed_assets,
-            "unbacked file cannot declare indexed XA framing: {}",
+            entry.reference.is_none() || !indexed_assets,
+            "referenced file cannot declare indexed XA framing: {}",
             entry.path
         );
         ensure!(
@@ -2854,13 +2884,13 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                         || attributes.contains(crate::manifest::XaAttributeFlag::Mode2Form2)
                 });
         ensure!(
-            !mixed_attributes || (is_file && (indexed_assets || has_extent)),
+            !mixed_attributes || (is_file && (indexed_assets || has_file_reference)),
             "interleaved or Form 2 file attributes require indexed assets or a fixed reference: {}",
             entry.path
         );
         ensure!(
             entry.sector_subheader == EntrySectorSubheader::Canonical
-                || (!has_extent && !indexed_assets),
+                || (!has_file_reference && !indexed_assets),
             "data sector subheader policy is unsupported for fixed-reference or mixed XA entry: {}",
             entry.path
         );
@@ -3510,7 +3540,8 @@ fn validate_directory_reference_path_tables(
         .iter()
         .filter_map(|entry| {
             entry
-                .directory_reference
+                .reference
+                .filter(|reference| reference.kind == EntryReferenceKind::Directory)
                 .map(|reference| (entry.path.as_str(), reference))
         })
         .collect::<Vec<_>>();
@@ -4287,16 +4318,13 @@ mod tests {
             recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
             hidden: false,
             associated: false,
-            unbacked: false,
+            reference: None,
             xa_system_use: None,
-            directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
             xa: None,
-            extent: None,
-            length: None,
         }
     }
 
@@ -4307,8 +4335,7 @@ mod tests {
             supplementary_volumes: Vec::new(),
             metadata_layout: Vec::new(),
             xa_system_use: true,
-            metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
-            metadata_framing_subheader: None,
+            metadata_subheader: MetadataSubheader::default(),
             volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
             directory_record_packing: DirectoryRecordPacking::Fill,
             directory_parent_recording_time: DirectoryParentRecordingTime::Parent,
@@ -4319,8 +4346,7 @@ mod tests {
             path_table_big_hex: None,
             path_table_copies: PathTableCopies::Duplicate,
             path_table_order: PathTableOrder::LittleEndianFirst,
-            path_table_subheader: EntrySectorSubheader::Canonical,
-            path_table_framing_subheader: None,
+            path_table_subheader: PathTableSubheader::default(),
             entries,
             layout: files.into_iter().map(FileLayoutItem::path).collect(),
         }
@@ -4329,7 +4355,8 @@ mod tests {
     #[test]
     fn childless_directory_reference_roundtrips_without_physical_directory() {
         let mut reference = test_entry("DATA/OLD");
-        reference.directory_reference = Some(crate::manifest::DirectoryReference {
+        reference.reference = Some(EntryReference {
+            kind: EntryReferenceKind::Directory,
             extent: 0,
             length: 0,
         });
@@ -4348,8 +4375,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            parsed_reference.directory_reference,
-            Some(crate::manifest::DirectoryReference {
+            parsed_reference.reference,
+            Some(EntryReference {
+                kind: EntryReferenceKind::Directory,
                 extent: 0,
                 length: 0,
             })
@@ -4365,6 +4393,63 @@ mod tests {
         assert_eq!(
             layout(&parsed.manifest, &HashMap::new()).unwrap().blocks,
             authored.blocks
+        );
+    }
+
+    #[test]
+    fn explicit_metadata_and_path_table_subheaders_reject_form2() {
+        let form2 = XaSubheader::with_submode(crate::raw_cd::XaSubmode::FORM2);
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.metadata_subheader = MetadataSubheader::Explicit(form2);
+        assert!(layout(&iso, &HashMap::new()).is_err());
+
+        iso.metadata_subheader = MetadataSubheader::default();
+        iso.path_table_subheader = PathTableSubheader::Explicit(form2);
+        assert!(layout(&iso, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn reference_kinds_reject_incompatible_entry_metadata() {
+        let mut entry = test_entry("FILE.BIN");
+        entry.reference = Some(EntryReference {
+            kind: EntryReferenceKind::RecordOnly,
+            extent: 0,
+            length: 0,
+        });
+        assert!(
+            layout(
+                &test_iso(vec![test_entry(ROOT_PATH), entry], vec![]),
+                &HashMap::new()
+            )
+            .is_err()
+        );
+
+        let mut entry = test_entry("AUDIO.BIN");
+        entry.reference = Some(EntryReference {
+            kind: EntryReferenceKind::External,
+            extent: 100,
+            length: 0,
+        });
+        assert!(
+            layout(
+                &test_iso(vec![test_entry(ROOT_PATH), entry], vec![]),
+                &HashMap::new()
+            )
+            .is_err()
+        );
+
+        let mut entry = test_entry("STREAM.XA");
+        entry.reference = Some(EntryReference {
+            kind: EntryReferenceKind::Layout,
+            extent: 23,
+            length: 2048,
+        });
+        assert!(
+            layout(
+                &test_iso(vec![test_entry(ROOT_PATH), entry], vec![]),
+                &HashMap::new()
+            )
+            .is_err()
         );
     }
 
@@ -4731,7 +4816,7 @@ mod tests {
         let mut entries = vec![test_entry(ROOT_PATH)];
         entries.extend((0..200).map(|index| test_entry(&format!("D{index:03}"))));
         let mut iso = test_iso(entries, vec![]);
-        iso.path_table_subheader = EntrySectorSubheader::DataUntilFinal;
+        iso.path_table_subheader = PathTableSubheader::Named(EntrySectorSubheader::DataUntilFinal);
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
 
@@ -4752,7 +4837,7 @@ mod tests {
         let mut entries = vec![test_entry(ROOT_PATH)];
         entries.extend((0..200).map(|index| test_entry(&format!("D{index:03}"))));
         let mut iso = test_iso(entries, vec![]);
-        iso.path_table_subheader = EntrySectorSubheader::EndOfFileData;
+        iso.path_table_subheader = PathTableSubheader::Named(EntrySectorSubheader::EndOfFileData);
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
 
@@ -4994,9 +5079,11 @@ mod tests {
         let mut iso = test_joliet_iso();
         iso.entries.insert(1, test_entry("DIR"));
         iso.entries[2].path = "DIR/FILE.BIN".to_owned();
-        iso.entries[2].extent = Some(100);
-        iso.entries[2].length = Some(17);
-        iso.entries[2].unbacked = true;
+        iso.entries[2].reference = Some(EntryReference {
+            kind: EntryReferenceKind::RecordOnly,
+            extent: 100,
+            length: 17,
+        });
         iso.layout.clear();
         let volume = &mut iso.supplementary_volumes[0];
         volume.entries.insert(
@@ -5993,16 +6080,13 @@ mod tests {
                     recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
                     hidden: false,
                     associated: false,
-                    unbacked: false,
+                    reference: None,
                     xa_system_use: None,
-                    directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
-                    extent: None,
-                    length: None,
                 },
                 true,
             )
@@ -6036,16 +6120,13 @@ mod tests {
                     recording_time: "1998-01-01T00:00:00+00:00".to_owned(),
                     hidden: false,
                     associated: false,
-                    unbacked: false,
+                    reference: None,
                     xa_system_use: None,
-                    directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
-                    extent: None,
-                    length: None,
                 },
                 false,
             )
@@ -6078,16 +6159,13 @@ mod tests {
                     recording_time: "1999-01-01T00:00:00+00:00".to_owned(),
                     hidden: false,
                     associated: false,
-                    unbacked: false,
+                    reference: None,
                     xa_system_use: None,
-                    directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
-                    extent: None,
-                    length: None,
                 },
                 false,
             )
@@ -6103,8 +6181,12 @@ mod tests {
             attributes: Some(XaAttributes::CDDA),
             ..EntryXa::default()
         });
-        audio.extent = Some(25);
-        audio.length = Some(2048);
+        audio.reference = Some(EntryReference {
+            kind: EntryReferenceKind::External,
+            extent: 25,
+            length: 2048,
+        });
+        let expected_reference = audio.reference;
         let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
         let lengths = HashMap::new();
         let authored = layout(&iso, &lengths).unwrap();
@@ -6113,8 +6195,7 @@ mod tests {
 
         let parsed = parse(&authored.blocks).unwrap();
         assert!(parsed.files.is_empty());
-        assert_eq!(parsed.manifest.entries[1].extent, Some(25));
-        assert_eq!(parsed.manifest.entries[1].length, Some(2048));
+        assert_eq!(parsed.manifest.entries[1].reference, expected_reference);
     }
 
     #[test]
@@ -6124,15 +6205,18 @@ mod tests {
             attributes: Some(XaAttributes::CDDA),
             ..EntryXa::default()
         });
-        audio.extent = Some(30_692);
-        audio.length = Some(0);
+        audio.reference = Some(EntryReference {
+            kind: EntryReferenceKind::External,
+            extent: 30_692,
+            length: 0,
+        });
+        let expected_reference = audio.reference;
         let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
         let parsed = parse(&authored.blocks).unwrap();
 
-        assert_eq!(parsed.manifest.entries[1].extent, Some(30_692));
-        assert_eq!(parsed.manifest.entries[1].length, Some(0));
+        assert_eq!(parsed.manifest.entries[1].reference, expected_reference);
     }
 
     #[test]
@@ -6142,15 +6226,18 @@ mod tests {
             attributes: Some(XaAttributes::CDDA),
             ..EntryXa::default()
         });
-        audio.extent = Some(0);
-        audio.length = Some(2048);
+        audio.reference = Some(EntryReference {
+            kind: EntryReferenceKind::External,
+            extent: 0,
+            length: 2048,
+        });
+        let expected_reference = audio.reference;
         let iso = test_iso(vec![test_entry(ROOT_PATH), audio], vec![]);
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
         let parsed = parse(&authored.blocks).unwrap();
 
-        assert_eq!(parsed.manifest.entries[1].extent, Some(0));
-        assert_eq!(parsed.manifest.entries[1].length, Some(2048));
+        assert_eq!(parsed.manifest.entries[1].reference, expected_reference);
     }
 
     #[test]
@@ -6160,15 +6247,21 @@ mod tests {
             attributes: Some(XaAttributes::INTERLEAVED),
             ..EntryXa::default()
         });
-        first.extent = Some(23);
-        first.length = Some(4096);
+        first.reference = Some(EntryReference {
+            kind: EntryReferenceKind::Layout,
+            extent: 23,
+            length: 4096,
+        });
         let mut second = test_entry("SECOND.XA");
         second.xa = Some(EntryXa {
             attributes: Some(XaAttributes::MODE2_FORM2),
             ..EntryXa::default()
         });
-        second.extent = Some(24);
-        second.length = Some(4096);
+        second.reference = Some(EntryReference {
+            kind: EntryReferenceKind::Layout,
+            extent: 24,
+            length: 4096,
+        });
         let mut iso = test_iso(vec![test_entry(ROOT_PATH), first, second], vec![]);
         assert_eq!(
             layout(&iso, &HashMap::new()).unwrap_err().to_string(),
@@ -6205,8 +6298,11 @@ mod tests {
             attributes: Some(XaAttributes::CDDA),
             ..EntryXa::default()
         });
-        external.extent = Some(100);
-        external.length = Some(2048);
+        external.reference = Some(EntryReference {
+            kind: EntryReferenceKind::External,
+            extent: 100,
+            length: 2048,
+        });
         let iso = test_iso(
             vec![
                 test_entry(ROOT_PATH),
