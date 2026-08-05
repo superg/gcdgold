@@ -11,14 +11,14 @@ use sha1::{Digest, Sha1};
 use crate::iso9660;
 use crate::manifest::{
     DirectorySlack, EntrySectorSubheader, FileLayoutItem, Form1Sectors, GapKind,
-    IsoMetadataSubheader, Manifest, MetadataLayoutItem, MetadataVolume, SYSTEM_AREA_SECTORS,
-    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
-    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, XaAttributeFlag, XaExtentAssets,
-    XaLengthEncoding, decode_sector_patch, serialize_manifest,
+    IsoMetadataSubheader, Manifest, MetadataLayoutItem, MetadataVolume, Redump0x55Run,
+    SYSTEM_AREA_SECTORS, SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
+    XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
-    Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SectorWriter, XaSubheader,
-    XaSubmode, format_msf, parse_image, parse_msf,
+    Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorWriter, XaSubheader,
+    XaSubmode, format_msf, frame_to_msf, parse_image, parse_msf,
 };
 
 #[derive(Debug, Clone)]
@@ -72,6 +72,21 @@ pub struct RecoveryWarning {
 pub struct BuildReport {
     pub sectors: u32,
     pub sha1: String,
+    pub sha1_mismatches: Vec<Sha1Mismatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sha1Target {
+    Track,
+    SystemArea { path: String },
+    Asset { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha1Mismatch {
+    pub target: Sha1Target,
+    pub expected: String,
+    pub actual: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +109,7 @@ pub struct ExtractOptions {
     pub manifest_only: bool,
     pub overwrite: bool,
     pub include_defaults: bool,
+    pub include_hashes: bool,
 }
 
 const FORM1_DATA_SUBHEADER: XaSubheader = XaSubheader::with_submode(XaSubmode::DATA);
@@ -122,6 +138,140 @@ fn raw_track_start_frame(raw: &[u8]) -> Result<u32> {
     ensure!(raw.len() >= RAW_SECTOR_SIZE, "raw image is empty");
     parse_msf(&format!("{:02x}:{:02x}:{:02x}", raw[12], raw[13], raw[14]))
         .context("parsing track start MSF")
+}
+
+fn detect_redump_0x55(raw: &[u8]) -> Vec<Redump0x55Run> {
+    if raw.is_empty() || !raw.len().is_multiple_of(RAW_SECTOR_SIZE) {
+        return Vec::new();
+    }
+    let track_mode = raw[15];
+    if !matches!(track_mode, 1 | 2) {
+        return Vec::new();
+    }
+    let Ok(start_frame) = raw_track_start_frame(raw) else {
+        return Vec::new();
+    };
+    let track_start_lba = i64::from(start_frame) - 150;
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for (index, sector) in raw.chunks_exact(RAW_SECTOR_SIZE).enumerate() {
+        let expected_msf = u32::try_from(index)
+            .ok()
+            .and_then(|index| start_frame.checked_add(index))
+            .and_then(|frame| frame_to_msf(frame).ok());
+        let detected = sector[..12] == SYNC
+            && sector[15] == track_mode
+            && expected_msf.is_some_and(|expected| sector[12..15] == expected)
+            && sector[16..].iter().all(|byte| *byte == 0x55);
+        if detected {
+            run_start.get_or_insert(index);
+        } else if let Some(start) = run_start.take() {
+            let lba = track_start_lba + i64::try_from(start).expect("sector index fits i64");
+            runs.push(Redump0x55Run {
+                lba: i32::try_from(lba).expect("CD LBA fits i32"),
+                sectors: u32::try_from(index - start).expect("sector run fits u32"),
+            });
+        }
+    }
+    if let Some(start) = run_start {
+        let sector_count = raw.len() / RAW_SECTOR_SIZE;
+        let lba = track_start_lba + i64::try_from(start).expect("sector index fits i64");
+        runs.push(Redump0x55Run {
+            lba: i32::try_from(lba).expect("CD LBA fits i32"),
+            sectors: u32::try_from(sector_count - start).expect("sector run fits u32"),
+        });
+    }
+    runs
+}
+
+fn resolve_redump_0x55_ranges(
+    track_start_frame: u32,
+    sector_count: usize,
+    runs: &[Redump0x55Run],
+) -> Result<Vec<Range<usize>>> {
+    let track_start_lba = i64::from(track_start_frame) - 150;
+    runs.iter()
+        .map(|run| {
+            let start = i64::from(run.lba) - track_start_lba;
+            ensure!(
+                start >= 0,
+                "Redump 0x55 run at LBA {} is before track start LBA {}",
+                run.lba,
+                track_start_lba
+            );
+            let start = usize::try_from(start)?;
+            let end = start
+                .checked_add(usize::try_from(run.sectors)?)
+                .context("Redump 0x55 run range overflow")?;
+            ensure!(
+                end <= sector_count,
+                "Redump 0x55 run at LBA {} extends outside the {}-sector track",
+                run.lba,
+                sector_count
+            );
+            Ok(start..end)
+        })
+        .collect()
+}
+
+fn validate_redump_0x55_runs(runs: &[Redump0x55Run], patches: &[SectorPatch]) -> Result<()> {
+    let mut previous_end = None;
+    for run in runs {
+        ensure!(run.sectors > 0, "Redump 0x55 run must not be empty");
+        let end = i64::from(run.lba)
+            .checked_add(i64::from(run.sectors))
+            .context("Redump 0x55 run LBA overflow")?;
+        if let Some(previous_end) = previous_end {
+            ensure!(
+                i64::from(run.lba) > previous_end,
+                "Redump 0x55 runs must be ordered, nonoverlapping, and nonadjacent"
+            );
+        }
+        ensure!(
+            !patches.iter().any(|patch| {
+                let lba = i64::from(patch.lba);
+                lba >= i64::from(run.lba) && lba < end
+            }),
+            "Redump 0x55 run at LBA {} overlaps a raw-sector patch",
+            run.lba
+        );
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+fn install_redump_0x55_placeholders(
+    raw: &mut [u8],
+    track_start_frame: u32,
+    track_mode: u8,
+    runs: &[Redump0x55Run],
+) -> Result<()> {
+    let ranges = resolve_redump_0x55_ranges(track_start_frame, raw.len() / RAW_SECTOR_SIZE, runs)?;
+    let mut writer = SectorWriter::new();
+    for range in ranges {
+        for index in range {
+            let frame = track_start_frame + u32::try_from(index)?;
+            let replacement = match track_mode {
+                1 => writer.mode1(frame, &[0; LOGICAL_BLOCK_SIZE])?,
+                2 => writer.form1(frame, FORM1_DATA_SUBHEADER, &[0; LOGICAL_BLOCK_SIZE])?,
+                _ => anyhow::bail!("unsupported track mode {track_mode}"),
+            };
+            let start = index * RAW_SECTOR_SIZE;
+            raw[start..start + RAW_SECTOR_SIZE].copy_from_slice(&replacement);
+        }
+    }
+    Ok(())
+}
+
+fn apply_redump_0x55(raw: &mut [u8], track_start_frame: u32, runs: &[Redump0x55Run]) -> Result<()> {
+    let ranges = resolve_redump_0x55_ranges(track_start_frame, raw.len() / RAW_SECTOR_SIZE, runs)?;
+    for range in ranges {
+        for index in range {
+            let start = index * RAW_SECTOR_SIZE;
+            raw[start + 16..start + RAW_SECTOR_SIZE].fill(0x55);
+        }
+    }
+    Ok(())
 }
 
 fn sector_bytes(raw: &[u8], index: usize) -> Result<[u8; RAW_SECTOR_SIZE]> {
@@ -1200,6 +1350,22 @@ fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 
+fn mark_entry_unbacked(entry: &mut crate::manifest::Entry, extent: u32, length: u32) {
+    entry.extent = Some(extent);
+    entry.length = Some(length);
+    entry.unbacked = true;
+    entry.allocation_padding_hex = None;
+    if let Some(xa) = &mut entry.xa {
+        xa.form1 = None;
+        xa.form2 = None;
+        xa.index = None;
+        xa.gap_index = None;
+        xa.logical_length = None;
+        xa.length_encoding = XaLengthEncoding::default();
+        xa.framing_subheader = None;
+    }
+}
+
 fn detach_unbacked_files(sector_count: usize, parsed_iso: &mut iso9660::ParsedIso) -> Result<()> {
     let entry_indices = parsed_iso
         .manifest
@@ -1221,10 +1387,7 @@ fn detach_unbacked_files(sector_count: usize, parsed_iso: &mut iso9660::ParsedIs
             "unbacked entry already has a fixed reference: {}",
             file.path
         );
-        entry.extent = Some(file.extent);
-        entry.length = Some(file.length);
-        entry.unbacked = true;
-        entry.allocation_padding_hex = None;
+        mark_entry_unbacked(entry, file.extent, file.length);
         detached_paths.insert(file.path.clone());
     }
     parsed_iso
@@ -1275,10 +1438,7 @@ fn detach_remaining_overlapping_files(parsed_iso: &mut iso9660::ParsedIso) -> Re
             "overlapping entry already has a fixed reference: {}",
             file.path
         );
-        entry.extent = Some(file.extent);
-        entry.length = Some(file.length);
-        entry.unbacked = true;
-        entry.allocation_padding_hex = None;
+        mark_entry_unbacked(entry, file.extent, file.length);
     }
     parsed_iso
         .files
@@ -1404,21 +1564,28 @@ fn entry_file_subheader(entry: &crate::manifest::Entry, mut subheader: XaSubhead
 fn file_subheaders_are_representable(
     sectors: &[crate::raw_cd::ParsedSector],
     entry: &crate::manifest::Entry,
+    damaged: &[bool],
 ) -> bool {
-    if sectors.is_empty() || sectors.iter().any(|sector| sector.kind != Kind::Form1) {
-        return sectors.is_empty();
+    let active = sectors
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !damaged[*index])
+        .map(|(_, sector)| sector)
+        .collect::<Vec<_>>();
+    if active.is_empty() || active.iter().any(|sector| sector.kind != Kind::Form1) {
+        return active.is_empty();
     }
     let data = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
     let end_of_file = entry_file_subheader(entry, SYSTEM_END_OF_FILE_SUBHEADER);
     let metadata = entry_file_subheader(entry, ISO_METADATA_SUBHEADER);
     let matches = |index: usize, expected: XaSubheader| {
-        sectors[index].subheader == expected && sectors[index].subheader_copy == expected
+        active[index].subheader == expected && active[index].subheader_copy == expected
     };
-    let all_data = (0..sectors.len()).all(|index| matches(index, data));
-    let all_metadata = (0..sectors.len()).all(|index| matches(index, metadata));
+    let all_data = (0..active.len()).all(|index| matches(index, data));
+    let all_metadata = (0..active.len()).all(|index| matches(index, metadata));
     let data_then_final = |final_subheader| {
-        (0..sectors.len() - 1).all(|index| matches(index, data))
-            && matches(sectors.len() - 1, final_subheader)
+        (0..active.len() - 1).all(|index| matches(index, data))
+            && matches(active.len() - 1, final_subheader)
     };
     all_data || all_metadata || data_then_final(metadata) || data_then_final(end_of_file)
 }
@@ -1426,6 +1593,7 @@ fn file_subheaders_are_representable(
 fn prepare_xa_sidecars(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
+    redump_ranges: &[Range<usize>],
 ) -> Result<()> {
     let iso_paths = parsed_iso
         .manifest
@@ -1447,12 +1615,17 @@ fn prepare_xa_sidecars(
             .iter()
             .position(|entry| entry.path == file.path)
             .context("parsed file has no manifest entry")?;
+        let damaged = (start..start + count)
+            .map(|lba| redump_ranges.iter().any(|range| range.contains(&lba)))
+            .collect::<Vec<_>>();
         let observed_mixed = sectors[start..start + count]
             .iter()
-            .any(|sector| sector.kind != Kind::Form1);
+            .enumerate()
+            .any(|(index, sector)| !damaged[index] && sector.kind != Kind::Form1);
         let observed_unrepresentable = !file_subheaders_are_representable(
             &sectors[start..start + count],
             &parsed_iso.manifest.entries[entry_index],
+            &damaged,
         );
         if !observed_mixed
             && !observed_unrepresentable
@@ -1489,6 +1662,41 @@ fn prepare_xa_sidecars(
             .then_some(file.length);
     }
     Ok(())
+}
+
+fn detect_metadata_subheader(
+    sectors: &[crate::raw_cd::ParsedSector],
+    manifest: &mut crate::manifest::Iso9660,
+    redump_ranges: &[Range<usize>],
+) {
+    if sectors[16].subheader == FORM1_DATA_SUBHEADER
+        && sectors[16].subheader_copy == FORM1_DATA_SUBHEADER
+    {
+        manifest.metadata_subheader = IsoMetadataSubheader::Data;
+    } else if sectors[16].subheader == SYSTEM_END_OF_FILE_SUBHEADER
+        && sectors[16].subheader_copy == SYSTEM_END_OF_FILE_SUBHEADER
+    {
+        manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
+    } else if sectors[16].subheader == ISO_METADATA_SUBHEADER
+        && sectors[16].subheader_copy == ISO_METADATA_SUBHEADER
+    {
+        manifest.metadata_subheader = IsoMetadataSubheader::IsoMetadata;
+    } else if sectors[16].subheader == PVD_SUBHEADER && sectors[16].subheader_copy == PVD_SUBHEADER
+    {
+        let terminator_uses_pvd_framing =
+            sectors.iter().enumerate().skip(16).any(|(lba, sector)| {
+                !redump_ranges.iter().any(|range| range.contains(&lba))
+                    && sector.payload().starts_with(b"\xffCD001\x01")
+                    && sector.subheader == PVD_SUBHEADER
+                    && sector.subheader_copy == PVD_SUBHEADER
+            });
+        if terminator_uses_pvd_framing {
+            manifest.volume_terminator_subheader = VolumeTerminatorSubheader::Pvd;
+        }
+    } else if sectors[16].kind == Kind::Form1 && sectors[16].subheader == sectors[16].subheader_copy
+    {
+        manifest.metadata_framing_subheader = Some(sectors[16].subheader);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1643,12 +1851,16 @@ fn append_detected_gap(
     let base = format!("{manifest_stem}.unreferenced.{ordinal:03}");
     let paths = XaExtentAssets {
         form1: format!("{base}.XA1"),
+        form1_sha1: None,
         form2: format!("{base}.XA2"),
+        form2_sha1: None,
         index: format!("{base}.XAI"),
+        index_sha1: None,
         gap_index: sectors[start..end]
             .iter()
             .any(|sector| sector.kind == Kind::XaGap)
             .then(|| format!("{base}.XAG")),
+        gap_index_sha1: None,
     };
     let assets = demultiplex_xa_extent(&sectors[start..end], form2_edc)
         .with_context(|| format!("demultiplexing unreferenced XA extent at LBA {start}"))?;
@@ -1828,6 +2040,7 @@ pub fn extract(
             manifest_only,
             overwrite,
             include_defaults: false,
+            include_hashes: false,
         },
     )
 }
@@ -1842,10 +2055,27 @@ pub fn extract_with_options(
     let image = fs::read(image_path)
         .with_context(|| format!("reading raw image {}", image_path.display()))?;
     let source_sha1 = sha1_hex(&image);
-    let recovery = recover_known_corruption(&source_sha1, &image)
+    let redump_0x55 = detect_redump_0x55(&image);
+    let mut recovery = recover_known_corruption(&source_sha1, &image)
         .context("applying approved corruption recovery")?;
-    let (start_frame, sectors) =
-        parse_image(&recovery.semantic).context("parsing recovered semantic image")?;
+    validate_redump_0x55_runs(&redump_0x55, &recovery.patches)?;
+    if !redump_0x55.is_empty() {
+        let start_frame = raw_track_start_frame(&image)?;
+        install_redump_0x55_placeholders(
+            recovery.semantic.to_mut(),
+            start_frame,
+            image[15],
+            &redump_0x55,
+        )?;
+    }
+    let (start_frame, sectors) = parse_image(&recovery.semantic).with_context(|| {
+        if redump_0x55.is_empty() {
+            "parsing recovered semantic image".to_owned()
+        } else {
+            "Redump 0x55 zero placeholders do not leave a parseable semantic image".to_owned()
+        }
+    })?;
+    let redump_ranges = resolve_redump_0x55_ranges(start_frame, sectors.len(), &redump_0x55)?;
     ensure!(sectors.len() >= 23, "image is too small");
     let track_mode = match sectors[0].kind {
         Kind::Mode1 | Kind::Mode1Gap => TrackMode::Mode1,
@@ -1887,14 +2117,20 @@ pub fn extract_with_options(
         sector_layout,
         final_form1_subheader,
         form1_framing,
-    } = extract_system_area(&sectors[..SYSTEM_AREA_SECTORS], track_mode)?;
+    } = extract_system_area(&sectors[..SYSTEM_AREA_SECTORS], track_mode, &redump_ranges)?;
     let manifest_stem = manifest_stem(manifest_path)?;
     let system_name = format!("{manifest_stem}.system");
     let blocks = sectors
         .iter()
         .map(|sector| sector.logical_block().try_into())
         .collect::<Result<Vec<[u8; LOGICAL_BLOCK_SIZE]>, _>>()?;
-    let mut parsed_iso = iso9660::parse(&blocks)?;
+    let mut parsed_iso = iso9660::parse(&blocks).with_context(|| {
+        if redump_0x55.is_empty() {
+            "parsing ISO 9660 filesystem".to_owned()
+        } else {
+            "Redump 0x55 zero placeholders do not leave a parseable ISO 9660 filesystem; required metadata may be damaged".to_owned()
+        }
+    })?;
     if source_sha1 == "1277d46d983b237659190938c9b41014c2c7aa2f" {
         for path in ["MLB2/FE_ART/LOADING", "MLB2/FE_ART/LOADING2"] {
             let entry = parsed_iso
@@ -1915,31 +2151,16 @@ pub fn extract_with_options(
     }
     let content_end = sectors.len() - trailing_physical_gap;
     if track_mode == TrackMode::Mode2Xa {
-        if sectors[16].subheader == FORM1_DATA_SUBHEADER
-            && sectors[16].subheader_copy == FORM1_DATA_SUBHEADER
-        {
-            parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::Data;
-        } else if sectors[16].subheader == SYSTEM_END_OF_FILE_SUBHEADER
-            && sectors[16].subheader_copy == SYSTEM_END_OF_FILE_SUBHEADER
-        {
-            parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::EndOfFileData;
-        } else if sectors[16].subheader == ISO_METADATA_SUBHEADER
-            && sectors[16].subheader_copy == ISO_METADATA_SUBHEADER
-        {
-            parsed_iso.manifest.metadata_subheader = IsoMetadataSubheader::IsoMetadata;
-        } else if sectors[16].subheader == PVD_SUBHEADER
-            && sectors[16].subheader_copy == PVD_SUBHEADER
-        {
-        } else if sectors[16].kind == Kind::Form1
-            && sectors[16].subheader == sectors[16].subheader_copy
-        {
-            parsed_iso.manifest.metadata_framing_subheader = Some(sectors[16].subheader);
-        }
-        detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso)?;
+        detect_metadata_subheader(
+            &sectors[..content_end],
+            &mut parsed_iso.manifest,
+            &redump_ranges,
+        );
+        detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_mode2_2336_file_lengths(content_end, &mut parsed_iso)?;
         detach_overlapping_form2_xa_files(&sectors[..content_end], &mut parsed_iso)?;
-        prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso)?;
-        detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso)?;
+        prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
+        detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
     } else {
         for item in &mut parsed_iso.manifest.metadata_layout {
             if let MetadataLayoutItem::Gap(gap) = item {
@@ -1961,6 +2182,7 @@ pub fn extract_with_options(
             &parsed_iso,
             trailing_physical_gap,
             &detected_layout.xa_extent_ranges,
+            &redump_ranges,
         )?;
     }
     parsed_iso.manifest.files = detected_layout.items;
@@ -2036,16 +2258,19 @@ pub fn extract_with_options(
             );
         }
     }
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         track: Track {
+            sha1: None,
             mode: track_mode,
             start_msf: format_msf(start_frame)?,
             form2_edc,
             noncompliant_trailing_ecc,
+            redump_0x55,
             patches: recovery.patches,
         },
         system_area: SystemArea {
             path: system_name.clone(),
+            sha1: None,
             form1_sectors: if system_bytes.len().div_ceil(LOGICAL_BLOCK_SIZE) == form1_count {
                 Form1Sectors::Auto("auto".to_owned())
             } else {
@@ -2069,6 +2294,9 @@ pub fn extract_with_options(
         !extracted_files.contains_key(&system_name),
         "system asset path collides with an extraction asset"
     );
+    if options.include_hashes {
+        add_extracted_hashes(&mut manifest, &image, &system_bytes, &extracted_files)?;
+    }
     verify_extracted_project(&manifest, &system_bytes, &extracted_files, &image)
         .context("verifying extracted project against source image")?;
     if !options.manifest_only {
@@ -2250,7 +2478,9 @@ fn verify_canonical_against_source(
                 .position(|(canonical, source)| canonical != source)
                 .expect("different sectors have a differing byte");
             anyhow::bail!(
-                "unexplained reconstruction difference at sector {index}, byte {relative}"
+                "unexplained reconstruction difference at sector {index}, byte {relative}: canonical {:02x}, source {:02x}",
+                canonical[start + relative],
+                source[start + relative]
             );
         }
     }
@@ -2279,6 +2509,7 @@ struct ExtractedSystemArea {
 fn extract_system_area(
     sectors: &[crate::raw_cd::ParsedSector],
     track_mode: TrackMode,
+    redump_ranges: &[Range<usize>],
 ) -> Result<ExtractedSystemArea> {
     ensure!(
         sectors.len() == SYSTEM_AREA_SECTORS,
@@ -2341,7 +2572,9 @@ fn extract_system_area(
     let mut form1_framing = Vec::new();
     if track_mode == TrackMode::Mode2Xa {
         for (index, sector) in sectors.iter().enumerate() {
-            if sector.kind != Kind::Form1 {
+            if sector.kind != Kind::Form1
+                || redump_ranges.iter().any(|range| range.contains(&index))
+            {
                 continue;
             }
             let expected = if Some(index) == final_form1_index
@@ -2459,6 +2692,7 @@ fn validate_track_structure(
     manifest: &Manifest,
     system_sector_layout: &[SystemAreaSectorKind],
 ) -> Result<()> {
+    validate_redump_0x55_runs(&manifest.track.redump_0x55, &manifest.track.patches)?;
     let file_gap_kinds = manifest
         .iso9660
         .files
@@ -2498,6 +2732,8 @@ fn validate_track_structure(
             ensure!(
                 manifest.iso9660.metadata_subheader == IsoMetadataSubheader::Canonical
                     && manifest.iso9660.metadata_framing_subheader.is_none()
+                    && manifest.iso9660.volume_terminator_subheader
+                        == VolumeTerminatorSubheader::Metadata
                     && manifest.iso9660.path_table_subheader == EntrySectorSubheader::Canonical
                     && manifest.iso9660.path_table_framing_subheader.is_none(),
                 "XA metadata framing is not applicable to Mode 1 tracks"
@@ -2565,6 +2801,7 @@ fn path_table_subheader(
 fn detect_path_table_subheader(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
+    redump_ranges: &[Range<usize>],
 ) -> Result<()> {
     let Some(path_tables) = &parsed_iso.path_tables else {
         return Ok(());
@@ -2584,6 +2821,9 @@ fn detect_path_table_subheader(
                     let Ok(lba) = usize::try_from(*extent + block_index) else {
                         return false;
                     };
+                    if redump_ranges.iter().any(|range| range.contains(&lba)) {
+                        return true;
+                    }
                     let Some(sector) = sectors.get(lba) else {
                         return false;
                     };
@@ -2606,6 +2846,9 @@ fn detect_path_table_subheader(
                 let Ok(lba) = usize::try_from(*extent + block_index) else {
                     return false;
                 };
+                if redump_ranges.iter().any(|range| range.contains(&lba)) {
+                    return true;
+                }
                 let Some(sector) = sectors.get(lba) else {
                     return false;
                 };
@@ -2631,6 +2874,7 @@ fn detect_path_table_subheader(
 fn detect_entry_sector_subheaders(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
+    redump_ranges: &[Range<usize>],
 ) -> Result<()> {
     for file in &parsed_iso.files {
         let entry = parsed_iso
@@ -2649,23 +2893,29 @@ fn detect_entry_sector_subheaders(
         let start = usize::try_from(file.extent)?;
         let final_lba = start + blocks - 1;
         ensure!(final_lba < sectors.len(), "file extent is outside image");
-        let sector = &sectors[final_lba];
+        let active = (start..=final_lba)
+            .filter(|lba| !redump_ranges.iter().any(|range| range.contains(lba)))
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            continue;
+        }
         let data_subheader = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
         let end_of_file_subheader = entry_file_subheader(entry, SYSTEM_END_OF_FILE_SUBHEADER);
         let metadata_subheader = entry_file_subheader(entry, ISO_METADATA_SUBHEADER);
-        if blocks > 1
-            && sectors[start..=final_lba].iter().all(|sector| {
-                sector.subheader == metadata_subheader
-                    && sector.subheader_copy == metadata_subheader
-            })
-        {
+        if active.iter().all(|lba| {
+            let sector = &sectors[*lba];
+            sector.subheader == metadata_subheader && sector.subheader_copy == metadata_subheader
+        }) {
             entry.sector_subheader = EntrySectorSubheader::IsoMetadata;
-        } else if sector.subheader == data_subheader && sector.subheader_copy == data_subheader {
-            entry.sector_subheader = EntrySectorSubheader::Data;
-        } else if sector.subheader == end_of_file_subheader
-            && sector.subheader_copy == end_of_file_subheader
-        {
-            entry.sector_subheader = EntrySectorSubheader::EndOfFileData;
+        } else if active.contains(&final_lba) {
+            let sector = &sectors[final_lba];
+            if sector.subheader == data_subheader && sector.subheader_copy == data_subheader {
+                entry.sector_subheader = EntrySectorSubheader::Data;
+            } else if sector.subheader == end_of_file_subheader
+                && sector.subheader_copy == end_of_file_subheader
+            {
+                entry.sector_subheader = EntrySectorSubheader::EndOfFileData;
+            }
         }
     }
     for directory in &parsed_iso.directories {
@@ -2684,66 +2934,63 @@ fn detect_entry_sector_subheaders(
             start + blocks <= sectors.len(),
             "directory extent is outside image"
         );
-        let directory_sectors = &sectors[start..start + blocks];
+        let active = (start..start + blocks)
+            .filter(|lba| !redump_ranges.iter().any(|range| range.contains(lba)))
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            continue;
+        }
         let data_subheader = entry_file_subheader(entry, FORM1_DATA_SUBHEADER);
         let end_of_file_subheader = entry_file_subheader(entry, SYSTEM_END_OF_FILE_SUBHEADER);
         let metadata_subheader = entry_file_subheader(entry, ISO_METADATA_SUBHEADER);
-        if directory_sectors.iter().all(|sector| {
-            sector.subheader == data_subheader && sector.subheader_copy == data_subheader
-        }) {
+        let matches = |lba: usize, expected: XaSubheader| {
+            sectors[lba].subheader == expected && sectors[lba].subheader_copy == expected
+        };
+        let final_lba = start + blocks - 1;
+        if active.iter().all(|lba| matches(*lba, data_subheader)) && active.contains(&final_lba) {
             entry.sector_subheader = EntrySectorSubheader::Data;
-        } else if blocks > 0
-            && directory_sectors[..blocks - 1].iter().all(|sector| {
-                sector.subheader == data_subheader && sector.subheader_copy == data_subheader
-            })
-            && directory_sectors[blocks - 1].subheader == end_of_file_subheader
-            && directory_sectors[blocks - 1].subheader_copy == end_of_file_subheader
+        } else if active.contains(&final_lba)
+            && active
+                .iter()
+                .filter(|lba| **lba != final_lba)
+                .all(|lba| matches(*lba, data_subheader))
+            && matches(final_lba, end_of_file_subheader)
         {
             entry.sector_subheader = EntrySectorSubheader::EndOfFileData;
-        } else if blocks > 1
-            && directory_sectors[..blocks - 1].iter().all(|sector| {
-                sector.subheader == data_subheader && sector.subheader_copy == data_subheader
-            })
-            && directory_sectors[blocks - 1].subheader == metadata_subheader
-            && directory_sectors[blocks - 1].subheader_copy == metadata_subheader
+        } else if active.contains(&final_lba)
+            && active
+                .iter()
+                .filter(|lba| **lba != final_lba)
+                .all(|lba| matches(*lba, data_subheader))
+            && matches(final_lba, metadata_subheader)
         {
             entry.sector_subheader = EntrySectorSubheader::DataUntilFinal;
-        } else if let Some(first) = directory_sectors.first()
-            && first.kind == Kind::Form1
-            && first.subheader == first.subheader_copy
-            && first.subheader != metadata_subheader
+        } else if let Some(first_lba) = active.first().copied()
+            && sectors[first_lba].kind == Kind::Form1
+            && sectors[first_lba].subheader == sectors[first_lba].subheader_copy
+            && sectors[first_lba].subheader != metadata_subheader
         {
-            let custom = first.subheader;
-            let prefix_matches =
-                directory_sectors[..blocks.saturating_sub(1)]
-                    .iter()
-                    .all(|sector| {
-                        sector.kind == Kind::Form1
-                            && sector.subheader == custom
-                            && sector.subheader_copy == custom
-                    });
-            let final_sector = &directory_sectors[blocks - 1];
-            let policy = if directory_sectors.iter().all(|sector| {
-                sector.kind == Kind::Form1
-                    && sector.subheader == custom
-                    && sector.subheader_copy == custom
-            }) {
-                Some(EntrySectorSubheader::Data)
-            } else if blocks > 1
-                && prefix_matches
-                && final_sector.subheader == end_of_file_subheader
-                && final_sector.subheader_copy == end_of_file_subheader
-            {
-                Some(EntrySectorSubheader::EndOfFileData)
-            } else if blocks > 1
-                && prefix_matches
-                && final_sector.subheader == metadata_subheader
-                && final_sector.subheader_copy == metadata_subheader
-            {
-                Some(EntrySectorSubheader::DataUntilFinal)
-            } else {
-                None
-            };
+            let custom = sectors[first_lba].subheader;
+            let prefix_matches = active
+                .iter()
+                .filter(|lba| **lba != final_lba)
+                .all(|lba| matches(*lba, custom));
+            let policy =
+                if active.contains(&final_lba) && active.iter().all(|lba| matches(*lba, custom)) {
+                    Some(EntrySectorSubheader::Data)
+                } else if active.contains(&final_lba)
+                    && prefix_matches
+                    && matches(final_lba, end_of_file_subheader)
+                {
+                    Some(EntrySectorSubheader::EndOfFileData)
+                } else if prefix_matches
+                    && (active.contains(&final_lba) && matches(final_lba, metadata_subheader)
+                        || !active.contains(&final_lba))
+                {
+                    Some(EntrySectorSubheader::DataUntilFinal)
+                } else {
+                    None
+                };
             if let Some(policy) = policy {
                 entry.sector_subheader = policy;
                 entry
@@ -2762,7 +3009,7 @@ fn validate_iso_subheaders(
     parsed_iso: &iso9660::ParsedIso,
     trailing_gap: usize,
 ) -> Result<()> {
-    validate_iso_subheaders_with_xa_extents(sectors, parsed_iso, trailing_gap, &[])
+    validate_iso_subheaders_with_xa_extents(sectors, parsed_iso, trailing_gap, &[], &[])
 }
 
 fn validate_iso_subheaders_with_xa_extents(
@@ -2770,6 +3017,7 @@ fn validate_iso_subheaders_with_xa_extents(
     parsed_iso: &iso9660::ParsedIso,
     trailing_gap: usize,
     xa_extent_ranges: &[Range<usize>],
+    redump_ranges: &[Range<usize>],
 ) -> Result<()> {
     let content_end = sectors
         .len()
@@ -2923,7 +3171,9 @@ fn validate_iso_subheaders_with_xa_extents(
     }
 
     for (lba, sector) in sectors.iter().enumerate().take(content_end).skip(16) {
-        if xa_extent_ranges.iter().any(|range| range.contains(&lba)) {
+        if xa_extent_ranges.iter().any(|range| range.contains(&lba))
+            || redump_ranges.iter().any(|range| range.contains(&lba))
+        {
             continue;
         }
         if parsed_iso.metadata_gaps.iter().any(|gap| {
@@ -2969,6 +3219,7 @@ fn validate_iso_subheaders_with_xa_extents(
             && sector.payload()[1..6] == *b"CD001"
             && sector.payload()[6] == 1;
         let volume_descriptor = primary_descriptor || supplementary_descriptor;
+        let volume_terminator = sector.payload().starts_with(b"\xffCD001\x01");
         let expected = if volume_descriptor {
             parsed_iso.manifest.metadata_framing_subheader.unwrap_or(
                 match parsed_iso.manifest.metadata_subheader {
@@ -2978,6 +3229,10 @@ fn validate_iso_subheaders_with_xa_extents(
                     IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
                 },
             )
+        } else if volume_terminator
+            && parsed_iso.manifest.volume_terminator_subheader == VolumeTerminatorSubheader::Pvd
+        {
+            PVD_SUBHEADER
         } else if let Some((is_last, interleaved, policy, file_number)) = file_sector_info.get(&lba)
         {
             if *interleaved {
@@ -3083,6 +3338,7 @@ pub fn build_with_options(
     let yaml = fs::read_to_string(manifest_path)
         .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
     let manifest: Manifest = yaml_serde::from_str(&yaml).context("parsing manifest")?;
+    validate_manifest_hashes(&manifest).context("validating manifest SHA-1 metadata")?;
     ensure!(
         matches!(manifest.track.mode, TrackMode::Mode1 | TrackMode::Mode2Xa),
         "unsupported track mode {}",
@@ -3101,6 +3357,15 @@ pub fn build_with_options(
     let system_path = safe_join(data_dir, &manifest.system_area.path)?;
     let system = fs::read(&system_path)
         .with_context(|| format!("reading system asset {}", system_path.display()))?;
+    let mut sha1_mismatches = Vec::new();
+    record_sha1_mismatch(
+        &mut sha1_mismatches,
+        Sha1Target::SystemArea {
+            path: manifest.system_area.path.clone(),
+        },
+        manifest.system_area.sha1.as_deref(),
+        &system,
+    );
     let form1_count = manifest.system_area.form1_sectors.resolve(system.len())?;
     let system_sector_layout =
         expand_system_area_sector_layout(&manifest.system_area, form1_count)?;
@@ -3143,11 +3408,11 @@ pub fn build_with_options(
         .map(|entry| entry.path.as_str())
         .collect();
     let mut secondary_paths = HashSet::new();
-    for file in manifest
+    for (file, ordinary_sha1) in manifest
         .iso9660
         .files
         .iter()
-        .filter_map(FileLayoutItem::as_path)
+        .filter_map(FileLayoutItem::as_path_with_sha1)
     {
         let entry = entries_by_path[file];
         if entry_uses_xa_sidecar(entry) {
@@ -3159,10 +3424,10 @@ pub fn build_with_options(
             let form2_path = xa.form2.as_deref().context("missing XA2 asset path")?;
             let index_path = xa.index.as_deref().context("missing XAI asset path")?;
             let mut assets = Vec::new();
-            for (asset, label) in [
-                (form1_path, "XA1"),
-                (form2_path, "XA2"),
-                (index_path, "XAI"),
+            for (asset, label, expected_sha1) in [
+                (form1_path, "XA1", xa.form1_sha1.as_deref()),
+                (form2_path, "XA2", xa.form2_sha1.as_deref()),
+                (index_path, "XAI", xa.index_sha1.as_deref()),
             ] {
                 ensure!(
                     secondary_paths.insert(asset),
@@ -3174,11 +3439,17 @@ pub fn build_with_options(
                 );
                 let host_path = safe_join(data_dir, asset)?;
                 validate_input_file(&host_path, label)?;
-                assets.push(
-                    fs::read(&host_path).with_context(|| {
-                        format!("reading {label} asset {}", host_path.display())
-                    })?,
+                let data = fs::read(&host_path)
+                    .with_context(|| format!("reading {label} asset {}", host_path.display()))?;
+                record_sha1_mismatch(
+                    &mut sha1_mismatches,
+                    Sha1Target::Asset {
+                        path: asset.to_owned(),
+                    },
+                    expected_sha1,
+                    &data,
                 );
+                assets.push(data);
             }
             let gap_index = if let Some(asset) = xa.gap_index.as_deref() {
                 ensure!(
@@ -3191,8 +3462,17 @@ pub fn build_with_options(
                 );
                 let host_path = safe_join(data_dir, asset)?;
                 validate_input_file(&host_path, "XAG")?;
-                fs::read(&host_path)
-                    .with_context(|| format!("reading XAG asset {}", host_path.display()))?
+                let data = fs::read(&host_path)
+                    .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
+                record_sha1_mismatch(
+                    &mut sha1_mismatches,
+                    Sha1Target::Asset {
+                        path: asset.to_owned(),
+                    },
+                    xa.gap_index_sha1.as_deref(),
+                    &data,
+                );
+                data
             } else {
                 Vec::new()
             };
@@ -3215,6 +3495,14 @@ pub fn build_with_options(
             let path = safe_join(data_dir, file)?;
             let data = fs::read(&path)
                 .with_context(|| format!("reading authored file {}", path.display()))?;
+            record_sha1_mismatch(
+                &mut sha1_mismatches,
+                Sha1Target::Asset {
+                    path: file.to_owned(),
+                },
+                ordinary_sha1,
+                &data,
+            );
             file_lengths.insert(file.to_owned(), u64::try_from(data.len())?);
             file_data.insert(file.to_owned(), data);
         }
@@ -3226,10 +3514,10 @@ pub fn build_with_options(
         .filter_map(FileLayoutItem::as_xa_extent)
     {
         let mut data = Vec::new();
-        for (asset, label) in [
-            (assets.form1.as_str(), "XA1"),
-            (assets.form2.as_str(), "XA2"),
-            (assets.index.as_str(), "XAI"),
+        for (asset, label, expected_sha1) in [
+            (assets.form1.as_str(), "XA1", assets.form1_sha1.as_deref()),
+            (assets.form2.as_str(), "XA2", assets.form2_sha1.as_deref()),
+            (assets.index.as_str(), "XAI", assets.index_sha1.as_deref()),
         ] {
             ensure!(
                 secondary_paths.insert(asset),
@@ -3241,10 +3529,17 @@ pub fn build_with_options(
             );
             let host_path = safe_join(data_dir, asset)?;
             validate_input_file(&host_path, label)?;
-            data.push(
-                fs::read(&host_path)
-                    .with_context(|| format!("reading {label} asset {}", host_path.display()))?,
+            let bytes = fs::read(&host_path)
+                .with_context(|| format!("reading {label} asset {}", host_path.display()))?;
+            record_sha1_mismatch(
+                &mut sha1_mismatches,
+                Sha1Target::Asset {
+                    path: asset.to_owned(),
+                },
+                expected_sha1,
+                &bytes,
             );
+            data.push(bytes);
         }
         let gap_index = if let Some(asset) = assets.gap_index.as_deref() {
             ensure!(
@@ -3257,8 +3552,17 @@ pub fn build_with_options(
             );
             let host_path = safe_join(data_dir, asset)?;
             validate_input_file(&host_path, "XAG")?;
-            fs::read(&host_path)
-                .with_context(|| format!("reading XAG asset {}", host_path.display()))?
+            let data = fs::read(&host_path)
+                .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
+            record_sha1_mismatch(
+                &mut sha1_mismatches,
+                Sha1Target::Asset {
+                    path: asset.to_owned(),
+                },
+                assets.gap_index_sha1.as_deref(),
+                &data,
+            );
+            data
         } else {
             Vec::new()
         };
@@ -3467,6 +3771,7 @@ pub fn build_with_options(
             && layout.blocks[usize::try_from(lba)?][1..6] == *b"CD001"
             && layout.blocks[usize::try_from(lba)?][6] == 1;
         let volume_descriptor = primary_descriptor || supplementary_descriptor;
+        let volume_terminator = layout.blocks[usize::try_from(lba)?].starts_with(b"\xffCD001\x01");
         let mut subheader = if let Some(subheader) = framing_subheader {
             subheader
         } else if volume_descriptor {
@@ -3478,6 +3783,10 @@ pub fn build_with_options(
                     IsoMetadataSubheader::IsoMetadata => ISO_METADATA_SUBHEADER,
                 },
             )
+        } else if volume_terminator
+            && manifest.iso9660.volume_terminator_subheader == VolumeTerminatorSubheader::Pvd
+        {
+            PVD_SUBHEADER
         } else if layout.data_subheader_sectors.contains(&lba) {
             FORM1_DATA_SUBHEADER
         } else if layout.end_of_file_data_subheader_sectors.contains(&lba) {
@@ -3541,12 +3850,27 @@ pub fn build_with_options(
         raw.extend_from_slice(&sector);
     }
 
+    apply_redump_0x55(&mut raw, start_frame, &manifest.track.redump_0x55)
+        .context("applying structural Redump 0x55 runs")?;
+
     if options.apply_patches {
         apply_sector_patches(&mut raw, start_frame, &manifest.track.patches)
             .context("applying raw-sector patches")?;
     }
 
     let sha1 = sha1_hex(&raw);
+    if manifest
+        .track
+        .sha1
+        .as_deref()
+        .is_some_and(|expected| !sha1.eq_ignore_ascii_case(expected))
+    {
+        sha1_mismatches.push(Sha1Mismatch {
+            target: Sha1Target::Track,
+            expected: manifest.track.sha1.clone().expect("checked track SHA-1"),
+            actual: sha1.clone(),
+        });
+    }
     create_output_parent(image_path, "image output")?;
     let mut output = OpenOptions::new()
         .write(true)
@@ -3560,6 +3884,7 @@ pub fn build_with_options(
     Ok(BuildReport {
         sectors: layout.volume_blocks,
         sha1,
+        sha1_mismatches,
     })
 }
 
@@ -3715,6 +4040,219 @@ fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(Sha1::digest(bytes))
 }
 
+fn validate_sha1_value(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{label} must be a 40-character hexadecimal SHA-1"
+    );
+    Ok(())
+}
+
+fn validate_optional_sha1(value: Option<&str>, label: &str) -> Result<()> {
+    if let Some(value) = value {
+        validate_sha1_value(value, label)?;
+    }
+    Ok(())
+}
+
+fn validate_xa_asset_hashes(xa: &crate::manifest::EntryXa, owner: &str) -> Result<()> {
+    for (path, sha1, label) in [
+        (xa.form1.as_deref(), xa.form1_sha1.as_deref(), "form1_sha1"),
+        (xa.form2.as_deref(), xa.form2_sha1.as_deref(), "form2_sha1"),
+        (xa.index.as_deref(), xa.index_sha1.as_deref(), "index_sha1"),
+        (
+            xa.gap_index.as_deref(),
+            xa.gap_index_sha1.as_deref(),
+            "gap_index_sha1",
+        ),
+    ] {
+        ensure!(
+            sha1.is_none() || path.is_some(),
+            "{owner} {label} requires its corresponding asset path"
+        );
+        validate_optional_sha1(sha1, &format!("{owner} {label}"))?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
+    validate_optional_sha1(manifest.track.sha1.as_deref(), "track sha1")?;
+    validate_optional_sha1(manifest.system_area.sha1.as_deref(), "system-area sha1")?;
+    let entries_by_path = manifest
+        .iso9660
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    for item in &manifest.iso9660.files {
+        match item {
+            FileLayoutItem::Path(file) => {
+                validate_optional_sha1(file.sha1.as_deref(), &format!("asset {} sha1", file.path))?;
+                if file.sha1.is_some()
+                    && entries_by_path
+                        .get(file.path.as_str())
+                        .is_some_and(|entry| entry_uses_xa_sidecar(entry))
+                {
+                    anyhow::bail!(
+                        "indexed XA file {} cannot declare an ordinary-file sha1",
+                        file.path
+                    );
+                }
+            }
+            FileLayoutItem::XaExtent(item) => {
+                let assets = &item.xa_extent;
+                for (path, sha1, label) in [
+                    (
+                        Some(assets.form1.as_str()),
+                        assets.form1_sha1.as_deref(),
+                        "form1_sha1",
+                    ),
+                    (
+                        Some(assets.form2.as_str()),
+                        assets.form2_sha1.as_deref(),
+                        "form2_sha1",
+                    ),
+                    (
+                        Some(assets.index.as_str()),
+                        assets.index_sha1.as_deref(),
+                        "index_sha1",
+                    ),
+                    (
+                        assets.gap_index.as_deref(),
+                        assets.gap_index_sha1.as_deref(),
+                        "gap_index_sha1",
+                    ),
+                ] {
+                    ensure!(
+                        sha1.is_none() || path.is_some(),
+                        "unreferenced XA {label} requires its corresponding asset path"
+                    );
+                    validate_optional_sha1(sha1, &format!("unreferenced XA {label}"))?;
+                }
+            }
+            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+        }
+    }
+    for entry in &manifest.iso9660.entries {
+        if let Some(xa) = &entry.xa {
+            validate_xa_asset_hashes(xa, &format!("entry {}", entry.path))?;
+        }
+        if let Some(xa) = &entry.directory_self_xa {
+            validate_xa_asset_hashes(xa, &format!("entry {} directory_self_xa", entry.path))?;
+        }
+    }
+    for volume in &manifest.iso9660.supplementary_volumes {
+        for entry in &volume.entries {
+            if let Some(xa) = &entry.xa {
+                validate_xa_asset_hashes(xa, &format!("Joliet entry {}", entry.path))?;
+            }
+            if let Some(xa) = &entry.directory_self_xa {
+                validate_xa_asset_hashes(
+                    xa,
+                    &format!("Joliet entry {} directory_self_xa", entry.path),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_sha1_mismatch(
+    mismatches: &mut Vec<Sha1Mismatch>,
+    target: Sha1Target,
+    expected: Option<&str>,
+    bytes: &[u8],
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    let actual = sha1_hex(bytes);
+    if !actual.eq_ignore_ascii_case(expected) {
+        mismatches.push(Sha1Mismatch {
+            target,
+            expected: expected.to_owned(),
+            actual,
+        });
+    }
+}
+
+fn set_extracted_asset_sha1(
+    path: &str,
+    destination: &mut Option<String>,
+    assets: &HashMap<String, Vec<u8>>,
+    hashed_paths: &mut HashSet<String>,
+) -> Result<()> {
+    let bytes = assets
+        .get(path)
+        .with_context(|| format!("missing extracted asset {path} while hashing"))?;
+    *destination = Some(sha1_hex(bytes));
+    ensure!(
+        hashed_paths.insert(path.to_owned()),
+        "duplicate extracted asset hash path {path}"
+    );
+    Ok(())
+}
+
+fn add_extracted_hashes(
+    manifest: &mut Manifest,
+    source: &[u8],
+    system: &[u8],
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<()> {
+    manifest.track.sha1 = Some(sha1_hex(source));
+    manifest.system_area.sha1 = Some(sha1_hex(system));
+    let indexed_paths = manifest
+        .iso9660
+        .entries
+        .iter()
+        .filter(|entry| entry_uses_xa_sidecar(entry))
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let mut hashed_paths = HashSet::new();
+    for item in &mut manifest.iso9660.files {
+        match item {
+            FileLayoutItem::Path(file) if !indexed_paths.contains(&file.path) => {
+                set_extracted_asset_sha1(&file.path, &mut file.sha1, assets, &mut hashed_paths)?;
+            }
+            FileLayoutItem::XaExtent(item) => {
+                let xa = &mut item.xa_extent;
+                set_extracted_asset_sha1(&xa.form1, &mut xa.form1_sha1, assets, &mut hashed_paths)?;
+                set_extracted_asset_sha1(&xa.form2, &mut xa.form2_sha1, assets, &mut hashed_paths)?;
+                set_extracted_asset_sha1(&xa.index, &mut xa.index_sha1, assets, &mut hashed_paths)?;
+                if let Some(path) = xa.gap_index.as_deref() {
+                    set_extracted_asset_sha1(
+                        path,
+                        &mut xa.gap_index_sha1,
+                        assets,
+                        &mut hashed_paths,
+                    )?;
+                }
+            }
+            FileLayoutItem::Path(_) | FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+        }
+    }
+    for entry in &mut manifest.iso9660.entries {
+        let Some(xa) = entry.xa.as_mut().filter(|xa| xa.form1.is_some()) else {
+            continue;
+        };
+        for (path, destination) in [
+            (xa.form1.as_deref(), &mut xa.form1_sha1),
+            (xa.form2.as_deref(), &mut xa.form2_sha1),
+            (xa.index.as_deref(), &mut xa.index_sha1),
+            (xa.gap_index.as_deref(), &mut xa.gap_index_sha1),
+        ] {
+            if let Some(path) = path {
+                set_extracted_asset_sha1(path, destination, assets, &mut hashed_paths)?;
+            }
+        }
+    }
+    ensure!(
+        hashed_paths.len() == assets.len() && assets.keys().all(|path| hashed_paths.contains(path)),
+        "not every extracted host asset received a SHA-1"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3803,6 +4341,137 @@ mod tests {
             );
         }
         raw
+    }
+
+    fn redump_test_image(mode: TrackMode) -> Vec<u8> {
+        let mut writer = SectorWriter::new();
+        let mut raw = Vec::new();
+        for index in 0..4 {
+            let sector = match mode {
+                TrackMode::Mode1 => writer
+                    .mode1(150 + index, &[index as u8; LOGICAL_BLOCK_SIZE])
+                    .unwrap(),
+                TrackMode::Mode2Xa => writer
+                    .form1(
+                        150 + index,
+                        FORM1_DATA_SUBHEADER,
+                        &[index as u8; LOGICAL_BLOCK_SIZE],
+                    )
+                    .unwrap(),
+                TrackMode::Mode2 => unreachable!(),
+            };
+            raw.extend_from_slice(&sector);
+        }
+        for index in 1..3 {
+            raw[index * RAW_SECTOR_SIZE + 16..(index + 1) * RAW_SECTOR_SIZE].fill(0x55);
+        }
+        raw
+    }
+
+    #[test]
+    fn redump_0x55_detection_is_exact_for_mode1_and_mode2() {
+        for mode in [TrackMode::Mode1, TrackMode::Mode2Xa] {
+            let raw = redump_test_image(mode);
+            assert_eq!(
+                detect_redump_0x55(&raw),
+                vec![Redump0x55Run { lba: 1, sectors: 2 }]
+            );
+        }
+    }
+
+    #[test]
+    fn redump_0x55_near_matches_are_not_detected() {
+        let exact = redump_test_image(TrackMode::Mode1);
+        for (offset, value) in [
+            (RAW_SECTOR_SIZE, 1),
+            (RAW_SECTOR_SIZE + 12, 0x99),
+            (RAW_SECTOR_SIZE + 15, 2),
+            (RAW_SECTOR_SIZE + 100, 0x54),
+        ] {
+            let mut raw = exact.clone();
+            raw[offset] = value;
+            assert_eq!(
+                detect_redump_0x55(&raw),
+                vec![Redump0x55Run { lba: 2, sectors: 1 }]
+            );
+        }
+    }
+
+    #[test]
+    fn redump_0x55_placeholders_and_generation_preserve_sector_headers() {
+        for (mode, raw_mode, expected_kind) in [
+            (TrackMode::Mode1, 1, Kind::Mode1Gap),
+            (TrackMode::Mode2Xa, 2, Kind::Form1),
+        ] {
+            let mut raw = redump_test_image(mode);
+            let header = raw[RAW_SECTOR_SIZE..RAW_SECTOR_SIZE + 16].to_vec();
+            let runs = detect_redump_0x55(&raw);
+            install_redump_0x55_placeholders(&mut raw, 150, raw_mode, &runs).unwrap();
+            let sectors = parse_image(&raw).unwrap().1;
+            assert_eq!(sectors[1].kind, expected_kind);
+            assert_eq!(sectors[1].logical_block(), &[0; LOGICAL_BLOCK_SIZE]);
+            if mode == TrackMode::Mode2Xa {
+                assert_eq!(sectors[1].subheader, FORM1_DATA_SUBHEADER);
+            }
+
+            apply_redump_0x55(&mut raw, 150, &runs).unwrap();
+            assert_eq!(&raw[RAW_SECTOR_SIZE..RAW_SECTOR_SIZE + 16], &header);
+            assert!(
+                raw[RAW_SECTOR_SIZE + 16..2 * RAW_SECTOR_SIZE]
+                    .iter()
+                    .all(|byte| *byte == 0x55)
+            );
+        }
+    }
+
+    #[test]
+    fn redump_0x55_runs_are_strictly_validated() {
+        let valid = [Redump0x55Run {
+            lba: -74,
+            sectors: 1,
+        }];
+        validate_redump_0x55_runs(&valid, &[]).unwrap();
+        let ranges = resolve_redump_0x55_ranges(75, 2, &valid).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 1..2);
+
+        for invalid in [
+            vec![Redump0x55Run { lba: 0, sectors: 0 }],
+            vec![
+                Redump0x55Run { lba: 2, sectors: 1 },
+                Redump0x55Run { lba: 1, sectors: 1 },
+            ],
+            vec![
+                Redump0x55Run { lba: 1, sectors: 2 },
+                Redump0x55Run { lba: 2, sectors: 1 },
+            ],
+            vec![
+                Redump0x55Run { lba: 1, sectors: 1 },
+                Redump0x55Run { lba: 2, sectors: 1 },
+            ],
+        ] {
+            assert!(validate_redump_0x55_runs(&invalid, &[]).is_err());
+        }
+
+        let patch = SectorPatch {
+            lba: -74,
+            hex: format_sector_patch_hex(&[0; RAW_SECTOR_SIZE]),
+        };
+        assert!(validate_redump_0x55_runs(&valid, &[patch]).is_err());
+        assert!(
+            resolve_redump_0x55_ranges(
+                150,
+                2,
+                &[Redump0x55Run {
+                    lba: -1,
+                    sectors: 1
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_redump_0x55_ranges(150, 2, &[Redump0x55Run { lba: 2, sectors: 1 }]).is_err()
+        );
     }
 
     #[test]
@@ -4013,7 +4682,7 @@ mod tests {
         }
 
         let mut sectors = parse_image(&raw).unwrap().1;
-        let extracted = extract_system_area(&sectors, TrackMode::Mode2Xa).unwrap();
+        let extracted = extract_system_area(&sectors, TrackMode::Mode2Xa, &[]).unwrap();
         assert_eq!(extracted.content, vec![7]);
         assert_eq!(extracted.form1_count, 12);
         assert!(extracted.form2_edc);
@@ -4026,7 +4695,7 @@ mod tests {
         sectors[11].subheader = SYSTEM_END_OF_FILE_SUBHEADER;
         sectors[11].subheader_copy = SYSTEM_END_OF_FILE_SUBHEADER;
         assert_eq!(
-            extract_system_area(&sectors, TrackMode::Mode2Xa)
+            extract_system_area(&sectors, TrackMode::Mode2Xa, &[])
                 .unwrap()
                 .final_form1_subheader,
             SystemAreaFinalSubheader::EndOfFileData
@@ -4040,7 +4709,7 @@ mod tests {
         sectors[11].subheader = custom.subheader;
         sectors[11].subheader_copy = custom.subheader_copy;
         assert_eq!(
-            extract_system_area(&sectors, TrackMode::Mode2Xa)
+            extract_system_area(&sectors, TrackMode::Mode2Xa, &[])
                 .unwrap()
                 .form1_framing,
             vec![custom]
@@ -4048,7 +4717,7 @@ mod tests {
 
         sectors[9].subheader_copy.coding_info = 33;
         assert_eq!(
-            extract_system_area(&sectors, TrackMode::Mode2Xa)
+            extract_system_area(&sectors, TrackMode::Mode2Xa, &[])
                 .unwrap()
                 .form1_framing
                 .iter()
@@ -4081,7 +4750,7 @@ mod tests {
         }
 
         let sectors = parse_image(&raw).unwrap().1;
-        let extracted = extract_system_area(&sectors, TrackMode::Mode2Xa).unwrap();
+        let extracted = extract_system_area(&sectors, TrackMode::Mode2Xa, &[]).unwrap();
 
         assert_eq!(extracted.content, vec![7]);
         assert_eq!(extracted.form1_count, 8);
@@ -4197,6 +4866,48 @@ mod tests {
     }
 
     #[test]
+    fn redump_0x55_placeholder_keeps_an_indexed_xa_position() {
+        let mut writer = SectorWriter::new();
+        let mut damaged = Vec::new();
+        for index in 0..3 {
+            damaged.extend_from_slice(
+                &writer
+                    .form2(
+                        150 + index,
+                        FORM2_SUBHEADER,
+                        &[index as u8; FORM2_PAYLOAD_SIZE],
+                        true,
+                    )
+                    .unwrap(),
+            );
+        }
+        damaged[RAW_SECTOR_SIZE + 16..2 * RAW_SECTOR_SIZE].fill(0x55);
+        let runs = detect_redump_0x55(&damaged);
+        let mut semantic = damaged.clone();
+        install_redump_0x55_placeholders(&mut semantic, 150, 2, &runs).unwrap();
+        let sectors = parse_image(&semantic).unwrap().1;
+        let assets = demultiplex_xa_extent(&sectors, true).unwrap();
+
+        assert_eq!(parse_xa_index(&assets.form2_index).unwrap(), vec![0, 2]);
+        assert_eq!(assets.form1.len(), XA_FORM1_RECORD_SIZE);
+        assert!(assets.form1[8..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            multiplex_xa_extent(
+                &assets.form1,
+                &assets.form2,
+                &assets.form2_index,
+                &assets.gap_index,
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+
+        apply_redump_0x55(&mut semantic, 150, &runs).unwrap();
+        assert_eq!(semantic, damaged);
+    }
+
+    #[test]
     fn xa_sidecars_preserve_structured_gap_positions() {
         let sectors = vec![
             parsed_xa_sector(false, 1),
@@ -4250,7 +4961,7 @@ mod tests {
         sectors[17] = parsed_xa_sector(true, 1);
         let mut parsed = parsed_iso();
 
-        prepare_xa_sidecars(&sectors, &mut parsed).unwrap();
+        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
         let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
         assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
@@ -4267,7 +4978,7 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.files[0].length = 1;
 
-        prepare_xa_sidecars(&sectors, &mut parsed).unwrap();
+        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
         let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
         assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
@@ -4291,6 +5002,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4309,7 +5021,7 @@ mod tests {
 
         detect_mode2_2336_file_lengths(sectors.len(), &mut parsed).unwrap();
         detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
-        prepare_xa_sidecars(&sectors, &mut parsed).unwrap();
+        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed
@@ -4507,7 +5219,7 @@ mod tests {
             },
         ];
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
@@ -4601,6 +5313,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: Some(crate::manifest::EntryXa {
                 attributes: Some(crate::manifest::XaAttributes::INTERLEAVED),
@@ -4618,6 +5331,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4694,6 +5408,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4713,6 +5428,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4740,6 +5456,35 @@ mod tests {
     }
 
     #[test]
+    fn unbacked_form2_xa_file_retains_only_directory_record_xa_fields() {
+        let sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER; 18]);
+        let mut parsed = parsed_iso();
+        parsed.files[0].extent = 100;
+        let attributes = crate::manifest::XaAttributes::from_bits(
+            crate::manifest::XaAttributes::MODE2_FORM1.bits()
+                | crate::manifest::XaAttributes::MODE2_FORM2.bits(),
+        );
+        parsed.manifest.entries[1].xa = Some(crate::manifest::EntryXa {
+            attributes: Some(attributes),
+            length_encoding: XaLengthEncoding::Mode2_2336,
+            ..crate::manifest::EntryXa::default()
+        });
+
+        detach_overlapping_form2_xa_files(&sectors, &mut parsed).unwrap();
+
+        let entry = &parsed.manifest.entries[1];
+        assert!(entry.unbacked);
+        let xa = entry.xa.as_ref().unwrap();
+        assert_eq!(xa.attributes, Some(attributes));
+        assert_eq!(xa.length_encoding, XaLengthEncoding::Logical2048);
+        assert!(xa.form1.is_none());
+        assert!(xa.form2.is_none());
+        assert!(xa.index.is_none());
+        parsed.manifest.files.clear();
+        iso9660::layout(&parsed.manifest, &HashMap::new()).unwrap();
+    }
+
+    #[test]
     fn overlapping_ordinary_files_become_unbacked_references() {
         let sectors = parsed_form1_sequence(&[FORM1_DATA_SUBHEADER; 8]);
         let mut parsed = parsed_iso();
@@ -4754,6 +5499,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4909,6 +5655,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4965,6 +5712,22 @@ mod tests {
         parsed.manifest.files.clear();
 
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+    }
+
+    #[test]
+    fn pvd_framed_volume_terminator_selects_scoped_framing() {
+        let mut sectors = parsed_form1_sequence(&[PVD_SUBHEADER; 19]);
+        sectors[16].bytes[24..31].copy_from_slice(b"\x01CD001\x01");
+        sectors[17].bytes[24..31].copy_from_slice(b"\x02CD001\x01");
+        sectors[18].bytes[24..31].copy_from_slice(b"\xffCD001\x01");
+        let mut parsed = parsed_iso();
+
+        detect_metadata_subheader(&sectors, &mut parsed.manifest, &[]);
+
+        assert_eq!(
+            parsed.manifest.volume_terminator_subheader,
+            VolumeTerminatorSubheader::Pvd
+        );
     }
 
     #[test]
@@ -5046,6 +5809,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -5057,7 +5821,7 @@ mod tests {
             length: (2 * LOGICAL_BLOCK_SIZE) as u32,
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::IsoMetadata
@@ -5075,7 +5839,7 @@ mod tests {
         file_subheaders[16] = PVD_SUBHEADER;
         let file_sectors = parsed_form1_sequence(&file_subheaders);
         let mut file_iso = parsed_iso();
-        detect_entry_sector_subheaders(&file_sectors, &mut file_iso).unwrap();
+        detect_entry_sector_subheaders(&file_sectors, &mut file_iso, &[]).unwrap();
         assert_eq!(
             file_iso.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::Data
@@ -5101,6 +5865,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -5112,7 +5877,7 @@ mod tests {
             length: (2 * LOGICAL_BLOCK_SIZE) as u32,
         });
 
-        detect_entry_sector_subheaders(&directory_sectors, &mut directory_iso).unwrap();
+        detect_entry_sector_subheaders(&directory_sectors, &mut directory_iso, &[]).unwrap();
         assert_eq!(
             directory_iso.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::DataUntilFinal
@@ -5141,6 +5906,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -5152,7 +5918,7 @@ mod tests {
             length: LOGICAL_BLOCK_SIZE as u32,
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
@@ -5184,6 +5950,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -5195,7 +5962,8 @@ mod tests {
             length: (2 * LOGICAL_BLOCK_SIZE) as u32,
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        let redump_ranges = std::iter::once(18..19).collect::<Vec<_>>();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &redump_ranges).unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1]
@@ -5208,7 +5976,7 @@ mod tests {
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::DataUntilFinal
         );
-        validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
+        validate_iso_subheaders_with_xa_extents(&sectors, &parsed, 0, &[], &redump_ranges).unwrap();
     }
 
     #[test]
@@ -5226,7 +5994,7 @@ mod tests {
             blocks: 2,
         });
 
-        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+        detect_path_table_subheader(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
@@ -5251,7 +6019,7 @@ mod tests {
             blocks: 2,
         });
 
-        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+        detect_path_table_subheader(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
@@ -5275,7 +6043,7 @@ mod tests {
             blocks: 1,
         });
 
-        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+        detect_path_table_subheader(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed.manifest.path_table_subheader,
@@ -5319,7 +6087,7 @@ mod tests {
             blocks: 1,
         });
 
-        detect_path_table_subheader(&sectors, &mut parsed).unwrap();
+        detect_path_table_subheader(&sectors, &mut parsed, &[]).unwrap();
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
@@ -5331,7 +6099,7 @@ mod tests {
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::EndOfFileData
@@ -5354,7 +6122,7 @@ mod tests {
             ..crate::manifest::EntryXa::default()
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
@@ -5368,6 +6136,7 @@ mod tests {
         assert!(!compact.contains("sector_subheader:"));
 
         let explicit = serialize_manifest(&manifest, true).unwrap();
+        assert!(!explicit.contains("sha1"));
         for expected in [
             "  mode: 2xa",
             "  start_msf: 00:02:00",
@@ -5381,6 +6150,464 @@ mod tests {
             assert!(explicit.lines().any(|line| line == expected));
         }
         assert!(yaml_serde::from_str::<Manifest>(&explicit).is_ok());
+    }
+
+    #[test]
+    fn manifest_sha1_validation_accepts_uppercase_and_rejects_invalid_placement() {
+        let uppercase = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let mut manifest = test_manifest();
+        manifest.track.sha1 = Some(uppercase.to_owned());
+        manifest.system_area.sha1 = Some(uppercase.to_owned());
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+            file.sha1 = Some(uppercase.to_owned());
+        }
+        validate_manifest_hashes(&manifest).unwrap();
+
+        manifest.track.sha1 = Some("not-a-sha1".to_owned());
+        assert!(validate_manifest_hashes(&manifest).is_err());
+        manifest.track.sha1 = Some(uppercase.to_owned());
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
+            form1: Some("FILE.BIN.XA1".to_owned()),
+            form2: Some("FILE.BIN.XA2".to_owned()),
+            index: Some("FILE.BIN.XAI".to_owned()),
+            ..crate::manifest::EntryXa::default()
+        });
+        assert_eq!(
+            validate_manifest_hashes(&manifest).unwrap_err().to_string(),
+            "indexed XA file FILE.BIN cannot declare an ordinary-file sha1"
+        );
+
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+            file.sha1 = None;
+        }
+        manifest.iso9660.entries[1].xa = None;
+        manifest
+            .iso9660
+            .files
+            .push(FileLayoutItem::xa_extent(XaExtentAssets {
+                form1: "EXTRA.XA1".to_owned(),
+                form1_sha1: None,
+                form2: "EXTRA.XA2".to_owned(),
+                form2_sha1: None,
+                index: "EXTRA.XAI".to_owned(),
+                index_sha1: None,
+                gap_index: None,
+                gap_index_sha1: Some(uppercase.to_owned()),
+            }));
+        assert!(validate_manifest_hashes(&manifest).is_err());
+    }
+
+    #[test]
+    fn extracted_hashes_cover_ordinary_indexed_and_unreferenced_assets() {
+        let mut manifest = test_manifest();
+        let mut ordinary = manifest.iso9660.entries[1].clone();
+        ordinary.path = "ORDINARY.BIN".to_owned();
+        manifest.iso9660.entries.push(ordinary);
+        manifest
+            .iso9660
+            .files
+            .push(FileLayoutItem::path("ORDINARY.BIN"));
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
+            form1: Some("FILE.BIN.XA1".to_owned()),
+            form2: Some("FILE.BIN.XA2".to_owned()),
+            index: Some("FILE.BIN.XAI".to_owned()),
+            gap_index: Some("FILE.BIN.XAG".to_owned()),
+            ..crate::manifest::EntryXa::default()
+        });
+        manifest
+            .iso9660
+            .files
+            .push(FileLayoutItem::xa_extent(XaExtentAssets {
+                form1: "EXTRA.XA1".to_owned(),
+                form1_sha1: None,
+                form2: "EXTRA.XA2".to_owned(),
+                form2_sha1: None,
+                index: "EXTRA.XAI".to_owned(),
+                index_sha1: None,
+                gap_index: Some("EXTRA.XAG".to_owned()),
+                gap_index_sha1: None,
+            }));
+        let assets = [
+            ("ORDINARY.BIN", vec![1]),
+            ("FILE.BIN.XA1", Vec::new()),
+            ("FILE.BIN.XA2", vec![2]),
+            ("FILE.BIN.XAI", vec![3]),
+            ("FILE.BIN.XAG", vec![4]),
+            ("EXTRA.XA1", vec![5]),
+            ("EXTRA.XA2", vec![6]),
+            ("EXTRA.XAI", vec![7]),
+            ("EXTRA.XAG", vec![8]),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| (path.to_owned(), bytes))
+        .collect::<HashMap<_, _>>();
+
+        add_extracted_hashes(&mut manifest, b"track", b"system", &assets).unwrap();
+
+        let track_sha1 = sha1_hex(b"track");
+        let system_sha1 = sha1_hex(b"system");
+        assert_eq!(manifest.track.sha1.as_deref(), Some(track_sha1.as_str()));
+        assert_eq!(
+            manifest.system_area.sha1.as_deref(),
+            Some(system_sha1.as_str())
+        );
+        let xa = manifest.iso9660.entries[1].xa.as_ref().unwrap();
+        assert_eq!(
+            xa.form1_sha1.as_deref(),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
+        assert!(xa.form2_sha1.is_some());
+        assert!(xa.index_sha1.is_some());
+        assert!(xa.gap_index_sha1.is_some());
+        if let FileLayoutItem::Path(file) = &manifest.iso9660.files[1] {
+            let expected = sha1_hex(&[1]);
+            assert_eq!(file.sha1.as_deref(), Some(expected.as_str()));
+        } else {
+            panic!("ordinary asset is not a path item");
+        }
+        if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.files[2] {
+            assert!(item.xa_extent.form1_sha1.is_some());
+            assert!(item.xa_extent.form2_sha1.is_some());
+            assert!(item.xa_extent.index_sha1.is_some());
+            assert!(item.xa_extent.gap_index_sha1.is_some());
+        } else {
+            panic!("unreferenced asset is not an XA extent");
+        }
+        let explicit = serialize_manifest(&manifest, true).unwrap();
+        assert!(explicit.contains(&format!("sha1: {track_sha1}")));
+        assert!(explicit.contains("form1_sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+        let reparsed: Manifest = yaml_serde::from_str(&explicit).unwrap();
+        assert_eq!(reparsed.track.sha1, manifest.track.sha1);
+    }
+
+    #[test]
+    fn indexed_xa_asset_hash_mismatches_are_reported_in_asset_order() {
+        let project = tempfile::tempdir().unwrap();
+        let data_dir = project.path().join("assets");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("sample.system"),
+            vec![0_u8; SYSTEM_AREA_SECTORS * LOGICAL_BLOCK_SIZE],
+        )
+        .unwrap();
+        let sectors = vec![
+            parsed_xa_sector(false, 1),
+            parsed_xa_sector(true, 2),
+            parsed_xa_gap_sector(),
+            parsed_xa_sector(false, 3),
+        ];
+        let assets = demultiplex_xa_extent(&sectors, true).unwrap();
+        for (path, bytes) in [
+            ("FILE.XA1", &assets.form1),
+            ("FILE.XA2", &assets.form2),
+            ("FILE.XAI", &assets.form2_index),
+            ("FILE.XAG", &assets.gap_index),
+        ] {
+            fs::write(data_dir.join(path), bytes).unwrap();
+        }
+        let mut manifest = test_manifest();
+        manifest.system_area.sha1 =
+            Some(sha1_hex(&fs::read(data_dir.join("sample.system")).unwrap()));
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
+            attributes: Some(crate::manifest::XaAttributes::from_bits(
+                crate::manifest::XaAttributes::MODE2_FORM1.bits()
+                    | crate::manifest::XaAttributes::INTERLEAVED.bits(),
+            )),
+            form1: Some("FILE.XA1".to_owned()),
+            form1_sha1: Some(sha1_hex(&assets.form1)),
+            form2: Some("FILE.XA2".to_owned()),
+            form2_sha1: Some(sha1_hex(&assets.form2)),
+            index: Some("FILE.XAI".to_owned()),
+            index_sha1: Some(sha1_hex(&assets.form2_index)),
+            gap_index: Some("FILE.XAG".to_owned()),
+            gap_index_sha1: Some(sha1_hex(&assets.gap_index)),
+            ..crate::manifest::EntryXa::default()
+        });
+        let manifest_path = project.path().join("disc.yaml");
+        fs::write(
+            &manifest_path,
+            serialize_manifest(&manifest, false).unwrap(),
+        )
+        .unwrap();
+        let unchanged = build(
+            &manifest_path,
+            &project.path().join("unchanged.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(unchanged.sha1_mismatches.is_empty());
+
+        let mut form1 = assets.form1.clone();
+        form1[8] ^= 1;
+        fs::write(data_dir.join("FILE.XA1"), form1).unwrap();
+        let mut form2 = assets.form2.clone();
+        form2[8] ^= 1;
+        fs::write(data_dir.join("FILE.XA2"), form2).unwrap();
+        fs::write(data_dir.join("FILE.XAI"), encode_xa_index(&[0])).unwrap();
+        fs::write(data_dir.join("FILE.XAG"), encode_xa_index(&[3])).unwrap();
+
+        let changed = build(
+            &manifest_path,
+            &project.path().join("changed.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            changed
+                .sha1_mismatches
+                .iter()
+                .map(|mismatch| match &mismatch.target {
+                    Sha1Target::Asset { path } => path.as_str(),
+                    Sha1Target::Track | Sha1Target::SystemArea { .. } => "unexpected",
+                })
+                .collect::<Vec<_>>(),
+            ["FILE.XA1", "FILE.XA2", "FILE.XAI", "FILE.XAG"]
+        );
+    }
+
+    fn build_redump_integration_fixture(project: &Path) -> (Vec<u8>, u32) {
+        let data_dir = project.join("source");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("sample.system"),
+            vec![0_u8; SYSTEM_AREA_SECTORS * LOGICAL_BLOCK_SIZE],
+        )
+        .unwrap();
+        fs::write(
+            data_dir.join("FILE.BIN"),
+            vec![0xa5_u8; 2 * LOGICAL_BLOCK_SIZE],
+        )
+        .unwrap();
+        let mut manifest = test_manifest();
+        manifest.iso9660.files.insert(0, FileLayoutItem::gap(3));
+        manifest.iso9660.files.push(FileLayoutItem::xa_gap(4));
+        let manifest_path = project.join("source.yaml");
+        fs::write(
+            &manifest_path,
+            serialize_manifest(&manifest, false).unwrap(),
+        )
+        .unwrap();
+        let image_path = project.join("source.bin");
+        build(&manifest_path, &image_path, &data_dir, false).unwrap();
+        let raw = fs::read(image_path).unwrap();
+        let blocks = parse_image(&raw)
+            .unwrap()
+            .1
+            .iter()
+            .map(|sector| sector.logical_block().try_into().unwrap())
+            .collect::<Vec<[u8; LOGICAL_BLOCK_SIZE]>>();
+        let parsed = iso9660::parse(&blocks).unwrap();
+        (raw, parsed.files[0].extent)
+    }
+
+    #[test]
+    fn optional_extracted_hashes_warn_without_blocking_build() {
+        let project = tempfile::tempdir().unwrap();
+        let (raw, _) = build_redump_integration_fixture(project.path());
+        let source_image = project.path().join("source.bin");
+
+        let plain_manifest_path = project.path().join("plain.yaml");
+        extract_with_options(
+            &source_image,
+            &plain_manifest_path,
+            &project.path().join("plain-assets"),
+            ExtractOptions {
+                manifest_only: true,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: false,
+            },
+        )
+        .unwrap();
+        let plain: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(plain_manifest_path).unwrap()).unwrap();
+        assert!(plain.track.sha1.is_none());
+        assert!(plain.system_area.sha1.is_none());
+        assert!(
+            plain
+                .iso9660
+                .files
+                .iter()
+                .filter_map(FileLayoutItem::as_path_with_sha1)
+                .all(|(_, sha1)| sha1.is_none())
+        );
+
+        let data_dir = project.path().join("hashed-assets");
+        let manifest_path = project.path().join("hashed.yaml");
+        extract_with_options(
+            &source_image,
+            &manifest_path,
+            &data_dir,
+            ExtractOptions {
+                manifest_only: false,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: true,
+            },
+        )
+        .unwrap();
+        let manifest: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.track.sha1.as_deref(),
+            Some(sha1_hex(&raw).as_str())
+        );
+        let system = fs::read(data_dir.join(&manifest.system_area.path)).unwrap();
+        assert_eq!(
+            manifest.system_area.sha1.as_deref(),
+            Some(sha1_hex(&system).as_str())
+        );
+        let file_sha1 = manifest
+            .iso9660
+            .files
+            .iter()
+            .filter_map(FileLayoutItem::as_path_with_sha1)
+            .find(|(path, _)| *path == "FILE.BIN")
+            .and_then(|(_, sha1)| sha1)
+            .unwrap();
+        assert_eq!(
+            file_sha1,
+            sha1_hex(&fs::read(data_dir.join("FILE.BIN")).unwrap())
+        );
+
+        let unchanged = build(
+            &manifest_path,
+            &project.path().join("unchanged.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(unchanged.sha1_mismatches.is_empty());
+
+        let mut patched_manifest = manifest.clone();
+        let patch_index = raw.len() / RAW_SECTOR_SIZE - 1;
+        let replacement = [0x3c; RAW_SECTOR_SIZE];
+        patched_manifest.track.patches.push(SectorPatch {
+            lba: i32::try_from(patch_index).unwrap(),
+            hex: format_sector_patch_hex(&replacement),
+        });
+        let mut patched_raw = raw.clone();
+        patched_raw[patch_index * RAW_SECTOR_SIZE..].copy_from_slice(&replacement);
+        patched_manifest.track.sha1 = Some(sha1_hex(&patched_raw));
+        let patched_manifest_path = project.path().join("patched.yaml");
+        fs::write(
+            &patched_manifest_path,
+            serialize_manifest(&patched_manifest, false).unwrap(),
+        )
+        .unwrap();
+        let patched = build(
+            &patched_manifest_path,
+            &project.path().join("patched.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(patched.sha1_mismatches.is_empty());
+        let no_patches = build_with_options(
+            &patched_manifest_path,
+            &project.path().join("no-patches.bin"),
+            &data_dir,
+            BuildOptions {
+                overwrite: false,
+                apply_patches: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(no_patches.sha1_mismatches.len(), 1);
+        assert_eq!(no_patches.sha1_mismatches[0].target, Sha1Target::Track);
+
+        fs::write(data_dir.join(&manifest.system_area.path), [1]).unwrap();
+        let mut file = fs::read(data_dir.join("FILE.BIN")).unwrap();
+        file[0] ^= 0xff;
+        fs::write(data_dir.join("FILE.BIN"), file).unwrap();
+        let changed_image = project.path().join("changed.bin");
+        let changed = build(&manifest_path, &changed_image, &data_dir, false).unwrap();
+        assert!(changed_image.is_file());
+        assert_eq!(changed.sha1_mismatches.len(), 3);
+        assert!(matches!(
+            &changed.sha1_mismatches[0].target,
+            Sha1Target::SystemArea { path } if path == &manifest.system_area.path
+        ));
+        assert_eq!(
+            changed.sha1_mismatches[1].target,
+            Sha1Target::Asset {
+                path: "FILE.BIN".to_owned()
+            }
+        );
+        assert_eq!(changed.sha1_mismatches[2].target, Sha1Target::Track);
+    }
+
+    #[test]
+    fn redump_0x55_runs_preserve_system_unreferenced_file_and_terminal_allocations() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut raw, file_extent) = build_redump_integration_fixture(project.path());
+        let last = raw.len() / RAW_SECTOR_SIZE - 1;
+        let file_extent = usize::try_from(file_extent).unwrap();
+        let damaged = [0_usize, file_extent - 2, file_extent, last];
+        for index in damaged {
+            raw[index * RAW_SECTOR_SIZE + 16..(index + 1) * RAW_SECTOR_SIZE].fill(0x55);
+        }
+        let image_path = project.path().join("damaged.bin");
+        fs::write(&image_path, &raw).unwrap();
+        let manifest_path = project.path().join("damaged.yaml");
+        let report = extract_with_options(
+            &image_path,
+            &manifest_path,
+            &project.path().join("extracted"),
+            ExtractOptions {
+                manifest_only: true,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: true,
+            },
+        )
+        .unwrap();
+        assert!(report.recovery_warnings.is_empty());
+        let manifest: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.track.redump_0x55,
+            damaged
+                .into_iter()
+                .map(|lba| Redump0x55Run {
+                    lba: i32::try_from(lba).unwrap(),
+                    sectors: 1,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(manifest.track.patches.is_empty());
+        assert_eq!(
+            manifest.track.sha1.as_deref(),
+            Some(sha1_hex(&raw).as_str())
+        );
+    }
+
+    #[test]
+    fn redump_0x55_damage_to_required_iso_metadata_is_targeted() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut raw, _) = build_redump_integration_fixture(project.path());
+        raw[16 * RAW_SECTOR_SIZE + 16..17 * RAW_SECTOR_SIZE].fill(0x55);
+        let image_path = project.path().join("metadata-damaged.bin");
+        fs::write(&image_path, raw).unwrap();
+        let error = extract_with_options(
+            &image_path,
+            &project.path().join("metadata-damaged.yaml"),
+            &project.path().join("extracted"),
+            ExtractOptions {
+                manifest_only: true,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "Redump 0x55 zero placeholders do not leave a parseable ISO 9660 filesystem; required metadata may be damaged"
+            )
+        );
     }
 
     #[test]

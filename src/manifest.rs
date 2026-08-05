@@ -22,6 +22,8 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Track {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
     #[serde(default, skip_serializing_if = "TrackMode::is_default")]
     pub mode: TrackMode,
     #[serde(
@@ -37,7 +39,16 @@ pub struct Track {
     #[serde(default, skip_serializing_if = "is_false")]
     pub noncompliant_trailing_ecc: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redump_0x55: Vec<Redump0x55Run>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<SectorPatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redump0x55Run {
+    pub lba: i32,
+    pub sectors: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,10 +86,12 @@ pub(crate) fn decode_sector_patch(patch: &SectorPatch) -> Result<[u8; 2352]> {
 impl Default for Track {
     fn default() -> Self {
         Self {
+            sha1: None,
             mode: TrackMode::default(),
             start_msf: default_start_msf(),
             form2_edc: default_form2_edc(),
             noncompliant_trailing_ecc: false,
+            redump_0x55: Vec::new(),
             patches: Vec::new(),
         }
     }
@@ -86,10 +99,12 @@ impl Default for Track {
 
 impl Track {
     fn is_default(&self) -> bool {
-        self.mode.is_default()
+        self.sha1.is_none()
+            && self.mode.is_default()
             && is_default_start_msf(&self.start_msf)
             && is_default_form2_edc(&self.form2_edc)
             && !self.noncompliant_trailing_ecc
+            && self.redump_0x55.is_empty()
             && self.patches.is_empty()
     }
 }
@@ -103,10 +118,14 @@ struct ManifestWithDefaults<'a> {
 
 #[derive(Serialize)]
 struct TrackWithDefaults<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha1: Option<&'a str>,
     mode: TrackMode,
     start_msf: &'a str,
     form2_edc: bool,
     noncompliant_trailing_ecc: bool,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    redump_0x55: &'a [Redump0x55Run],
     #[serde(skip_serializing_if = "slice_is_empty")]
     patches: &'a [SectorPatch],
 }
@@ -126,6 +145,7 @@ struct Iso9660WithDefaults<'a> {
     metadata_subheader: IsoMetadataSubheader,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata_framing_subheader: Option<XaSubheader>,
+    volume_terminator_subheader: VolumeTerminatorSubheader,
     identifier_policy: IdentifierPolicy,
     directory_record_packing: DirectoryRecordPacking,
     directory_parent_recording_time: DirectoryParentRecordingTime,
@@ -159,6 +179,8 @@ struct EntryWithDefaults<'a> {
     directory_slack: Option<&'a DirectorySlack>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_padding_hex: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_self_xa: Option<&'a EntryXa>,
     sector_subheader: EntrySectorSubheader,
     xa: EntryXaWithDefaults<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,9 +197,17 @@ struct EntryXaWithDefaults<'a> {
     attributes: XaAttributes,
     file_number: u8,
     form1: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    form1_sha1: Option<&'a str>,
     form2: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    form2_sha1: Option<&'a str>,
     index: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_sha1: Option<&'a str>,
     gap_index: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gap_index_sha1: Option<&'a str>,
     logical_length: Option<u32>,
     length_encoding: XaLengthEncoding,
     framing_subheader: Option<XaSubheader>,
@@ -250,6 +280,7 @@ pub(crate) fn serialize_manifest(
                     directory_reference: entry.directory_reference,
                     directory_slack: entry.directory_slack.as_ref(),
                     allocation_padding_hex: entry.allocation_padding_hex.as_deref(),
+                    directory_self_xa: entry.directory_self_xa.as_ref(),
                     sector_subheader: entry.sector_subheader,
                     xa: EntryXaWithDefaults {
                         group_id: xa.map_or(0, |value| value.group_id),
@@ -258,9 +289,13 @@ pub(crate) fn serialize_manifest(
                         attributes,
                         file_number: xa.map_or(0, |value| value.file_number),
                         form1: xa.and_then(|value| value.form1.as_deref()),
+                        form1_sha1: xa.and_then(|value| value.form1_sha1.as_deref()),
                         form2: xa.and_then(|value| value.form2.as_deref()),
+                        form2_sha1: xa.and_then(|value| value.form2_sha1.as_deref()),
                         index: xa.and_then(|value| value.index.as_deref()),
+                        index_sha1: xa.and_then(|value| value.index_sha1.as_deref()),
                         gap_index: xa.and_then(|value| value.gap_index.as_deref()),
+                        gap_index_sha1: xa.and_then(|value| value.gap_index_sha1.as_deref()),
                         logical_length: xa.and_then(|value| value.logical_length),
                         length_encoding: xa
                             .map_or_else(XaLengthEncoding::default, |value| value.length_encoding),
@@ -273,10 +308,12 @@ pub(crate) fn serialize_manifest(
             .collect();
         yaml_serde::to_string(&ManifestWithDefaults {
             track: TrackWithDefaults {
+                sha1: manifest.track.sha1.as_deref(),
                 mode: manifest.track.mode,
                 start_msf: &manifest.track.start_msf,
                 form2_edc: manifest.track.form2_edc,
                 noncompliant_trailing_ecc: manifest.track.noncompliant_trailing_ecc,
+                redump_0x55: &manifest.track.redump_0x55,
                 patches: &manifest.track.patches,
             },
             system_area: &manifest.system_area,
@@ -343,6 +380,7 @@ pub(crate) fn serialize_manifest(
                 xa_system_use_omissions: &manifest.iso9660.xa_system_use_omissions,
                 metadata_subheader: manifest.iso9660.metadata_subheader,
                 metadata_framing_subheader: manifest.iso9660.metadata_framing_subheader,
+                volume_terminator_subheader: manifest.iso9660.volume_terminator_subheader,
                 identifier_policy: manifest.iso9660.identifier_policy,
                 directory_record_packing: manifest.iso9660.directory_record_packing,
                 directory_parent_recording_time: manifest.iso9660.directory_parent_recording_time,
@@ -477,6 +515,8 @@ const fn is_false(value: &bool) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct SystemArea {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
     pub form1_sectors: Form1Sectors,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sector_layout: Vec<SystemAreaSectorRun>,
@@ -571,6 +611,8 @@ pub struct Iso9660 {
     pub metadata_subheader: IsoMetadataSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_framing_subheader: Option<XaSubheader>,
+    #[serde(default, skip_serializing_if = "VolumeTerminatorSubheader::is_default")]
+    pub volume_terminator_subheader: VolumeTerminatorSubheader,
     #[serde(default, skip_serializing_if = "IdentifierPolicy::is_default")]
     pub identifier_policy: IdentifierPolicy,
     #[serde(default, skip_serializing_if = "DirectoryRecordPacking::is_default")]
@@ -721,6 +763,8 @@ pub struct JolietEntry {
     pub associated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xa: Option<EntryXa>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_xa: Option<EntryXa>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -832,6 +876,20 @@ pub enum IsoMetadataSubheader {
     IsoMetadata,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeTerminatorSubheader {
+    #[default]
+    Metadata,
+    Pvd,
+}
+
+impl VolumeTerminatorSubheader {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Metadata)
+    }
+}
+
 impl IsoMetadataSubheader {
     const fn is_default(&self) -> bool {
         matches!(self, Self::Canonical)
@@ -851,6 +909,8 @@ pub enum FileLayoutItem {
 #[serde(deny_unknown_fields)]
 pub struct FilePathItem {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -871,10 +931,18 @@ pub struct FileXaExtentItem {
 #[serde(deny_unknown_fields)]
 pub struct XaExtentAssets {
     pub form1: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form1_sha1: Option<String>,
     pub form2: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form2_sha1: Option<String>,
     pub index: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_sha1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_index_sha1: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -908,7 +976,10 @@ impl GapKind {
 
 impl FileLayoutItem {
     pub fn path(path: impl Into<String>) -> Self {
-        Self::Path(FilePathItem { path: path.into() })
+        Self::Path(FilePathItem {
+            path: path.into(),
+            sha1: None,
+        })
     }
 
     pub fn directory(path: impl Into<String>) -> Self {
@@ -986,6 +1057,13 @@ impl FileLayoutItem {
     pub fn as_path(&self) -> Option<&str> {
         match self {
             Self::Path(item) => Some(&item.path),
+            Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
+        }
+    }
+
+    pub fn as_path_with_sha1(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::Path(item) => Some((&item.path, item.sha1.as_deref())),
             Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
         }
     }
@@ -1149,6 +1227,8 @@ pub struct Entry {
     pub directory_slack: Option<DirectorySlack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_padding_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1220,11 +1300,19 @@ pub struct EntryXa {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub form1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub form1_sha1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub form2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form2_sha1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_sha1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gap_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_index_sha1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_length: Option<u32>,
     #[serde(skip_serializing_if = "XaLengthEncoding::is_default")]
@@ -1242,9 +1330,13 @@ impl Default for EntryXa {
             attributes: None,
             file_number: 0,
             form1: None,
+            form1_sha1: None,
             form2: None,
+            form2_sha1: None,
             index: None,
+            index_sha1: None,
             gap_index: None,
+            gap_index_sha1: None,
             logical_length: None,
             length_encoding: XaLengthEncoding::default(),
             framing_subheader: None,
@@ -1261,9 +1353,13 @@ struct EntryXaFields {
     attributes: Option<XaAttributes>,
     file_number: u8,
     form1: Option<String>,
+    form1_sha1: Option<String>,
     form2: Option<String>,
+    form2_sha1: Option<String>,
     index: Option<String>,
+    index_sha1: Option<String>,
     gap_index: Option<String>,
+    gap_index_sha1: Option<String>,
     logical_length: Option<u32>,
     length_encoding: XaLengthEncoding,
     framing_subheader: Option<XaSubheader>,
@@ -1278,9 +1374,13 @@ impl Default for EntryXaFields {
             attributes: None,
             file_number: 0,
             form1: None,
+            form1_sha1: None,
             form2: None,
+            form2_sha1: None,
             index: None,
+            index_sha1: None,
             gap_index: None,
+            gap_index_sha1: None,
             logical_length: None,
             length_encoding: XaLengthEncoding::default(),
             framing_subheader: None,
@@ -1307,6 +1407,18 @@ impl<'de> Deserialize<'de> for EntryXa {
                 "XA gap index requires form1, form2, and index assets",
             ));
         }
+        for (path, sha1, label) in [
+            (&fields.form1, &fields.form1_sha1, "form1_sha1"),
+            (&fields.form2, &fields.form2_sha1, "form2_sha1"),
+            (&fields.index, &fields.index_sha1, "index_sha1"),
+            (&fields.gap_index, &fields.gap_index_sha1, "gap_index_sha1"),
+        ] {
+            if sha1.is_some() && path.is_none() {
+                return Err(de::Error::custom(format_args!(
+                    "XA {label} requires its corresponding asset path"
+                )));
+            }
+        }
         if fields.logical_length.is_some() && asset_count != 3 {
             return Err(de::Error::custom(
                 "XA logical length requires form1, form2, and index assets",
@@ -1329,9 +1441,13 @@ impl<'de> Deserialize<'de> for EntryXa {
             attributes: fields.attributes,
             file_number: fields.file_number,
             form1: fields.form1,
+            form1_sha1: fields.form1_sha1,
             form2: fields.form2,
+            form2_sha1: fields.form2_sha1,
             index: fields.index,
+            index_sha1: fields.index_sha1,
             gap_index: fields.gap_index,
+            gap_index_sha1: fields.gap_index_sha1,
             logical_length: fields.logical_length,
             length_encoding: fields.length_encoding,
             framing_subheader: fields.framing_subheader,
@@ -1459,10 +1575,12 @@ mod tests {
 
     fn track(mode: TrackMode, start_msf: &str) -> Track {
         Track {
+            sha1: None,
             mode,
             start_msf: start_msf.to_owned(),
             form2_edc: true,
             noncompliant_trailing_ecc: false,
+            redump_0x55: Vec::new(),
             patches: Vec::new(),
         }
     }
@@ -1485,6 +1603,46 @@ mod tests {
         assert_eq!(parsed.start_msf, "00:02:00");
         assert!(parsed.form2_edc);
         assert!(!parsed.noncompliant_trailing_ecc);
+    }
+
+    #[test]
+    fn redump_0x55_runs_roundtrip_at_track_level() {
+        let mut value = track(TrackMode::Mode2Xa, "00:02:00");
+        value.redump_0x55 = vec![Redump0x55Run {
+            lba: 145_707,
+            sectors: 2,
+        }];
+
+        let yaml = yaml_serde::to_string(&value).unwrap();
+        assert!(yaml.contains("redump_0x55:\n- lba: 145707\n  sectors: 2"));
+        let parsed = yaml_serde::from_str::<Track>(&yaml).unwrap();
+        assert_eq!(parsed.redump_0x55, value.redump_0x55);
+    }
+
+    #[test]
+    fn optional_sha1_fields_round_trip_without_changing_legacy_defaults() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789";
+        let mut value = track(TrackMode::Mode2Xa, "00:02:00");
+        value.sha1 = Some(hash.to_owned());
+        let yaml = yaml_serde::to_string(&value).unwrap();
+        assert!(yaml.starts_with(&format!("sha1: {hash}\n")));
+        assert_eq!(
+            yaml_serde::from_str::<Track>(&yaml)
+                .unwrap()
+                .sha1
+                .as_deref(),
+            Some(hash)
+        );
+        assert!(track(TrackMode::Mode2Xa, "00:02:00").sha1.is_none());
+
+        let xa: EntryXa = yaml_serde::from_str(&format!(
+            "form1: FILE.XA1\nform1_sha1: {hash}\nform2: FILE.XA2\nform2_sha1: {hash}\nindex: FILE.XAI\nindex_sha1: {hash}\n"
+        ))
+        .unwrap();
+        assert_eq!(xa.form1_sha1.as_deref(), Some(hash));
+        assert_eq!(xa.form2_sha1.as_deref(), Some(hash));
+        assert_eq!(xa.index_sha1.as_deref(), Some(hash));
+        assert!(yaml_serde::from_str::<EntryXa>(&format!("form1_sha1: {hash}\n")).is_err());
     }
 
     #[test]
@@ -1547,14 +1705,18 @@ mod tests {
     fn unreferenced_xa_extent_assets_round_trip_without_ambiguity() {
         let item = FileLayoutItem::xa_extent(XaExtentAssets {
             form1: "disc.unreferenced.000.XA1".to_owned(),
+            form1_sha1: Some("1111111111111111111111111111111111111111".to_owned()),
             form2: "disc.unreferenced.000.XA2".to_owned(),
+            form2_sha1: None,
             index: "disc.unreferenced.000.XAI".to_owned(),
+            index_sha1: None,
             gap_index: Some("disc.unreferenced.000.XAG".to_owned()),
+            gap_index_sha1: None,
         });
         let yaml = yaml_serde::to_string(&item).unwrap();
         assert_eq!(
             yaml,
-            "xa_extent:\n  form1: disc.unreferenced.000.XA1\n  form2: disc.unreferenced.000.XA2\n  index: disc.unreferenced.000.XAI\n  gap_index: disc.unreferenced.000.XAG\n"
+            "xa_extent:\n  form1: disc.unreferenced.000.XA1\n  form1_sha1: '1111111111111111111111111111111111111111'\n  form2: disc.unreferenced.000.XA2\n  index: disc.unreferenced.000.XAI\n  gap_index: disc.unreferenced.000.XAG\n"
         );
         assert_eq!(yaml_serde::from_str::<FileLayoutItem>(&yaml).unwrap(), item);
     }

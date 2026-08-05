@@ -1,3 +1,4 @@
 gcdgold = "../target/release/gcdgold"
-roms = "../data/complete"
-output = "../gcdgold-failures.csv"
+roms = "../data/roms"
+output = "../data/failures.csv"
+manifests = "../data/manifests"

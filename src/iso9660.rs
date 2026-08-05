@@ -8,7 +8,7 @@ use crate::manifest::{
     EntryXa, FileLayoutItem, GapKind, IdentifierPolicy, Iso9660, JolietEntry, JolietLevel,
     JolietVolume, MetadataLayoutItem, MetadataPathTable, MetadataVolume, PathTableCopies,
     PathTableOrder, PrimaryVolume, PrimaryVolumeApplicationUse, PvdU16Encoding,
-    RootDirectoryIdentifier, XaAttributes, XaLengthEncoding,
+    RootDirectoryIdentifier, VolumeTerminatorSubheader, XaAttributes, XaLengthEncoding,
 };
 use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader};
 
@@ -209,6 +209,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         directory_reference: None,
         directory_slack: None,
         allocation_padding_hex: None,
+        directory_self_xa: None,
         sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, xa_system_use)?,
         extent: None,
@@ -246,6 +247,16 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             .context("directory entry is missing")?
             .directory_slack = directory_slack;
         ensure!(records.len() >= 2, "directory lacks dot records");
+        let dot_xa = entry_xa(&records[0], true, xa_system_use)?;
+        let directory_entry = entries
+            .iter_mut()
+            .find(|entry| entry.path == directory_path)
+            .context("directory entry is missing")?;
+        let advertised_system_use = serialize_xa_system_use(directory_entry, true)?;
+        let dot_system_use = serialize_xa_system_use_parts(directory_path, dot_xa.as_ref(), true)?;
+        if advertised_system_use != dot_system_use {
+            directory_entry.directory_self_xa = Some(dot_xa.unwrap_or_default());
+        }
         if directory_path != ROOT_PATH {
             let current_time = &entries
                 .iter()
@@ -336,6 +347,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                 allocation_padding_hex: (!is_dir && !external_cdda)
                     .then(|| file_allocation_padding_hex(blocks, &record))
                     .flatten(),
+                directory_self_xa: None,
                 sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                 xa,
                 extent: external_cdda.then_some(record.extent),
@@ -473,6 +485,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         xa_system_use_omissions,
         metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
         metadata_framing_subheader: None,
+        volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
         identifier_policy,
         directory_record_packing: if packing_observation.skipped_exact_fit {
             DirectoryRecordPacking::AvoidExactFit
@@ -803,10 +816,19 @@ fn parse_joliet(
     let mut descriptor = parse_joliet_descriptor(block)?;
     let root_record = parse_record(&block[156..])?;
     validate_record_fields(&root_record, true)?;
-    ensure!(
-        root_record.system_use.is_empty(),
-        "unsupported Joliet descriptor root system-use data"
-    );
+    let root_record_length = block[156];
+    if root_record_length == 34 {
+        ensure!(
+            root_record.system_use.is_empty(),
+            "unsupported Joliet descriptor root system-use data"
+        );
+    } else {
+        ensure!(
+            root_record_length > 34,
+            "unsupported Joliet descriptor root directory-record length {root_record_length}"
+        );
+        descriptor.root_directory_record_length = Some(root_record_length);
+    }
     let (root_records, _, _) = read_directory(blocks, root_record.extent, root_record.length)?;
     ensure!(
         root_records.len() >= 2,
@@ -827,6 +849,7 @@ fn parse_joliet(
         hidden: root_record.flags & HIDDEN_FLAG != 0,
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
         xa: entry_xa(dot, true, xa_system_use)?,
+        directory_self_xa: None,
     };
     let primary_sources = primary_files.iter().fold(
         HashMap::<(u32, u32), Vec<&str>>::new(),
@@ -854,6 +877,22 @@ fn parse_joliet(
         let (records, _, slack) = read_directory(blocks, extent, length)?;
         ensure!(slack.is_none(), "unsupported Joliet directory slack");
         ensure!(records.len() >= 2, "Joliet directory lacks dot records");
+        let dot_xa = entry_xa(&records[0], true, xa_system_use)?;
+        let directory_path = if parent.is_empty() {
+            ROOT_PATH
+        } else {
+            parent.as_str()
+        };
+        let directory_entry = entries
+            .iter_mut()
+            .find(|entry| entry.path == directory_path)
+            .context("Joliet directory entry is missing")?;
+        let advertised_system_use =
+            serialize_xa_system_use_parts(directory_path, directory_entry.xa.as_ref(), true)?;
+        let dot_system_use = serialize_xa_system_use_parts(directory_path, dot_xa.as_ref(), true)?;
+        if advertised_system_use != dot_system_use {
+            directory_entry.directory_self_xa = Some(dot_xa.unwrap_or_default());
+        }
         for record in &records {
             let directory = record.flags & DIRECTORY_FLAG != 0;
             validate_standard_record_fields(record, directory, xa_system_use)?;
@@ -894,6 +933,7 @@ fn parse_joliet(
                 hidden: record.flags & HIDDEN_FLAG != 0,
                 associated: record.flags & ASSOCIATED_FLAG != 0,
                 xa: entry_xa(&record, is_dir, xa_system_use)?,
+                directory_self_xa: None,
             });
             if is_dir {
                 directories.push(ParsedDirectory {
@@ -1385,13 +1425,7 @@ fn entry_xa(record: &Record, directory: bool, uses_xa_system_use: bool) -> Resul
             permissions,
             attributes: Some(attributes),
             file_number,
-            form1: None,
-            form2: None,
-            index: None,
-            gap_index: None,
-            logical_length: None,
-            length_encoding: XaLengthEncoding::default(),
-            framing_subheader: None,
+            ..EntryXa::default()
         }))
     }
 }
@@ -2614,6 +2648,25 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 "Joliet entries support only directory-record XA fields: {}",
                 entry.path
             );
+            ensure!(
+                entry.directory_self_xa.is_none()
+                    || (entry.source.is_none() && volume.xa_system_use),
+                "Joliet directory_self_xa is supported only for directories: {}",
+                entry.path
+            );
+            ensure!(
+                entry.directory_self_xa.as_ref().is_none_or(|xa| {
+                    xa.form1.is_none()
+                        && xa.form2.is_none()
+                        && xa.index.is_none()
+                        && xa.gap_index.is_none()
+                        && xa.logical_length.is_none()
+                        && xa.length_encoding.is_default()
+                        && xa.framing_subheader.is_none()
+                }),
+                "Joliet directory_self_xa supports only directory-record XA fields: {}",
+                entry.path
+            );
         }
     }
     for (index, entry) in iso.entries.iter().enumerate() {
@@ -2695,6 +2748,25 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             "allocation_padding_hex is supported only for files: {}",
             entry.path
         );
+        ensure!(
+            is_file
+                || entry.directory_self_xa.as_ref().is_none_or(|xa| {
+                    xa.form1.is_none()
+                        && xa.form2.is_none()
+                        && xa.index.is_none()
+                        && xa.gap_index.is_none()
+                        && xa.logical_length.is_none()
+                        && xa.length_encoding.is_default()
+                        && xa.framing_subheader.is_none()
+                }),
+            "directory_self_xa supports only directory-record XA fields: {}",
+            entry.path
+        );
+        ensure!(
+            entry.directory_self_xa.is_none() || (!is_file && iso.xa_system_use),
+            "directory_self_xa requires XA system use on a directory: {}",
+            entry.path
+        );
         serialize_directory_record_system_use(
             entry,
             !is_file,
@@ -2743,8 +2815,8 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             entry.path
         );
         ensure!(
-            !unbacked || (!indexed_assets && !form2_xa),
-            "unbacked file cannot declare mixed XA framing: {}",
+            !unbacked || !indexed_assets,
+            "unbacked file cannot declare indexed XA framing: {}",
             entry.path
         );
         ensure!(
@@ -3529,8 +3601,12 @@ fn serialize_directory(
     let parent = &directories[directory.parent];
     let parent_entry = entry_by_path[parent.path.as_str()];
     let mut records = Vec::new();
+    let mut dot_metadata = metadata.clone();
+    if let Some(xa) = &metadata.directory_self_xa {
+        dot_metadata.xa = Some(xa.clone());
+    }
     records.push(make_record_with_padding(
-        metadata,
+        &dot_metadata,
         directory.extent,
         directory.length,
         vec![0],
@@ -3538,8 +3614,13 @@ fn serialize_directory(
         trailing_system_use_padding,
         iso.xa_system_use,
     )?);
+    let mut parent_metadata = (*parent_entry).clone();
+    parent_metadata.xa = metadata
+        .directory_self_xa
+        .clone()
+        .or_else(|| metadata.xa.clone());
     let mut parent_record = make_record_with_padding(
-        parent_entry,
+        &parent_metadata,
         parent.extent,
         parent.length,
         vec![1],
@@ -3642,8 +3723,12 @@ fn serialize_joliet_directory(
     let parent = &directories[directory.parent];
     let parent_entry = entry_by_path[parent.path.as_str()];
     let mut records = Vec::new();
+    let mut dot_metadata = metadata.clone();
+    if let Some(xa) = &metadata.directory_self_xa {
+        dot_metadata.xa = Some(xa.clone());
+    }
     records.push(make_joliet_record(
-        metadata,
+        &dot_metadata,
         directory.extent,
         directory.length,
         vec![0],
@@ -3651,8 +3736,13 @@ fn serialize_joliet_directory(
         trailing_system_use_padding,
         volume.xa_system_use,
     )?);
+    let mut parent_metadata = parent_entry.clone();
+    parent_metadata.xa = metadata
+        .directory_self_xa
+        .clone()
+        .or_else(|| metadata.xa.clone());
     let mut parent_record = make_joliet_record(
-        parent_entry,
+        &parent_metadata,
         parent.extent,
         parent.length,
         vec![1],
@@ -4222,6 +4312,7 @@ mod tests {
             directory_reference: None,
             directory_slack: None,
             allocation_padding_hex: None,
+            directory_self_xa: None,
             sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
             xa: None,
             extent: None,
@@ -4239,6 +4330,7 @@ mod tests {
             xa_system_use_omissions: Vec::new(),
             metadata_subheader: crate::manifest::IsoMetadataSubheader::Canonical,
             metadata_framing_subheader: None,
+            volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
             identifier_policy: IdentifierPolicy::IsoLevel1,
             directory_record_packing: DirectoryRecordPacking::Fill,
             directory_parent_recording_time: DirectoryParentRecordingTime::Parent,
@@ -4777,6 +4869,7 @@ mod tests {
                     hidden: false,
                     associated: false,
                     xa: None,
+                    directory_self_xa: None,
                 },
                 crate::manifest::JolietEntry {
                     path: "file.bin".to_owned(),
@@ -4786,6 +4879,7 @@ mod tests {
                     hidden: false,
                     associated: false,
                     xa: None,
+                    directory_self_xa: None,
                 },
             ],
         }];
@@ -4874,6 +4968,27 @@ mod tests {
     }
 
     #[test]
+    fn overlong_joliet_root_record_length_round_trips_in_memory() {
+        let iso = test_joliet_iso();
+        let lengths = HashMap::from([("FILE.BIN".to_owned(), 17_u64)]);
+        let mut authored = layout(&iso, &lengths).unwrap();
+        authored.blocks[17][156] = 48;
+
+        let parsed = parse(&authored.blocks).unwrap();
+
+        assert_eq!(
+            parsed.manifest.supplementary_volumes[0]
+                .descriptor
+                .root_directory_record_length,
+            Some(48)
+        );
+        assert_eq!(
+            layout(&parsed.manifest, &lengths).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
     fn structured_joliet_metadata_keeps_fixed_reference_ancestors_in_place() {
         let mut iso = test_joliet_iso();
         iso.entries.insert(1, test_entry("DIR"));
@@ -4893,6 +5008,7 @@ mod tests {
                 hidden: false,
                 associated: false,
                 xa: None,
+                directory_self_xa: None,
             },
         );
         volume.entries[2].path = "dir/file.bin".to_owned();
@@ -5385,9 +5501,13 @@ mod tests {
         );
         let assets = crate::manifest::XaExtentAssets {
             form1: "disc.unreferenced.000.XA1".to_owned(),
+            form1_sha1: None,
             form2: "disc.unreferenced.000.XA2".to_owned(),
+            form2_sha1: None,
             index: "disc.unreferenced.000.XAI".to_owned(),
+            index_sha1: None,
             gap_index: None,
+            gap_index_sha1: None,
         };
         iso.files
             .insert(1, FileLayoutItem::xa_extent(assets.clone()));
@@ -5542,14 +5662,7 @@ mod tests {
             attributes: Some(XaAttributes::from_bits(
                 XaAttributes::MODE2_FORM1.bits() | XaAttributes::DIRECTORY.bits(),
             )),
-            file_number: 0,
-            form1: None,
-            form2: None,
-            index: None,
-            gap_index: None,
-            logical_length: None,
-            length_encoding: XaLengthEncoding::default(),
-            framing_subheader: None,
+            ..EntryXa::default()
         });
         assert!(
             validate(&test_iso(
@@ -5571,10 +5684,7 @@ mod tests {
             form1: Some("ROOT.XA1".to_owned()),
             form2: Some("ROOT.XA2".to_owned()),
             index: Some("ROOT.XAI".to_owned()),
-            gap_index: None,
-            logical_length: None,
-            length_encoding: XaLengthEncoding::default(),
-            framing_subheader: None,
+            ..EntryXa::default()
         });
         assert!(validate(&test_iso(vec![directory], vec![])).is_err());
 
@@ -5605,6 +5715,35 @@ mod tests {
             vec!["MOVIE.STR"],
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn directory_self_xa_can_differ_from_its_parent_record() {
+        let mut directory = test_entry("DIR");
+        directory.xa = Some(EntryXa {
+            file_number: 0xff,
+            ..EntryXa::default()
+        });
+        directory.directory_self_xa = Some(EntryXa::default());
+        let iso = test_iso(vec![test_entry(ROOT_PATH), directory], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+
+        let parsed_directory = &parsed.manifest.entries[1];
+        assert_eq!(parsed_directory.xa.as_ref().unwrap().file_number, 0xff);
+        assert_eq!(
+            parsed_directory
+                .directory_self_xa
+                .as_ref()
+                .unwrap()
+                .file_number,
+            0
+        );
+        assert_eq!(
+            layout(&parsed.manifest, &HashMap::new()).unwrap().blocks,
+            authored.blocks
+        );
     }
 
     #[test]
@@ -5716,6 +5855,7 @@ mod tests {
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
+                    directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                     extent: None,
@@ -5757,6 +5897,7 @@ mod tests {
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
+                    directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                     extent: None,
@@ -5797,6 +5938,7 @@ mod tests {
                     directory_reference: None,
                     directory_slack: None,
                     allocation_padding_hex: None,
+                    directory_self_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                     extent: None,
@@ -5890,9 +6032,13 @@ mod tests {
         iso.files
             .push(FileLayoutItem::xa_extent(crate::manifest::XaExtentAssets {
                 form1: "stream.XA1".to_owned(),
+                form1_sha1: None,
                 form2: "stream.XA2".to_owned(),
+                form2_sha1: None,
                 index: "stream.XAI".to_owned(),
+                index_sha1: None,
                 gap_index: None,
+                gap_index_sha1: None,
             }));
         let lengths = HashMap::from([(String::from("stream.XAI"), 6144_u64)]);
 

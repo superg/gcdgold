@@ -10,6 +10,18 @@ struct Cli {
     command: Command,
 }
 
+fn format_sha1_warning(mismatch: &gcdgold::Sha1Mismatch) -> String {
+    let target = match &mismatch.target {
+        gcdgold::Sha1Target::Track => "track".to_owned(),
+        gcdgold::Sha1Target::SystemArea { path } => format!("system area {path}"),
+        gcdgold::Sha1Target::Asset { path } => format!("asset {path}"),
+    };
+    format!(
+        "warning: SHA-1 mismatch for {target}: expected {}, actual {}",
+        mismatch.expected, mismatch.actual
+    )
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Extract a raw MODE2/2352 image into an editable project.
@@ -26,6 +38,8 @@ enum Command {
         overwrite: bool,
         #[arg(long)]
         include_defaults: bool,
+        #[arg(long)]
+        include_hashes: bool,
     },
     /// Build a raw MODE2/2352 image from an editable project.
     Build {
@@ -51,6 +65,7 @@ fn main() -> Result<()> {
             manifest_only,
             overwrite,
             include_defaults,
+            include_hashes,
         } => {
             let manifest = manifest.unwrap_or_else(|| image.with_extension("yaml"));
             let report = gcdgold::extract_with_options(
@@ -61,6 +76,7 @@ fn main() -> Result<()> {
                     manifest_only,
                     overwrite,
                     include_defaults,
+                    include_hashes,
                 },
             )?;
             for warning in &report.recovery_warnings {
@@ -114,7 +130,15 @@ fn main() -> Result<()> {
                     apply_patches: !no_patches,
                 },
             )?;
-            println!("built {} sectors; sha1 {}", report.sectors, report.sha1);
+            for mismatch in &report.sha1_mismatches {
+                eprintln!("{}", format_sha1_warning(mismatch));
+            }
+            println!(
+                "built {} sectors; sha1 {}; hash warnings {}",
+                report.sectors,
+                report.sha1,
+                report.sha1_mismatches.len()
+            );
         }
     }
     Ok(())
@@ -175,6 +199,50 @@ mod tests {
                 "--include-defaults",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn include_hashes_flag_is_accepted_only_by_extract() {
+        let extract = Cli::try_parse_from([
+            "gcdgold",
+            "extract",
+            "--image",
+            "disc.bin",
+            "--include-hashes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            extract.command,
+            Command::Extract {
+                include_hashes: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "gcdgold",
+                "build",
+                "--manifest",
+                "disc.yaml",
+                "--include-hashes",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sha1_mismatch_warning_names_the_asset_and_both_hashes() {
+        let warning = format_sha1_warning(&gcdgold::Sha1Mismatch {
+            target: gcdgold::Sha1Target::Asset {
+                path: "FILE.BIN".to_owned(),
+            },
+            expected: "1111111111111111111111111111111111111111".to_owned(),
+            actual: "2222222222222222222222222222222222222222".to_owned(),
+        });
+        assert_eq!(
+            warning,
+            "warning: SHA-1 mismatch for asset FILE.BIN: expected 1111111111111111111111111111111111111111, actual 2222222222222222222222222222222222222222"
         );
     }
 

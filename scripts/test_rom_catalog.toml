@@ -1,3 +1,4 @@
 gcdgold = "../target/release/gcdgold"
-roms = "/mnt/e/redump/psx/complete"
-output = "../gcdgold-failures.csv"
+roms = "/mnt/e/redump/library/Sony - PlayStation"
+output = "../data/failures.csv"
+manifests = "../data/manifests"

@@ -37,6 +37,7 @@ class Configuration:
     gcdgold: Path
     roms: Path
     output: Path
+    manifests: Path | None
 
 
 @dataclass(frozen=True)
@@ -54,8 +55,14 @@ class AttemptOutcome:
 
 @dataclass(frozen=True)
 class Discovery:
-    images: tuple[Path, ...]
+    items: tuple[CatalogItem, ...]
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CatalogItem:
+    image: Path
+    cue: Path | None
 
 
 def resolve_configured_path(config_path: Path, value: str) -> Path:
@@ -78,10 +85,12 @@ def load_configuration(path: Path) -> Configuration:
     except tomllib.TOMLDecodeError as error:
         raise CatalogError(f"invalid TOML in {config_path}: {error}") from error
 
-    expected = {"gcdgold", "roms", "output"}
+    required = {"gcdgold", "roms", "output"}
+    optional = {"manifests"}
+    expected = required | optional
     actual = set(document)
-    if actual != expected:
-        missing = sorted(expected - actual)
+    if not required.issubset(actual) or not actual.issubset(expected):
+        missing = sorted(required - actual)
         unknown = sorted(actual - expected)
         details: list[str] = []
         if missing:
@@ -91,7 +100,7 @@ def load_configuration(path: Path) -> Configuration:
         raise CatalogError(f"invalid configuration ({'; '.join(details)})")
 
     values: dict[str, Path] = {}
-    for key in sorted(expected):
+    for key in sorted(actual):
         value = document[key]
         if not isinstance(value, str) or not value.strip():
             raise CatalogError(f"configuration key {key!r} must be a nonempty string")
@@ -101,6 +110,7 @@ def load_configuration(path: Path) -> Configuration:
         gcdgold=values["gcdgold"],
         roms=values["roms"],
         output=values["output"],
+        manifests=values.get("manifests"),
     )
 
 
@@ -142,6 +152,13 @@ def validate_configuration(configuration: Configuration) -> None:
     backup = appended_path(configuration.output, ".bak")
     if backup.exists() and backup.is_dir():
         raise CatalogError(f"backup path is a directory: {backup}")
+
+    if configuration.manifests is not None:
+        if configuration.manifests.exists() and not configuration.manifests.is_dir():
+            raise CatalogError(
+                f"manifest output path is not a directory: {configuration.manifests}"
+            )
+        configuration.manifests.mkdir(parents=True, exist_ok=True)
 
 
 def decode_cue(path: Path) -> str:
@@ -226,7 +243,7 @@ def relative_image_path(image: Path, roms: Path) -> str:
 
 
 def discover_images(roms: Path) -> Discovery:
-    images: list[Path] = []
+    items: list[CatalogItem] = []
     errors: list[str] = []
     seen: set[Path] = set()
 
@@ -241,9 +258,48 @@ def discover_images(roms: Path) -> Discovery:
                 continue
             if image not in seen:
                 seen.add(image)
-                images.append(image)
+                items.append(CatalogItem(image=image, cue=cue))
 
-    return Discovery(images=tuple(images), errors=tuple(errors))
+    return Discovery(items=tuple(items), errors=tuple(errors))
+
+
+def associate_cues(images: Sequence[Path], roms: Path) -> tuple[CatalogItem, ...]:
+    cues_by_image: dict[Path, Path] = {}
+    wanted = set(images)
+    for cue in discover_cues(roms):
+        cue_images, _ = parse_cue(cue)
+        for image in cue_images:
+            if image in wanted and image not in cues_by_image:
+                cues_by_image[image] = cue
+    return tuple(CatalogItem(image=image, cue=cues_by_image.get(image)) for image in images)
+
+
+def manifest_destination(directory: Path, cue: Path) -> Path:
+    return directory / cue.with_suffix(".yaml").name
+
+
+def manifest_preflight_failures(
+    items: Sequence[CatalogItem], directory: Path
+) -> dict[Path, str]:
+    targets: dict[Path, list[CatalogItem]] = {}
+    failures: dict[Path, str] = {}
+    for item in items:
+        if item.cue is None:
+            failures[item.image] = (
+                "manifest: no top-level CUE sheet selects this data track"
+            )
+            continue
+        target = manifest_destination(directory, item.cue)
+        targets.setdefault(target, []).append(item)
+
+    for target, matching_items in targets.items():
+        if len(matching_items) < 2:
+            continue
+        cue_names = ", ".join(item.cue.name for item in matching_items if item.cue)
+        reason = f"manifest: destination conflict for {target.name}: {cue_names}"
+        for item in matching_items:
+            failures[item.image] = reason
+    return failures
 
 
 def load_retry_images(output: Path, roms: Path) -> tuple[Path, ...]:
@@ -369,7 +425,9 @@ def compare_files(source: Path, rebuilt: Path) -> AttemptOutcome:
             offset += len(expected_chunk)
 
 
-def run_round_trip(gcdgold: Path, image: Path) -> AttemptOutcome:
+def run_round_trip(
+    gcdgold: Path, image: Path, saved_manifest: Path | None = None
+) -> AttemptOutcome:
     if not image.exists():
         return AttemptOutcome(
             passed=False,
@@ -401,6 +459,18 @@ def run_round_trip(gcdgold: Path, image: Path) -> AttemptOutcome:
         )
         if extraction.returncode != 0:
             return command_failure("extract", extraction)
+
+        if saved_manifest is not None:
+            try:
+                install_manifest(manifest, saved_manifest)
+            except (CatalogError, OSError) as error:
+                return AttemptOutcome(
+                    passed=False,
+                    reason=(
+                        "manifest: I/O error: "
+                        f"{normalize_message(str(error))}"
+                    ),
+                )
 
         building = run_command(
             [
@@ -440,6 +510,19 @@ def copy_and_fsync(source: Path, destination: Path) -> None:
         os.fsync(output_file.fileno())
 
 
+def install_manifest(source: Path, destination: Path) -> None:
+    temporary = appended_path(destination, ".tmp")
+    for label, path in (("manifest", destination), ("manifest staging", temporary)):
+        if path.is_symlink():
+            raise CatalogError(f"{label} path must not be a symlink: {path}")
+        if path.exists() and not path.is_file():
+            raise CatalogError(f"{label} path is not a regular file: {path}")
+
+    copy_and_fsync(source, temporary)
+    os.replace(temporary, destination)
+    fsync_directory(destination.parent)
+
+
 def fsync_directory(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -471,11 +554,21 @@ def pass_rate(passed: int, failed: int) -> float:
 def process_catalog(configuration: Configuration) -> int:
     if configuration.output.exists():
         images = load_retry_images(configuration.output, configuration.roms)
+        if configuration.manifests is None:
+            items = tuple(CatalogItem(image=image, cue=None) for image in images)
+        else:
+            items = associate_cues(images, configuration.roms)
         discovery_errors: tuple[str, ...] = ()
     else:
         discovery = discover_images(configuration.roms)
-        images = discovery.images
+        items = discovery.items
         discovery_errors = discovery.errors
+
+    manifest_failures = (
+        manifest_preflight_failures(items, configuration.manifests)
+        if configuration.manifests is not None
+        else {}
+    )
 
     for message in discovery_errors:
         print(f"discovery error: {message}", file=sys.stderr, flush=True)
@@ -486,17 +579,29 @@ def process_catalog(configuration: Configuration) -> int:
 
     with temporary_output.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
-        for position, image in enumerate(images, start=1):
+        for position, item in enumerate(items, start=1):
+            image = item.image
             data_path = relative_image_path(image, configuration.roms)
             started = time.monotonic()
-            outcome = run_round_trip(configuration.gcdgold, image)
+            preflight_failure = manifest_failures.get(image)
+            if preflight_failure is not None:
+                outcome = AttemptOutcome(passed=False, reason=preflight_failure)
+            else:
+                saved_manifest = (
+                    manifest_destination(configuration.manifests, item.cue)
+                    if configuration.manifests is not None and item.cue is not None
+                    else None
+                )
+                outcome = run_round_trip(
+                    configuration.gcdgold, image, saved_manifest
+                )
             elapsed = time.monotonic() - started
 
             if outcome.passed:
                 passed += 1
                 rate = pass_rate(passed, failed)
                 print(
-                    f"[{position}/{len(images)}, rate: {rate:.2f}%] "
+                    f"[{position}/{len(items)}, rate: {rate:.2f}%] "
                     f"PASS {data_path} ({elapsed:.1f}s)",
                     flush=True,
                 )
@@ -507,7 +612,7 @@ def process_catalog(configuration: Configuration) -> int:
             writer.writerow([data_path, outcome.reason])
             fsync_file(output)
             print(
-                f"[{position}/{len(images)}, rate: {rate:.2f}%] "
+                f"[{position}/{len(items)}, rate: {rate:.2f}%] "
                 f"FAIL {data_path}: "
                 f"{outcome.reason} ({elapsed:.1f}s)",
                 flush=True,
@@ -520,7 +625,7 @@ def process_catalog(configuration: Configuration) -> int:
     print(
         "summary: "
         f"passed={passed} failed={failed} rate={rate:.2f}% "
-        f"discovery_errors={len(discovery_errors)} total={len(images)}",
+        f"discovery_errors={len(discovery_errors)} total={len(items)}",
         flush=True,
     )
     return 1 if failed or discovery_errors else 0
