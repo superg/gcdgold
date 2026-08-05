@@ -3,7 +3,7 @@
 ## Stack
 
 - Rust 2024, with `unsafe` forbidden.
-- `clap` for the command line, Serde plus `yaml_serde` for manifests, `sha1` for legacy track identity, and `ecmlib` for CD-ROM EDC/ECC handling.
+- `clap` for the command line, Serde plus `yaml_serde` for manifests, `sha1` for legacy track identity, `crc` for CD-ROM EDC, and native safe-Rust ECC handling.
 - The raw 2352-byte BIN is the only image source of truth.
 
 ## Engineering rules

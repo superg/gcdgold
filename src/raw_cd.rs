@@ -1,7 +1,7 @@
 use std::fmt;
 
 use anyhow::{Context, Result, bail, ensure};
-use ecmlib::{Decoder, Encoder, Optimizations, SectorType};
+use crc::{CRC_32_CD_ROM_EDC, Crc};
 use serde::de;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -9,6 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub const RAW_SECTOR_SIZE: usize = 2352;
 pub const LOGICAL_BLOCK_SIZE: usize = 2048;
 pub const MODE2_DATA_SIZE: usize = 2336;
+const CD_ROM_EDC: Crc<u32> = Crc::<u32>::new(&CRC_32_CD_ROM_EDC);
+const ECC_TABLES: EccTables = make_ecc_tables();
 pub const SYNC: [u8; 12] = [
     0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
 ];
@@ -241,7 +243,6 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         "unsupported sector mode at sector 0"
     );
     let start_frame = msf_to_frame([first[12], first[13], first[14]])?;
-    let detector = Encoder::new(Optimizations::all());
     let mut sectors = Vec::with_capacity(bytes.len() / RAW_SECTOR_SIZE);
 
     for (index, chunk) in bytes.chunks_exact(RAW_SECTOR_SIZE).enumerate() {
@@ -271,16 +272,23 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
             chunk[12..15] == expected,
             "non-monotonic MSF at sector {index}"
         );
-        let detected = detector
-            .detect_sector_type(chunk)
-            .with_context(|| format!("detecting sector type at sector {index}"))?;
         if track_mode == 1 {
-            let kind = match detected {
-                SectorType::Mode1 => Kind::Mode1,
-                SectorType::Mode1Gap => Kind::Mode1Gap,
-                other => {
-                    bail!("unsupported or invalid sector type {other:?} at sector {index}")
-                }
+            ensure!(
+                chunk[2068..2076].iter().all(|byte| *byte == 0),
+                "nonzero Mode 1 reserved bytes are unsupported at sector {index}"
+            );
+            ensure!(
+                edc_matches(&chunk[..2064], &chunk[2064..2068]),
+                "invalid Mode 1 EDC at sector {index}"
+            );
+            ensure!(
+                ecc_matches(chunk, chunk[12..16].try_into()?),
+                "invalid Mode 1 ECC at sector {index}"
+            );
+            let kind = if chunk[16..2064].iter().all(|byte| *byte == 0) {
+                Kind::Mode1Gap
+            } else {
+                Kind::Mode1
             };
             let mut sector = [0_u8; RAW_SECTOR_SIZE];
             sector.copy_from_slice(chunk);
@@ -297,24 +305,25 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
         let subheader = XaSubheader::from(subheader_bytes);
         let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&chunk[20..24])?);
-        let noncompliant_ecc = detected == SectorType::Mode2
-            && !subheader.submode.contains(XaSubmodeFlag::Form2)
-            && recorded_header_ecc_matches(chunk);
-        let kind = if subheader.submode.contains(XaSubmodeFlag::Form2) {
-            Kind::Form2
-        } else if noncompliant_ecc {
-            Kind::XaGap
+        let form2 = subheader.submode.contains(XaSubmodeFlag::Form2);
+        let form2_edc_valid = form2 && edc_matches(&chunk[16..2348], &chunk[2348..2352]);
+        let (kind, noncompliant_ecc) = if form2 {
+            (Kind::Form2, false)
+        } else if chunk[16..].iter().all(|byte| *byte == 0)
+            || (chunk[16..20] == chunk[20..24] && chunk[24..].iter().all(|byte| *byte == 0))
+        {
+            (Kind::XaGap, false)
+        } else if edc_matches(&chunk[16..2072], &chunk[2072..2076]) && ecc_matches(chunk, [0; 4]) {
+            (Kind::Form1, false)
+        } else if !edc_matches(&chunk[16..2348], &chunk[2348..2352])
+            && recorded_header_ecc_matches(chunk)
+        {
+            (Kind::XaGap, true)
         } else {
-            match detected {
-                SectorType::Mode2Xa1 | SectorType::Mode2Xa1Gap => Kind::Form1,
-                SectorType::Mode2Gap | SectorType::Mode2XaGap => Kind::XaGap,
-                other => bail!("unsupported or invalid sector type {other:?} at sector {index}"),
-            }
+            bail!("unsupported or invalid Mode 2 sector at sector {index}")
         };
         let mut sector = [0_u8; RAW_SECTOR_SIZE];
         sector.copy_from_slice(chunk);
-        let form2_edc_valid = kind == Kind::Form2
-            && matches!(detected, SectorType::Mode2Xa2 | SectorType::Mode2Xa2Gap);
         sectors.push(ParsedSector {
             bytes: sector,
             kind,
@@ -327,17 +336,11 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
     Ok((start_frame, sectors))
 }
 
-pub struct SectorWriter {
-    standard: Decoder,
-    gap: Decoder,
-}
+pub struct SectorWriter;
 
 impl SectorWriter {
-    pub fn new() -> Self {
-        Self {
-            standard: Decoder::new(),
-            gap: Decoder::new(),
-        }
+    pub const fn new() -> Self {
+        Self
     }
 
     pub fn mode1(&mut self, frame: u32, data: &[u8]) -> Result<Vec<u8>> {
@@ -345,19 +348,16 @@ impl SectorWriter {
             data.len() == LOGICAL_BLOCK_SIZE,
             "Mode 1 payload must be 2048 bytes"
         );
-        self.standard
-            .decode_sector(data, SectorType::Mode1, frame, Optimizations::all())
-            .context("generating Mode 1 sector")
+        let mut sector = initialized_sector(frame, 1)?;
+        sector[16..2064].copy_from_slice(data);
+        let edc = generate_edc(&sector[..2064]).to_le_bytes();
+        sector[2064..2068].copy_from_slice(&edc);
+        write_ecc(&mut sector, frame_header(frame, 1)?);
+        Ok(sector)
     }
 
     pub fn form1(&mut self, frame: u32, subheader: XaSubheader, data: &[u8]) -> Result<Vec<u8>> {
-        ensure!(data.len() == 2048, "Form 1 payload must be 2048 bytes");
-        let mut compact = Vec::with_capacity(2052);
-        compact.extend_from_slice(&<[u8; 4]>::from(subheader));
-        compact.extend_from_slice(data);
-        self.standard
-            .decode_sector(&compact, SectorType::Mode2Xa1, frame, Optimizations::all())
-            .context("generating Form 1 sector")
+        self.form1_with_subheaders(frame, subheader, subheader, data)
     }
 
     pub fn form1_with_subheaders(
@@ -367,10 +367,12 @@ impl SectorWriter {
         subheader_copy: XaSubheader,
         data: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut sector = self.form1(frame, subheader, data)?;
+        ensure!(data.len() == 2048, "Form 1 payload must be 2048 bytes");
+        let mut sector = initialized_sector(frame, 2)?;
+        sector[16..20].copy_from_slice(&<[u8; 4]>::from(subheader));
         sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
-        regenerate_mode2_protection(&mut sector, true, false)
-            .context("generating Form 1 protection with distinct subheaders")?;
+        sector[24..2072].copy_from_slice(data);
+        regenerate_mode2_protection(&mut sector, true, false)?;
         Ok(sector)
     }
 
@@ -381,18 +383,7 @@ impl SectorWriter {
         data: &[u8],
         computed_edc: bool,
     ) -> Result<Vec<u8>> {
-        ensure!(data.len() == 2324, "Form 2 payload must be 2324 bytes");
-        let mut compact = Vec::with_capacity(2332);
-        compact.extend_from_slice(&<[u8; 4]>::from(subheader));
-        compact.extend_from_slice(data);
-        let mut optimizations = Optimizations::all();
-        if !computed_edc {
-            optimizations.remove(Optimizations::RemoveEDC);
-            compact.extend_from_slice(&[0; 4]);
-        }
-        self.standard
-            .decode_sector(&compact, SectorType::Mode2Xa2, frame, optimizations)
-            .context("generating Form 2 sector")
+        self.form2_with_subheaders(frame, subheader, subheader, data, computed_edc)
     }
 
     pub fn form2_with_subheaders(
@@ -403,23 +394,21 @@ impl SectorWriter {
         data: &[u8],
         computed_edc: bool,
     ) -> Result<Vec<u8>> {
-        let mut sector = self.form2(frame, subheader, data, computed_edc)?;
+        ensure!(data.len() == 2324, "Form 2 payload must be 2324 bytes");
+        let mut sector = initialized_sector(frame, 2)?;
+        sector[16..20].copy_from_slice(&<[u8; 4]>::from(subheader));
         sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
-        regenerate_mode2_protection(&mut sector, computed_edc, false)
-            .context("generating Form 2 protection with distinct subheaders")?;
+        sector[24..2348].copy_from_slice(data);
+        regenerate_mode2_protection(&mut sector, computed_edc, false)?;
         Ok(sector)
     }
 
     pub fn xa_gap(&mut self, frame: u32, subheader: XaSubheader) -> Result<Vec<u8>> {
         let subheader = <[u8; 4]>::from(subheader);
-        self.gap
-            .decode_sector(
-                &subheader,
-                SectorType::Mode2XaGap,
-                frame,
-                Optimizations::all(),
-            )
-            .context("generating XA gap sector")
+        let mut sector = initialized_sector(frame, 2)?;
+        sector[16..20].copy_from_slice(&subheader);
+        sector[20..24].copy_from_slice(&subheader);
+        Ok(sector)
     }
 
     pub fn xa_gap_with_recorded_header_ecc(
@@ -433,13 +422,26 @@ impl SectorWriter {
     }
 }
 
+fn frame_header(frame: u32, mode: u8) -> Result<[u8; 4]> {
+    let [minute, second, frame] = frame_to_msf(frame)?;
+    Ok([minute, second, frame, mode])
+}
+
+fn initialized_sector(frame: u32, mode: u8) -> Result<Vec<u8>> {
+    let mut sector = vec![0; RAW_SECTOR_SIZE];
+    sector[..12].copy_from_slice(&SYNC);
+    sector[12..16].copy_from_slice(&frame_header(frame, mode)?);
+    Ok(sector)
+}
+
 fn recorded_header_ecc_matches(sector: &[u8]) -> bool {
     if sector.len() != RAW_SECTOR_SIZE || sector[16..2076].iter().any(|byte| *byte != 0) {
         return false;
     }
-    let mut generated = sector.to_vec();
-    write_recorded_header_ecc(&mut generated);
-    generated[2076..] == sector[2076..]
+    ecc_matches(
+        sector,
+        sector[12..16].try_into().expect("four-byte CD header"),
+    )
 }
 
 pub(crate) fn regenerate_mode2_protection(
@@ -480,91 +482,129 @@ pub(crate) fn regenerate_mode2_protection(
 }
 
 fn generate_edc(data: &[u8]) -> u32 {
-    let mut edc = 0_u32;
-    for byte in data {
-        edc = (edc >> 8) ^ EDC_LOOKUP[usize::from((edc as u8) ^ byte)];
-    }
-    edc
+    CD_ROM_EDC.checksum(data)
 }
 
-const EDC_LOOKUP: [u32; 256] = make_edc_lookup();
-
-const fn make_edc_lookup() -> [u32; 256] {
-    let mut lookup = [0_u32; 256];
-    let mut index = 0;
-    while index < lookup.len() {
-        let mut value = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            value = (value >> 1) ^ if value & 1 != 0 { 0xd801_8001 } else { 0 };
-            bit += 1;
-        }
-        lookup[index] = value;
-        index += 1;
-    }
-    lookup
+fn edc_matches(data: &[u8], stored: &[u8]) -> bool {
+    generate_edc(data).to_le_bytes() == stored
 }
 
 fn write_standard_form1_ecc(sector: &mut [u8]) {
-    let mut p = [0_u8; 172];
-    generate_ecc_pq(&[0; 4], &sector[16..2076], &mut p, 86, 24, 2, 86);
-    sector[2076..2248].copy_from_slice(&p);
-    let mut q = [0_u8; 104];
-    generate_ecc_pq(&[0; 4], &sector[16..2248], &mut q, 52, 43, 86, 88);
-    sector[2248..2352].copy_from_slice(&q);
+    write_ecc(sector, [0; 4]);
 }
 
 fn write_recorded_header_ecc(sector: &mut [u8]) {
     debug_assert_eq!(sector.len(), RAW_SECTOR_SIZE);
     let address: [u8; 4] = sector[12..16].try_into().expect("four-byte CD header");
-    let mut p = [0_u8; 172];
-    generate_ecc_pq(&address, &sector[16..2076], &mut p, 86, 24, 2, 86);
-    sector[2076..2248].copy_from_slice(&p);
-    let mut q = [0_u8; 104];
-    generate_ecc_pq(&address, &sector[16..2248], &mut q, 52, 43, 86, 88);
-    sector[2248..2352].copy_from_slice(&q);
+    write_ecc(sector, address);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn generate_ecc_pq(
-    address: &[u8],
-    data: &[u8],
-    ecc: &mut [u8],
-    major_count: usize,
-    minor_count: usize,
-    major_mult: usize,
-    minor_inc: usize,
-) {
-    let mut forward = [0_u8; 256];
-    let mut backward = [0_u8; 256];
-    for index in 0..256 {
-        let next = ((index << 1) ^ if index & 0x80 != 0 { 0x11d } else { 0 }) & 0xff;
-        forward[index] = next as u8;
-        backward[index ^ next] = index as u8;
+fn write_ecc(sector: &mut [u8], address: [u8; 4]) {
+    {
+        let (data, parity) = sector.split_at_mut(2076);
+        generate_ecc_p(
+            &address,
+            data[16..].try_into().expect("fixed-size P source region"),
+            (&mut parity[..172])
+                .try_into()
+                .expect("fixed-size P parity region"),
+        );
     }
+    let (data, parity) = sector.split_at_mut(2248);
+    generate_ecc_q(
+        &address,
+        data[16..].try_into().expect("fixed-size Q source region"),
+        parity.try_into().expect("fixed-size Q parity region"),
+    );
+}
 
-    let size = major_count * minor_count;
-    for major in 0..major_count {
-        let mut index = (major >> 1) * major_mult + (major & 1);
+fn ecc_matches(sector: &[u8], address: [u8; 4]) -> bool {
+    let mut p = [0_u8; 172];
+    generate_ecc_p(
+        &address,
+        sector[16..2076]
+            .try_into()
+            .expect("fixed-size P source region"),
+        &mut p,
+    );
+    if p != sector[2076..2248] {
+        return false;
+    }
+    let mut q = [0_u8; 104];
+    generate_ecc_q(
+        &address,
+        sector[16..2248]
+            .try_into()
+            .expect("fixed-size Q source region"),
+        &mut q,
+    );
+    q == sector[2248..2352]
+}
+
+fn generate_ecc_p(address: &[u8; 4], data: &[u8; 2060], ecc: &mut [u8; 172]) {
+    generate_ecc::<2060, 172, 86, 24, 2, 86>(address, data, ecc);
+}
+
+fn generate_ecc_q(address: &[u8; 4], data: &[u8; 2232], ecc: &mut [u8; 104]) {
+    generate_ecc::<2232, 104, 52, 43, 86, 88>(address, data, ecc);
+}
+
+fn generate_ecc<
+    const DATA_LEN: usize,
+    const ECC_LEN: usize,
+    const MAJOR_COUNT: usize,
+    const MINOR_COUNT: usize,
+    const MAJOR_MULT: usize,
+    const MINOR_INC: usize,
+>(
+    address: &[u8; 4],
+    data: &[u8; DATA_LEN],
+    ecc: &mut [u8; ECC_LEN],
+) {
+    const ADDRESS_LEN: usize = 4;
+    debug_assert_eq!(DATA_LEN + ADDRESS_LEN, MAJOR_COUNT * MINOR_COUNT);
+    debug_assert_eq!(ECC_LEN, MAJOR_COUNT * 2);
+
+    let size = MAJOR_COUNT * MINOR_COUNT;
+    for major in 0..MAJOR_COUNT {
+        let mut index = (major >> 1) * MAJOR_MULT + (major & 1);
         let mut ecc_a = 0_u8;
         let mut ecc_b = 0_u8;
-        for _ in 0..minor_count {
-            let value = if index < 4 {
+        for _ in 0..MINOR_COUNT {
+            let value = if index < ADDRESS_LEN {
                 address[index]
             } else {
-                data[index - 4]
+                data[index - ADDRESS_LEN]
             };
-            index += minor_inc;
+            index += MINOR_INC;
             if index >= size {
                 index -= size;
             }
             ecc_b ^= value;
-            ecc_a = forward[usize::from(ecc_a ^ value)];
+            ecc_a = ECC_TABLES.forward[usize::from(ecc_a ^ value)];
         }
-        ecc_a = backward[usize::from(forward[usize::from(ecc_a)] ^ ecc_b)];
+        ecc_a = ECC_TABLES.backward[usize::from(ECC_TABLES.forward[usize::from(ecc_a)] ^ ecc_b)];
         ecc[major] = ecc_a;
-        ecc[major + major_count] = ecc_a ^ ecc_b;
+        ecc[major + MAJOR_COUNT] = ecc_a ^ ecc_b;
     }
+}
+
+struct EccTables {
+    forward: [u8; 256],
+    backward: [u8; 256],
+}
+
+const fn make_ecc_tables() -> EccTables {
+    let mut forward = [0_u8; 256];
+    let mut backward = [0_u8; 256];
+    let mut index = 0;
+    while index < 256 {
+        let next = ((index << 1) ^ if index & 0x80 != 0 { 0x11d } else { 0 }) & 0xff;
+        forward[index] = next as u8;
+        backward[index ^ next] = index as u8;
+        index += 1;
+    }
+    EccTables { forward, backward }
 }
 
 pub fn msf_to_frame(msf: [u8; 3]) -> Result<u32> {
@@ -890,5 +930,131 @@ mod tests {
             .xa_gap_with_recorded_header_ecc(frame, XaSubheader::default())
             .unwrap();
         assert_eq!(generated, raw);
+    }
+
+    #[test]
+    fn native_sector_writer_matches_ecmlib_golden_vectors() {
+        use sha1::{Digest, Sha1};
+
+        let mut writer = SectorWriter::new();
+        let sectors = [
+            (
+                "mode1",
+                writer.mode1(150, &[0x5a; LOGICAL_BLOCK_SIZE]).unwrap(),
+            ),
+            (
+                "form1_distinct",
+                writer
+                    .form1_with_subheaders(
+                        151,
+                        [1, 2, 0x08, 4].into(),
+                        [5, 6, 0x08, 8].into(),
+                        &[0x11; LOGICAL_BLOCK_SIZE],
+                    )
+                    .unwrap(),
+            ),
+            (
+                "form2_computed",
+                writer
+                    .form2(152, [9, 10, 0x20, 12].into(), &[0x22; 2324], true)
+                    .unwrap(),
+            ),
+            (
+                "form2_zero",
+                writer
+                    .form2(153, [9, 10, 0x20, 12].into(), &[0x22; 2324], false)
+                    .unwrap(),
+            ),
+            (
+                "xa_gap",
+                writer.xa_gap(154, XaSubheader::default()).unwrap(),
+            ),
+            (
+                "recorded_header_gap",
+                writer
+                    .xa_gap_with_recorded_header_ecc(81_860, XaSubheader::default())
+                    .unwrap(),
+            ),
+        ];
+        let expected = [
+            ("mode1", "0be5c2cdaef917dca3cb3c57cb612bf79abed8f6"),
+            ("form1_distinct", "756938d5cd9f0a05700b8df3df13c8fbf59eb98a"),
+            ("form2_computed", "2d379f2dc36c6f84bc31166b101245324e833523"),
+            ("form2_zero", "6ee8e62a7d381f6ce955def30b83485a7ab6b130"),
+            ("xa_gap", "f8f5ec8053c249225aa0d0a60471ae7af556cb34"),
+            (
+                "recorded_header_gap",
+                "cc8062656b0c811d50169317518353adea92c7bd",
+            ),
+        ];
+        for ((name, sector), (expected_name, expected_sha1)) in sectors.into_iter().zip(expected) {
+            assert_eq!(name, expected_name);
+            assert_eq!(hex::encode(Sha1::digest(sector)), expected_sha1, "{name}");
+        }
+    }
+
+    #[test]
+    fn edc_matches_the_cd_rom_catalog_check_value() {
+        assert_eq!(generate_edc(b"123456789"), 0x6ec2_edc4);
+    }
+
+    #[test]
+    fn ecc_tables_have_the_expected_inverse_relationship() {
+        for index in 0..256 {
+            let next = usize::from(ECC_TABLES.forward[index]);
+            assert_eq!(usize::from(ECC_TABLES.backward[index ^ next]), index);
+        }
+    }
+
+    #[test]
+    fn mode1_and_form1_protection_errors_are_rejected() {
+        let mode1 = SectorWriter::new()
+            .mode1(150, &[0x5a; LOGICAL_BLOCK_SIZE])
+            .unwrap();
+        let mut invalid_edc = mode1.clone();
+        invalid_edc[2064] ^= 1;
+        assert!(
+            parse_image(&invalid_edc)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid Mode 1 EDC at sector 0")
+        );
+        let mut invalid_ecc = mode1.clone();
+        invalid_ecc[2076] ^= 1;
+        assert!(
+            parse_image(&invalid_ecc)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid Mode 1 ECC at sector 0")
+        );
+        let mut reserved = mode1;
+        reserved[2068] = 1;
+        write_ecc(&mut reserved, frame_header(150, 1).unwrap());
+        assert!(
+            parse_image(&reserved)
+                .unwrap_err()
+                .to_string()
+                .contains("nonzero Mode 1 reserved bytes are unsupported at sector 0")
+        );
+
+        let form1 = SectorWriter::new()
+            .form1(150, [0, 0, 0x08, 0].into(), &[0x5a; LOGICAL_BLOCK_SIZE])
+            .unwrap();
+        let mut invalid_edc = form1.clone();
+        invalid_edc[2072] ^= 1;
+        assert!(
+            parse_image(&invalid_edc)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported or invalid Mode 2 sector at sector 0")
+        );
+        let mut invalid_ecc = form1;
+        invalid_ecc[2076] ^= 1;
+        assert!(
+            parse_image(&invalid_ecc)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported or invalid Mode 2 sector at sector 0")
+        );
     }
 }
