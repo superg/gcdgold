@@ -2294,6 +2294,17 @@ pub fn extract_with_options(
         !extracted_files.contains_key(&system_name),
         "system asset path collides with an extraction asset"
     );
+    let write_plan = if options.manifest_only {
+        None
+    } else {
+        Some(plan_extraction_outputs(
+            &mut manifest,
+            &mut extracted_files,
+            &system_bytes,
+            data_dir,
+            options.overwrite,
+        )?)
+    };
     if options.include_hashes {
         add_extracted_hashes(&mut manifest, &image, &system_bytes, &extracted_files)?;
     }
@@ -2313,34 +2324,19 @@ pub fn extract_with_options(
             .filter(|entry| entry.extent.is_some())
             .map(|entry| entry.path.as_str())
             .collect();
-        let interleaved_paths: HashSet<_> = manifest
-            .iso9660
-            .entries
-            .iter()
-            .filter(|entry| entry_uses_xa_sidecar(entry))
-            .map(|entry| entry.path.as_str())
-            .collect();
-        validate_data_directory(data_dir)?;
-        let system_path = safe_join(data_dir, &system_name)?;
-        validate_output_file(&system_path, options.overwrite, "system output")?;
         for entry in manifest
             .iso9660
             .entries
             .iter()
             .filter(|entry| entry.path != iso9660::ROOT_PATH)
         {
-            let output = safe_join(data_dir, &entry.path)?;
-            if authored_file_paths.contains(entry.path.as_str()) {
-                if !interleaved_paths.contains(entry.path.as_str()) {
-                    validate_output_file(&output, options.overwrite, "extraction output")?;
-                }
-            } else if !referenced_file_paths.contains(entry.path.as_str()) {
-                validate_output_directory(&output, options.overwrite, "extraction output")?;
+            if !authored_file_paths.contains(entry.path.as_str())
+                && !referenced_file_paths.contains(entry.path.as_str())
+            {
+                let output = safe_join(data_dir, &entry.path)?;
+                validate_output_ancestors(data_dir, &entry.path)?;
+                validate_output_directory(&output, "extraction output")?;
             }
-        }
-        for path in extracted_files.keys() {
-            let output = safe_join(data_dir, path)?;
-            validate_output_file(&output, options.overwrite, "extraction output")?;
         }
         create_output_parent(manifest_path, "manifest output")?;
         fs::create_dir_all(data_dir)
@@ -2351,21 +2347,24 @@ pub fn extract_with_options(
             .iter()
             .filter(|entry| entry.path != iso9660::ROOT_PATH)
         {
-            let output = safe_join(data_dir, &entry.path)?;
-            if authored_file_paths.contains(entry.path.as_str()) {
-                if !interleaved_paths.contains(entry.path.as_str())
-                    && let Some(parent) = output.parent()
-                {
-                    fs::create_dir_all(parent)?;
-                }
-            } else if !referenced_file_paths.contains(entry.path.as_str()) {
+            if !authored_file_paths.contains(entry.path.as_str())
+                && !referenced_file_paths.contains(entry.path.as_str())
+            {
+                let output = safe_join(data_dir, &entry.path)?;
                 fs::create_dir_all(&output)
                     .with_context(|| format!("creating directory {}", output.display()))?;
             }
         }
-        fs::write(&system_path, &system_bytes)
-            .with_context(|| format!("writing {}", system_path.display()))?;
+        let write_plan = write_plan.expect("non-manifest extraction has a write plan");
+        let system_path = safe_join(data_dir, &manifest.system_area.path)?;
+        if write_plan.system {
+            fs::write(&system_path, &system_bytes)
+                .with_context(|| format!("writing {}", system_path.display()))?;
+        }
         for (path, data) in extracted_files {
+            if !write_plan.assets.contains(&path) {
+                continue;
+            }
             let output = safe_join(data_dir, &path)?;
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
@@ -3344,15 +3343,8 @@ pub fn build_with_options(
         "unsupported track mode {}",
         manifest.track.mode
     );
-    ensure!(
-        manifest
-            .iso9660
-            .entries
-            .iter()
-            .all(|entry| entry.path != manifest.system_area.path),
-        "system asset path collides with an ISO entry"
-    );
     iso9660::validate(&manifest.iso9660)?;
+    validate_manifest_asset_paths(&manifest)?;
 
     let system_path = safe_join(data_dir, &manifest.system_area.path)?;
     let system = fs::read(&system_path)
@@ -3401,18 +3393,12 @@ pub fn build_with_options(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
-    let iso_paths: HashSet<_> = manifest
-        .iso9660
-        .entries
-        .iter()
-        .map(|entry| entry.path.as_str())
-        .collect();
     let mut secondary_paths = HashSet::new();
-    for (file, ordinary_sha1) in manifest
+    for (file, source, ordinary_sha1) in manifest
         .iso9660
         .files
         .iter()
-        .filter_map(FileLayoutItem::as_path_with_sha1)
+        .filter_map(FileLayoutItem::as_path_source_with_sha1)
     {
         let entry = entries_by_path[file];
         if entry_uses_xa_sidecar(entry) {
@@ -3434,8 +3420,8 @@ pub fn build_with_options(
                     "duplicate XA secondary asset path {asset}"
                 );
                 ensure!(
-                    !iso_paths.contains(asset) && asset != manifest.system_area.path,
-                    "XA secondary asset path collides with another authored asset: {asset}"
+                    asset != manifest.system_area.path,
+                    "XA secondary asset path collides with the system asset: {asset}"
                 );
                 let host_path = safe_join(data_dir, asset)?;
                 validate_input_file(&host_path, label)?;
@@ -3457,8 +3443,8 @@ pub fn build_with_options(
                     "duplicate XA secondary asset path {asset}"
                 );
                 ensure!(
-                    !iso_paths.contains(asset) && asset != manifest.system_area.path,
-                    "XA secondary asset path collides with another authored asset: {asset}"
+                    asset != manifest.system_area.path,
+                    "XA secondary asset path collides with the system asset: {asset}"
                 );
                 let host_path = safe_join(data_dir, asset)?;
                 validate_input_file(&host_path, "XAG")?;
@@ -3492,13 +3478,13 @@ pub fn build_with_options(
             );
             mixed_extents.insert(file.to_owned(), sectors);
         } else {
-            let path = safe_join(data_dir, file)?;
+            let path = safe_join(data_dir, source)?;
             let data = fs::read(&path)
                 .with_context(|| format!("reading authored file {}", path.display()))?;
             record_sha1_mismatch(
                 &mut sha1_mismatches,
                 Sha1Target::Asset {
-                    path: file.to_owned(),
+                    path: source.to_owned(),
                 },
                 ordinary_sha1,
                 &data,
@@ -3524,8 +3510,8 @@ pub fn build_with_options(
                 "duplicate XA secondary asset path {asset}"
             );
             ensure!(
-                !iso_paths.contains(asset) && asset != manifest.system_area.path,
-                "XA secondary asset path collides with another authored asset: {asset}"
+                asset != manifest.system_area.path,
+                "XA secondary asset path collides with the system asset: {asset}"
             );
             let host_path = safe_join(data_dir, asset)?;
             validate_input_file(&host_path, label)?;
@@ -3547,8 +3533,8 @@ pub fn build_with_options(
                 "duplicate XA secondary asset path {asset}"
             );
             ensure!(
-                !iso_paths.contains(asset) && asset != manifest.system_area.path,
-                "XA secondary asset path collides with another authored asset: {asset}"
+                asset != manifest.system_area.path,
+                "XA secondary asset path collides with the system asset: {asset}"
             );
             let host_path = safe_join(data_dir, asset)?;
             validate_input_file(&host_path, "XAG")?;
@@ -3929,6 +3915,342 @@ fn create_output_parent(path: &Path, label: &str) -> Result<()> {
         .with_context(|| format!("creating {label} directory {}", parent.display()))
 }
 
+struct ExtractionWritePlan {
+    system: bool,
+    assets: HashSet<String>,
+}
+
+fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
+    let entries_by_path = manifest
+        .iso9660
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut paths = vec![manifest.system_area.path.clone()];
+    for item in &manifest.iso9660.files {
+        match item {
+            FileLayoutItem::Path(file) => {
+                let entry = entries_by_path
+                    .get(file.path.as_str())
+                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
+                if entry_uses_xa_sidecar(entry) {
+                    let xa = entry.xa.as_ref().context("missing indexed XA metadata")?;
+                    paths.extend(
+                        [
+                            xa.form1.as_ref(),
+                            xa.form2.as_ref(),
+                            xa.index.as_ref(),
+                            xa.gap_index.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                    );
+                } else {
+                    paths.push(file.source.clone().unwrap_or_else(|| file.path.clone()));
+                }
+            }
+            FileLayoutItem::XaExtent(item) => {
+                let xa = &item.xa_extent;
+                paths.extend([xa.form1.clone(), xa.form2.clone(), xa.index.clone()]);
+                paths.extend(xa.gap_index.iter().cloned());
+            }
+            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+        }
+    }
+    Ok(paths)
+}
+
+fn numbered_asset_family(path: &str) -> Result<(String, String, u64)> {
+    let (parent, file_name) = path
+        .rsplit_once('/')
+        .map_or(("", path), |(parent, file_name)| (parent, file_name));
+    let (stem, number) = match file_name.rsplit_once('.') {
+        Some((stem, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let number = suffix
+                .parse::<u64>()
+                .with_context(|| format!("numeric asset suffix is too large: {path}"))?
+                .checked_add(1)
+                .with_context(|| format!("numeric asset suffix cannot be incremented: {path}"))?;
+            (stem, number)
+        }
+        _ => (file_name, 1),
+    };
+    Ok((parent.to_owned(), stem.to_owned(), number))
+}
+
+fn numbered_asset_path(parent: &str, stem: &str, number: u64) -> String {
+    if parent.is_empty() {
+        format!("{stem}.{number}")
+    } else {
+        format!("{parent}/{stem}.{number}")
+    }
+}
+
+fn existing_asset_matches(path: &Path, expected_sha1: &str) -> Result<bool> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading existing extraction asset {}", path.display()))?;
+    Ok(sha1_hex(&bytes) == expected_sha1)
+}
+
+fn resolve_extraction_asset_path(
+    nominal: &str,
+    bytes: &[u8],
+    data_dir: &Path,
+    overwrite: bool,
+    reserved: &HashSet<String>,
+    selected: &mut HashSet<String>,
+) -> Result<(String, bool)> {
+    let nominal_output = safe_join(data_dir, nominal)?;
+    validate_output_ancestors(data_dir, nominal)?;
+    if overwrite {
+        validate_output_file(&nominal_output, true, "extraction output")?;
+        ensure!(
+            selected.insert(nominal.to_owned()),
+            "duplicate selected extraction asset path {nominal}"
+        );
+        return Ok((nominal.to_owned(), true));
+    }
+
+    let expected_sha1 = sha1_hex(bytes);
+    match output_metadata(&nominal_output)? {
+        None => {
+            ensure!(
+                selected.insert(nominal.to_owned()),
+                "duplicate selected extraction asset path {nominal}"
+            );
+            return Ok((nominal.to_owned(), true));
+        }
+        Some(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "extraction output is a symlink: {}",
+                nominal_output.display()
+            );
+            ensure!(
+                metadata.is_file(),
+                "extraction output is not a regular file: {}",
+                nominal_output.display()
+            );
+            if existing_asset_matches(&nominal_output, &expected_sha1)? {
+                ensure!(
+                    selected.insert(nominal.to_owned()),
+                    "duplicate selected extraction asset path {nominal}"
+                );
+                return Ok((nominal.to_owned(), false));
+            }
+        }
+    }
+
+    let (parent, stem, mut number) = numbered_asset_family(nominal)?;
+    loop {
+        let candidate = numbered_asset_path(&parent, &stem, number);
+        number = number
+            .checked_add(1)
+            .context("numeric extraction asset suffix overflow")?;
+        if reserved.contains(&candidate) || selected.contains(&candidate) {
+            continue;
+        }
+        let output = safe_join(data_dir, &candidate)?;
+        validate_output_ancestors(data_dir, &candidate)?;
+        match output_metadata(&output)? {
+            None => {
+                ensure!(selected.insert(candidate.clone()));
+                return Ok((candidate, true));
+            }
+            Some(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                if existing_asset_matches(&output, &expected_sha1)? {
+                    ensure!(selected.insert(candidate.clone()));
+                    return Ok((candidate, false));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn validate_output_ancestors(base: &Path, relative: &str) -> Result<()> {
+    let relative = Path::new(relative);
+    let mut current = base.to_path_buf();
+    let component_count = relative.components().count();
+    for component in relative
+        .components()
+        .take(component_count.saturating_sub(1))
+    {
+        let Component::Normal(component) = component else {
+            anyhow::bail!("manifest path contains traversal or non-normal components: {relative:?}")
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "extraction output parent is a symlink: {}",
+                    current.display()
+                );
+                ensure!(
+                    metadata.is_dir(),
+                    "extraction output parent is not a directory: {}",
+                    current.display()
+                );
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting output parent {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mapped_extraction_asset(
+    path: &mut String,
+    assets: &mut HashMap<String, Vec<u8>>,
+    data_dir: &Path,
+    overwrite: bool,
+    reserved: &HashSet<String>,
+    selected: &mut HashSet<String>,
+    writes: &mut HashSet<String>,
+) -> Result<()> {
+    let nominal = path.clone();
+    let bytes = assets
+        .remove(&nominal)
+        .with_context(|| format!("missing extracted asset {nominal} during output planning"))?;
+    let (resolved, write) =
+        resolve_extraction_asset_path(&nominal, &bytes, data_dir, overwrite, reserved, selected)?;
+    if write {
+        writes.insert(resolved.clone());
+    }
+    *path = resolved.clone();
+    ensure!(
+        assets.insert(resolved.clone(), bytes).is_none(),
+        "resolved extraction asset path collides with another asset: {resolved}"
+    );
+    Ok(())
+}
+
+fn plan_extraction_outputs(
+    manifest: &mut Manifest,
+    assets: &mut HashMap<String, Vec<u8>>,
+    system: &[u8],
+    data_dir: &Path,
+    overwrite: bool,
+) -> Result<ExtractionWritePlan> {
+    validate_data_directory(data_dir)?;
+    validate_manifest_asset_paths(manifest)?;
+    let reserved = extraction_asset_paths(manifest)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut selected = HashSet::new();
+    let mut writes = HashSet::new();
+    let (system_path, write_system) = resolve_extraction_asset_path(
+        &manifest.system_area.path,
+        system,
+        data_dir,
+        overwrite,
+        &reserved,
+        &mut selected,
+    )?;
+    manifest.system_area.path = system_path;
+
+    for item_index in 0..manifest.iso9660.files.len() {
+        let snapshot = manifest.iso9660.files[item_index].clone();
+        match snapshot {
+            FileLayoutItem::Path(file) => {
+                let entry_index = manifest
+                    .iso9660
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path == file.path)
+                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
+                if entry_uses_xa_sidecar(&manifest.iso9660.entries[entry_index]) {
+                    let xa = manifest.iso9660.entries[entry_index]
+                        .xa
+                        .as_mut()
+                        .context("missing indexed XA metadata")?;
+                    for path in [
+                        &mut xa.form1,
+                        &mut xa.form2,
+                        &mut xa.index,
+                        &mut xa.gap_index,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        resolve_mapped_extraction_asset(
+                            path,
+                            assets,
+                            data_dir,
+                            overwrite,
+                            &reserved,
+                            &mut selected,
+                            &mut writes,
+                        )?;
+                    }
+                } else {
+                    let nominal = file.source.unwrap_or_else(|| file.path.clone());
+                    let mut resolved = nominal;
+                    resolve_mapped_extraction_asset(
+                        &mut resolved,
+                        assets,
+                        data_dir,
+                        overwrite,
+                        &reserved,
+                        &mut selected,
+                        &mut writes,
+                    )?;
+                    let FileLayoutItem::Path(item) = &mut manifest.iso9660.files[item_index] else {
+                        unreachable!("snapshot preserves file layout kind")
+                    };
+                    item.source = (resolved != item.path).then_some(resolved);
+                }
+            }
+            FileLayoutItem::XaExtent(_) => {
+                let FileLayoutItem::XaExtent(item) = &mut manifest.iso9660.files[item_index] else {
+                    unreachable!("snapshot preserves file layout kind")
+                };
+                let xa = &mut item.xa_extent;
+                for path in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
+                    resolve_mapped_extraction_asset(
+                        path,
+                        assets,
+                        data_dir,
+                        overwrite,
+                        &reserved,
+                        &mut selected,
+                        &mut writes,
+                    )?;
+                }
+                if let Some(path) = &mut xa.gap_index {
+                    resolve_mapped_extraction_asset(
+                        path,
+                        assets,
+                        data_dir,
+                        overwrite,
+                        &reserved,
+                        &mut selected,
+                        &mut writes,
+                    )?;
+                }
+            }
+            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+        }
+    }
+    validate_manifest_asset_paths(manifest)?;
+    ensure!(
+        selected.len() == assets.len() + 1,
+        "extraction output planning did not resolve every asset"
+    );
+    Ok(ExtractionWritePlan {
+        system: write_system,
+        assets: writes,
+    })
+}
+
 fn validate_data_directory(path: &Path) -> Result<()> {
     let Some(metadata) = output_metadata(path)? else {
         return Ok(());
@@ -3980,11 +4302,10 @@ fn validate_input_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_output_directory(path: &Path, overwrite: bool, label: &str) -> Result<()> {
+fn validate_output_directory(path: &Path, label: &str) -> Result<()> {
     let Some(metadata) = output_metadata(path)? else {
         return Ok(());
     };
-    ensure!(overwrite, "{label} already exists: {}", path.display());
     ensure!(
         !metadata.file_type().is_symlink(),
         "{label} is a symlink: {}",
@@ -4088,12 +4409,17 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
         match item {
             FileLayoutItem::Path(file) => {
                 validate_optional_sha1(file.sha1.as_deref(), &format!("asset {} sha1", file.path))?;
-                if file.sha1.is_some()
-                    && entries_by_path
-                        .get(file.path.as_str())
-                        .is_some_and(|entry| entry_uses_xa_sidecar(entry))
+                if entries_by_path
+                    .get(file.path.as_str())
+                    .is_some_and(|entry| entry_uses_xa_sidecar(entry))
                 {
-                    anyhow::bail!(
+                    ensure!(
+                        file.source.is_none(),
+                        "indexed XA file {} cannot declare an ordinary-file source",
+                        file.path
+                    );
+                    ensure!(
+                        file.sha1.is_none(),
                         "indexed XA file {} cannot declare an ordinary-file sha1",
                         file.path
                     );
@@ -4157,6 +4483,68 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
+    let entries_by_path = manifest
+        .iso9660
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut paths = HashSet::new();
+    let mut register = |path: &str, owner: &str| -> Result<()> {
+        safe_join(Path::new("."), path)
+            .with_context(|| format!("validating authored asset path for {owner}"))?;
+        ensure!(
+            paths.insert(path.to_owned()),
+            "duplicate authored asset path {path}"
+        );
+        Ok(())
+    };
+    register(&manifest.system_area.path, "system area")?;
+    for item in &manifest.iso9660.files {
+        match item {
+            FileLayoutItem::Path(file) => {
+                let entry = entries_by_path
+                    .get(file.path.as_str())
+                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
+                if entry_uses_xa_sidecar(entry) {
+                    let xa = entry.xa.as_ref().context("missing indexed XA metadata")?;
+                    for (path, label) in [
+                        (xa.form1.as_deref(), "XA1"),
+                        (xa.form2.as_deref(), "XA2"),
+                        (xa.index.as_deref(), "XAI"),
+                        (xa.gap_index.as_deref(), "XAG"),
+                    ] {
+                        if let Some(path) = path {
+                            register(path, &format!("{} {label}", file.path))?;
+                        }
+                    }
+                } else {
+                    register(
+                        file.source.as_deref().unwrap_or(&file.path),
+                        &format!("ordinary file {}", file.path),
+                    )?;
+                }
+            }
+            FileLayoutItem::XaExtent(item) => {
+                let xa = &item.xa_extent;
+                for (path, label) in [
+                    (Some(xa.form1.as_str()), "XA1"),
+                    (Some(xa.form2.as_str()), "XA2"),
+                    (Some(xa.index.as_str()), "XAI"),
+                    (xa.gap_index.as_deref(), "XAG"),
+                ] {
+                    if let Some(path) = path {
+                        register(path, &format!("unreferenced {label}"))?;
+                    }
+                }
+            }
+            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn record_sha1_mismatch(
     mismatches: &mut Vec<Sha1Mismatch>,
     target: Sha1Target,
@@ -4212,7 +4600,8 @@ fn add_extracted_hashes(
     for item in &mut manifest.iso9660.files {
         match item {
             FileLayoutItem::Path(file) if !indexed_paths.contains(&file.path) => {
-                set_extracted_asset_sha1(&file.path, &mut file.sha1, assets, &mut hashed_paths)?;
+                let path = file.source.as_deref().unwrap_or(&file.path);
+                set_extracted_asset_sha1(path, &mut file.sha1, assets, &mut hashed_paths)?;
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &mut item.xa_extent;
@@ -6132,11 +6521,13 @@ mod tests {
         let compact = serialize_manifest(&manifest, false).unwrap();
         assert!(!compact.contains("track:"));
         assert!(!compact.contains("sha1"));
+        assert!(!compact.contains("source:"));
         assert!(!compact.contains("metadata_subheader:"));
         assert!(!compact.contains("sector_subheader:"));
 
         let explicit = serialize_manifest(&manifest, true).unwrap();
         assert!(!explicit.contains("sha1"));
+        assert!(!explicit.contains("source:"));
         for expected in [
             "  mode: 2xa",
             "  start_msf: 00:02:00",
@@ -6150,6 +6541,22 @@ mod tests {
             assert!(explicit.lines().any(|line| line == expected));
         }
         assert!(yaml_serde::from_str::<Manifest>(&explicit).is_ok());
+
+        let mut sourced = manifest;
+        let FileLayoutItem::Path(file) = &mut sourced.iso9660.files[0] else {
+            panic!("expected ordinary file")
+        };
+        file.source = Some("FILE.BIN.1".to_owned());
+        assert!(
+            serialize_manifest(&sourced, false)
+                .unwrap()
+                .contains("source: FILE.BIN.1")
+        );
+        assert!(
+            serialize_manifest(&sourced, true)
+                .unwrap()
+                .contains("source: FILE.BIN.1")
+        );
     }
 
     #[test]
@@ -6430,8 +6837,8 @@ mod tests {
                 .iso9660
                 .files
                 .iter()
-                .filter_map(FileLayoutItem::as_path_with_sha1)
-                .all(|(_, sha1)| sha1.is_none())
+                .filter_map(FileLayoutItem::as_path_source_with_sha1)
+                .all(|(_, _, sha1)| sha1.is_none())
         );
 
         let data_dir = project.path().join("hashed-assets");
@@ -6463,9 +6870,9 @@ mod tests {
             .iso9660
             .files
             .iter()
-            .filter_map(FileLayoutItem::as_path_with_sha1)
-            .find(|(path, _)| *path == "FILE.BIN")
-            .and_then(|(_, sha1)| sha1)
+            .filter_map(FileLayoutItem::as_path_source_with_sha1)
+            .find(|(path, _, _)| *path == "FILE.BIN")
+            .and_then(|(_, _, sha1)| sha1)
             .unwrap();
         assert_eq!(
             file_sha1,
@@ -6651,12 +7058,333 @@ mod tests {
         let directory = project.path().join("existing-directory");
         fs::create_dir(&directory).unwrap();
         assert!(validate_output_file(&directory, true, "output").is_err());
-        assert!(validate_output_directory(&directory, false, "output").is_err());
-        validate_output_directory(&directory, true, "output").unwrap();
+        validate_output_directory(&directory, "output").unwrap();
 
         let nested = project.path().join("new/parent/manifest.yaml");
         create_output_parent(&nested, "manifest").unwrap();
         assert!(nested.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn numbered_asset_paths_increment_terminal_suffixes_and_fill_gaps() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("FILE"), b"old").unwrap();
+        fs::write(project.path().join("FILE.1"), b"also old").unwrap();
+        fs::write(project.path().join("FILE.2"), b"desired").unwrap();
+        let mut selected = HashSet::new();
+        let reserved = HashSet::from(["FILE".to_owned()]);
+        let (path, write) = resolve_extraction_asset_path(
+            "FILE",
+            b"desired",
+            project.path(),
+            false,
+            &reserved,
+            &mut selected,
+        )
+        .unwrap();
+        assert_eq!(path, "FILE.2");
+        assert!(!write);
+
+        let mut selected = HashSet::new();
+        let reserved = HashSet::from(["FILE".to_owned(), "FILE.1".to_owned()]);
+        fs::remove_file(project.path().join("FILE.2")).unwrap();
+        let (path, write) = resolve_extraction_asset_path(
+            "FILE",
+            b"desired",
+            project.path(),
+            false,
+            &reserved,
+            &mut selected,
+        )
+        .unwrap();
+        assert_eq!(path, "FILE.2");
+        assert!(write);
+
+        fs::write(project.path().join("NUMBERED.7"), b"old").unwrap();
+        let mut selected = HashSet::new();
+        let reserved = HashSet::from(["NUMBERED.7".to_owned()]);
+        let (path, write) = resolve_extraction_asset_path(
+            "NUMBERED.7",
+            b"new",
+            project.path(),
+            false,
+            &reserved,
+            &mut selected,
+        )
+        .unwrap();
+        assert_eq!(path, "NUMBERED.8");
+        assert!(write);
+
+        fs::write(project.path().join("GAP"), b"old").unwrap();
+        fs::write(project.path().join("GAP.2"), b"new").unwrap();
+        let mut selected = HashSet::new();
+        let reserved = HashSet::from(["GAP".to_owned()]);
+        let (path, write) = resolve_extraction_asset_path(
+            "GAP",
+            b"new",
+            project.path(),
+            false,
+            &reserved,
+            &mut selected,
+        )
+        .unwrap();
+        assert_eq!(path, "GAP.1");
+        assert!(write);
+
+        let mut selected = HashSet::new();
+        let (path, write) = resolve_extraction_asset_path(
+            "GAP",
+            b"replacement",
+            project.path(),
+            true,
+            &HashSet::from(["GAP".to_owned()]),
+            &mut selected,
+        )
+        .unwrap();
+        assert_eq!(path, "GAP");
+        assert!(write);
+    }
+
+    #[test]
+    fn extraction_output_planning_rewrites_system_and_xa_asset_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let mut manifest = test_manifest();
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
+            form1: Some("FILE.XA1".to_owned()),
+            form2: Some("FILE.XA2".to_owned()),
+            index: Some("FILE.XAI".to_owned()),
+            gap_index: Some("FILE.XAG".to_owned()),
+            ..crate::manifest::EntryXa::default()
+        });
+        manifest
+            .iso9660
+            .files
+            .push(FileLayoutItem::xa_extent(XaExtentAssets {
+                form1: "EXTRA.XA1".to_owned(),
+                form1_sha1: None,
+                form2: "EXTRA.XA2".to_owned(),
+                form2_sha1: None,
+                index: "EXTRA.XAI".to_owned(),
+                index_sha1: None,
+                gap_index: Some("EXTRA.XAG".to_owned()),
+                gap_index_sha1: None,
+            }));
+        let mut assets = HashMap::from([
+            ("FILE.XA1".to_owned(), vec![1]),
+            ("FILE.XA2".to_owned(), vec![2]),
+            ("FILE.XAI".to_owned(), vec![3]),
+            ("FILE.XAG".to_owned(), Vec::new()),
+            ("EXTRA.XA1".to_owned(), vec![4]),
+            ("EXTRA.XA2".to_owned(), vec![5]),
+            ("EXTRA.XAI".to_owned(), vec![6]),
+            ("EXTRA.XAG".to_owned(), Vec::new()),
+        ]);
+        for path in extraction_asset_paths(&manifest).unwrap() {
+            fs::write(project.path().join(path), b"different").unwrap();
+        }
+        let plan =
+            plan_extraction_outputs(&mut manifest, &mut assets, b"system", project.path(), false)
+                .unwrap();
+        assert_eq!(manifest.system_area.path, "sample.system.1");
+        let xa = manifest.iso9660.entries[1].xa.as_ref().unwrap();
+        assert_eq!(xa.form1.as_deref(), Some("FILE.XA1.1"));
+        assert_eq!(xa.form2.as_deref(), Some("FILE.XA2.1"));
+        assert_eq!(xa.index.as_deref(), Some("FILE.XAI.1"));
+        assert_eq!(xa.gap_index.as_deref(), Some("FILE.XAG.1"));
+        let extra = manifest
+            .iso9660
+            .files
+            .last()
+            .unwrap()
+            .as_xa_extent()
+            .unwrap();
+        assert_eq!(extra.form1, "EXTRA.XA1.1");
+        assert_eq!(extra.form2, "EXTRA.XA2.1");
+        assert_eq!(extra.index, "EXTRA.XAI.1");
+        assert_eq!(extra.gap_index.as_deref(), Some("EXTRA.XAG.1"));
+        assert!(plan.system);
+        assert_eq!(plan.assets.len(), assets.len());
+        assert!(assets.contains_key("FILE.XAG.1"));
+        assert!(assets["FILE.XAG.1"].is_empty());
+    }
+
+    #[test]
+    fn ordinary_sources_validate_and_build_from_the_resolved_host_path() {
+        let project = tempfile::tempdir().unwrap();
+        let (raw, _) = build_redump_integration_fixture(project.path());
+        let image_path = project.path().join("source.bin");
+        let data_dir = project.path().join("shared");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("shared.system"), b"old system").unwrap();
+        fs::write(data_dir.join("FILE.BIN"), b"old file").unwrap();
+
+        let first_manifest = project.path().join("first/shared.yaml");
+        extract_with_options(
+            &image_path,
+            &first_manifest,
+            &data_dir,
+            ExtractOptions {
+                manifest_only: false,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: true,
+            },
+        )
+        .unwrap();
+        let first: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(&first_manifest).unwrap()).unwrap();
+        assert_eq!(first.system_area.path, "shared.system.1");
+        let FileLayoutItem::Path(file) = first
+            .iso9660
+            .files
+            .iter()
+            .find(|item| item.as_path() == Some("FILE.BIN"))
+            .unwrap()
+        else {
+            panic!("expected ordinary file")
+        };
+        assert_eq!(file.source.as_deref(), Some("FILE.BIN.1"));
+        assert_eq!(
+            file.sha1.as_deref(),
+            Some(sha1_hex(&fs::read(data_dir.join("FILE.BIN.1")).unwrap()).as_str())
+        );
+        assert_eq!(
+            fs::read(data_dir.join("shared.system")).unwrap(),
+            b"old system"
+        );
+        assert_eq!(fs::read(data_dir.join("FILE.BIN")).unwrap(), b"old file");
+
+        let rebuilt = project.path().join("rebuilt.bin");
+        let report = build(&first_manifest, &rebuilt, &data_dir, false).unwrap();
+        assert!(report.sha1_mismatches.is_empty());
+        assert_eq!(fs::read(rebuilt).unwrap(), raw);
+
+        let second_manifest = project.path().join("second/shared.yaml");
+        extract_with_options(
+            &image_path,
+            &second_manifest,
+            &data_dir,
+            ExtractOptions {
+                manifest_only: false,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: false,
+            },
+        )
+        .unwrap();
+        let second: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(second_manifest).unwrap()).unwrap();
+        assert_eq!(second.system_area.path, "shared.system.1");
+        let FileLayoutItem::Path(file) = second
+            .iso9660
+            .files
+            .iter()
+            .find(|item| item.as_path() == Some("FILE.BIN"))
+            .unwrap()
+        else {
+            panic!("expected ordinary file")
+        };
+        assert_eq!(file.source.as_deref(), Some("FILE.BIN.1"));
+
+        let manifest_only_path = project.path().join("third/shared.yaml");
+        extract_with_options(
+            &image_path,
+            &manifest_only_path,
+            &data_dir,
+            ExtractOptions {
+                manifest_only: true,
+                overwrite: false,
+                include_defaults: false,
+                include_hashes: false,
+            },
+        )
+        .unwrap();
+        let manifest_only: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(manifest_only_path).unwrap()).unwrap();
+        assert_eq!(manifest_only.system_area.path, "shared.system");
+        let FileLayoutItem::Path(file) = manifest_only
+            .iso9660
+            .files
+            .iter()
+            .find(|item| item.as_path() == Some("FILE.BIN"))
+            .unwrap()
+        else {
+            panic!("expected ordinary file")
+        };
+        assert!(file.source.is_none());
+        assert!(!data_dir.join("shared.system.2").exists());
+        assert!(!data_dir.join("FILE.BIN.2").exists());
+
+        let overwrite_manifest_path = project.path().join("fourth/shared.yaml");
+        extract_with_options(
+            &image_path,
+            &overwrite_manifest_path,
+            &data_dir,
+            ExtractOptions {
+                manifest_only: false,
+                overwrite: true,
+                include_defaults: false,
+                include_hashes: false,
+            },
+        )
+        .unwrap();
+        let overwritten: Manifest =
+            yaml_serde::from_str(&fs::read_to_string(overwrite_manifest_path).unwrap()).unwrap();
+        assert_eq!(overwritten.system_area.path, "shared.system");
+        let FileLayoutItem::Path(file) = overwritten
+            .iso9660
+            .files
+            .iter()
+            .find(|item| item.as_path() == Some("FILE.BIN"))
+            .unwrap()
+        else {
+            panic!("expected ordinary file")
+        };
+        assert!(file.source.is_none());
+
+        let mut changed = fs::read(data_dir.join("FILE.BIN.1")).unwrap();
+        changed[0] ^= 0xff;
+        fs::write(data_dir.join("FILE.BIN.1"), changed).unwrap();
+        let report = build(
+            &first_manifest,
+            &project.path().join("changed-source.bin"),
+            &data_dir,
+            false,
+        )
+        .unwrap();
+        assert!(report.sha1_mismatches.iter().any(|mismatch| {
+            mismatch.target
+                == (Sha1Target::Asset {
+                    path: "FILE.BIN.1".to_owned(),
+                })
+        }));
+    }
+
+    #[test]
+    fn indexed_sources_and_duplicate_or_unsafe_host_paths_are_rejected() {
+        let mut manifest = test_manifest();
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
+            form1: Some("FILE.XA1".to_owned()),
+            form2: Some("FILE.XA2".to_owned()),
+            index: Some("FILE.XAI".to_owned()),
+            ..crate::manifest::EntryXa::default()
+        });
+        let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] else {
+            panic!("expected path item")
+        };
+        file.source = Some("OTHER.BIN".to_owned());
+        assert!(validate_manifest_hashes(&manifest).is_err());
+
+        manifest.iso9660.entries[1].xa = None;
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+            file.source = Some("../escape".to_owned());
+        }
+        assert!(validate_manifest_asset_paths(&manifest).is_err());
+
+        if let FileLayoutItem::Path(file) = &mut manifest.iso9660.files[0] {
+            file.source = Some("sample.system".to_owned());
+        }
+        assert!(validate_manifest_asset_paths(&manifest).is_err());
     }
 
     #[cfg(unix)]
@@ -6673,6 +7401,13 @@ mod tests {
         assert!(validate_input_file(&alias, "input").is_err());
         assert!(validate_output_file(&alias, true, "output").is_err());
         assert_eq!(fs::read(target).unwrap(), b"sentinel");
+
+        let data_dir = project.path().join("data");
+        let outside = project.path().join("outside");
+        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, data_dir.join("LINK")).unwrap();
+        assert!(validate_output_ancestors(&data_dir, "LINK/FILE.BIN").is_err());
     }
 
     #[test]

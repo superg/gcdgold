@@ -910,6 +910,8 @@ pub enum FileLayoutItem {
 pub struct FilePathItem {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
 }
 
@@ -978,6 +980,7 @@ impl FileLayoutItem {
     pub fn path(path: impl Into<String>) -> Self {
         Self::Path(FilePathItem {
             path: path.into(),
+            source: None,
             sha1: None,
         })
     }
@@ -1061,9 +1064,13 @@ impl FileLayoutItem {
         }
     }
 
-    pub fn as_path_with_sha1(&self) -> Option<(&str, Option<&str>)> {
+    pub fn as_path_source_with_sha1(&self) -> Option<(&str, &str, Option<&str>)> {
         match self {
-            Self::Path(item) => Some((&item.path, item.sha1.as_deref())),
+            Self::Path(item) => Some((
+                &item.path,
+                item.source.as_deref().unwrap_or(&item.path),
+                item.sha1.as_deref(),
+            )),
             Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
         }
     }
@@ -1833,6 +1840,24 @@ mod tests {
         let yaml = "- path: SYSTEM.CNF\n- gap: 13\n- path: WAD.WAD\n";
         let files: Vec<FileLayoutItem> = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(yaml_serde::to_string(&files).unwrap(), yaml);
+    }
+
+    #[test]
+    fn ordinary_file_source_is_an_optional_host_path() {
+        let yaml = "- path: SYSTEM.CNF\n  source: SYSTEM.CNF.1\n";
+        let files: Vec<FileLayoutItem> = yaml_serde::from_str(yaml).unwrap();
+        let FileLayoutItem::Path(file) = &files[0] else {
+            panic!("expected path item")
+        };
+        assert_eq!(file.path, "SYSTEM.CNF");
+        assert_eq!(file.source.as_deref(), Some("SYSTEM.CNF.1"));
+        assert_eq!(yaml_serde::to_string(&files).unwrap(), yaml);
+
+        let legacy: Vec<FileLayoutItem> = yaml_serde::from_str("- path: SYSTEM.CNF\n").unwrap();
+        let FileLayoutItem::Path(file) = &legacy[0] else {
+            panic!("expected path item")
+        };
+        assert!(file.source.is_none());
     }
 
     #[test]
