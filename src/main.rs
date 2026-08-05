@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -10,6 +10,62 @@ struct Cli {
     command: Command,
 }
 
+fn format_extraction_summary(report: &gcdgold::ExtractReport, manifest: &Path) -> String {
+    format!(
+        "Extraction complete\n  Sectors: {}\n  Source SHA-1: {}\n  Recovery warnings: {}\n  Manifest: {}",
+        report.sectors,
+        report.sha1,
+        report.recovery_warnings.len(),
+        manifest.display()
+    )
+}
+
+fn format_build_summary(report: &gcdgold::BuildReport, image: &Path) -> String {
+    format!(
+        "Build complete\n  Sectors: {}\n  Image SHA-1: {}\n  SHA-1 warnings: {}\n  Image: {}",
+        report.sectors,
+        report.sha1,
+        report.sha1_mismatches.len(),
+        image.display()
+    )
+}
+
+fn format_recovery_warning(warning: &gcdgold::RecoveryWarning) -> String {
+    let location = warning
+        .ranges
+        .iter()
+        .map(|range| {
+            if range.first_lba == range.last_lba {
+                format!("LBA {} ({})", range.first_lba, range.first_msf)
+            } else {
+                format!(
+                    "LBAs {}-{} ({}-{})",
+                    range.first_lba, range.last_lba, range.first_msf, range.last_msf
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![
+        "Recovery warning".to_owned(),
+        format!("  Category: {}", warning.category),
+        format!("  Location: {location}"),
+    ];
+    if let Some(path) = &warning.path {
+        lines.push(format!("  Path: {path}"));
+    }
+    lines.push(format!("  Details: {}", warning.description));
+    lines.join("\n")
+}
+
+fn format_recovery_warnings(warnings: &[gcdgold::RecoveryWarning]) -> String {
+    warnings
+        .iter()
+        .map(format_recovery_warning)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn format_sha1_warning(mismatch: &gcdgold::Sha1Mismatch) -> String {
     let target = match &mismatch.target {
         gcdgold::Sha1Target::Track => "track".to_owned(),
@@ -17,9 +73,17 @@ fn format_sha1_warning(mismatch: &gcdgold::Sha1Mismatch) -> String {
         gcdgold::Sha1Target::Asset { path } => format!("asset {path}"),
     };
     format!(
-        "warning: SHA-1 mismatch for {target}: expected {}, actual {}",
+        "SHA-1 mismatch\n  Target: {target}\n  Expected: {}\n  Actual: {}",
         mismatch.expected, mismatch.actual
     )
+}
+
+fn format_sha1_warnings(mismatches: &[gcdgold::Sha1Mismatch]) -> String {
+    mismatches
+        .iter()
+        .map(format_sha1_warning)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn has_track_sha1_mismatch(mismatches: &[gcdgold::Sha1Mismatch]) -> bool {
@@ -28,13 +92,34 @@ fn has_track_sha1_mismatch(mismatches: &[gcdgold::Sha1Mismatch]) -> bool {
         .any(|mismatch| mismatch.target == gcdgold::Sha1Target::Track)
 }
 
+fn resolve_output_path(
+    explicit: Option<PathBuf>,
+    input: &Path,
+    extension: &str,
+    input_kind: &str,
+) -> Result<PathBuf> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit);
+    }
+    let file_name = input.file_name().with_context(|| {
+        format!(
+            "{input_kind} path {} has no file name for deriving the default output",
+            input.display()
+        )
+    })?;
+    Ok(PathBuf::from(file_name).with_extension(extension))
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Extract a CD-ROM data track into an editable project.
     Extract {
         #[arg(long)]
         image: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Output manifest path (default: image filename with .yaml in the current directory)"
+        )]
         manifest: Option<PathBuf>,
         #[arg(long, default_value = ".")]
         data_dir: PathBuf,
@@ -45,7 +130,10 @@ enum Command {
     Build {
         #[arg(long)]
         manifest: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Output image path (default: manifest filename with .bin in the current directory)"
+        )]
         image: Option<PathBuf>,
         #[arg(long, default_value = ".")]
         data_dir: PathBuf,
@@ -62,46 +150,18 @@ fn main() -> Result<()> {
             data_dir,
             overwrite,
         } => {
-            let manifest = manifest.unwrap_or_else(|| image.with_extension("yaml"));
+            let manifest = resolve_output_path(manifest, &image, "yaml", "image")?;
             let report = gcdgold::extract_with_options(
                 &image,
                 &manifest,
                 &data_dir,
                 gcdgold::ExtractOptions { overwrite },
             )?;
-            for warning in &report.recovery_warnings {
-                let ranges = warning
-                    .ranges
-                    .iter()
-                    .map(|range| {
-                        if range.first_lba == range.last_lba {
-                            format!("LBA {} ({})", range.first_lba, range.first_msf)
-                        } else {
-                            format!(
-                                "LBAs {}-{} ({}-{})",
-                                range.first_lba, range.last_lba, range.first_msf, range.last_msf
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let path = warning
-                    .path
-                    .as_deref()
-                    .map(|path| format!(" [{path}]"))
-                    .unwrap_or_default();
-                eprintln!(
-                    "warning: {} at {}{}: {}",
-                    warning.category, ranges, path, warning.description
-                );
+            let warnings = format_recovery_warnings(&report.recovery_warnings);
+            if !warnings.is_empty() {
+                eprintln!("{warnings}");
             }
-            println!(
-                "extracted {} sectors; source sha1 {}; recovery warnings {}; manifest {}",
-                report.sectors,
-                report.sha1,
-                report.recovery_warnings.len(),
-                manifest.display()
-            );
+            println!("{}", format_extraction_summary(&report, &manifest));
         }
         Command::Build {
             manifest,
@@ -109,22 +169,18 @@ fn main() -> Result<()> {
             data_dir,
             overwrite,
         } => {
-            let image = image.unwrap_or_else(|| manifest.with_extension("bin"));
+            let image = resolve_output_path(image, &manifest, "bin", "manifest")?;
             let report = gcdgold::build_with_options(
                 &manifest,
                 &image,
                 &data_dir,
                 gcdgold::BuildOptions { overwrite },
             )?;
-            for mismatch in &report.sha1_mismatches {
-                eprintln!("{}", format_sha1_warning(mismatch));
+            let warnings = format_sha1_warnings(&report.sha1_mismatches);
+            if !warnings.is_empty() {
+                eprintln!("{warnings}");
             }
-            println!(
-                "built {} sectors; sha1 {}; hash warnings {}",
-                report.sectors,
-                report.sha1,
-                report.sha1_mismatches.len()
-            );
+            println!("{}", format_build_summary(&report, &image));
             if has_track_sha1_mismatch(&report.sha1_mismatches) {
                 anyhow::bail!("built track SHA-1 does not match manifest track.sha1");
             }
@@ -157,6 +213,68 @@ mod tests {
                 assert!(!help.contains(narrow_term));
             }
         }
+
+        let mut command = Cli::command();
+        let extract_help = command
+            .find_subcommand_mut("extract")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(extract_help.contains("image filename with .yaml in the current directory"));
+
+        let mut command = Cli::command();
+        let build_help = command
+            .find_subcommand_mut("build")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(build_help.contains("manifest filename with .bin in the current directory"));
+    }
+
+    #[test]
+    fn implicit_outputs_use_only_the_input_filename_in_the_current_directory() {
+        for (input, extension, kind, expected) in [
+            ("/library/disc.bin", "yaml", "image", "disc.yaml"),
+            ("library/disc.bin", "yaml", "image", "disc.yaml"),
+            ("disc.bin", "yaml", "image", "disc.yaml"),
+            (
+                "/library/archive.disc.bin",
+                "yaml",
+                "image",
+                "archive.disc.yaml",
+            ),
+            ("/projects/disc.yaml", "bin", "manifest", "disc.bin"),
+            ("projects/disc.yaml", "bin", "manifest", "disc.bin"),
+            ("disc.yaml", "bin", "manifest", "disc.bin"),
+            (
+                "/projects/archive.disc.yaml",
+                "bin",
+                "manifest",
+                "archive.disc.bin",
+            ),
+        ] {
+            assert_eq!(
+                resolve_output_path(None, Path::new(input), extension, kind).unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_outputs_are_unchanged_and_unusable_implicit_inputs_are_rejected() {
+        let explicit = PathBuf::from("/custom/output.yaml");
+        assert_eq!(
+            resolve_output_path(Some(explicit.clone()), Path::new("/"), "yaml", "image").unwrap(),
+            explicit
+        );
+
+        let error = resolve_output_path(None, Path::new("/"), "yaml", "image")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "image path / has no file name for deriving the default output"
+        );
     }
 
     #[test]
@@ -243,18 +361,119 @@ mod tests {
     }
 
     #[test]
-    fn sha1_mismatch_warning_names_the_asset_and_both_hashes() {
-        let warning = format_sha1_warning(&gcdgold::Sha1Mismatch {
-            target: gcdgold::Sha1Target::Asset {
-                path: "FILE.BIN".to_owned(),
-            },
-            expected: "1111111111111111111111111111111111111111".to_owned(),
-            actual: "2222222222222222222222222222222222222222".to_owned(),
-        });
-        assert_eq!(
-            warning,
-            "warning: SHA-1 mismatch for asset FILE.BIN: expected 1111111111111111111111111111111111111111, actual 2222222222222222222222222222222222222222"
+    fn success_summaries_are_multiline_and_include_output_paths() {
+        let extract_report = gcdgold::ExtractReport {
+            sectors: 248_051,
+            sha1: "782c50827bf4cf8fe5530b64b188a2d43c75b0e0".to_owned(),
+            recovery_warnings: Vec::new(),
+        };
+        let extraction = format_extraction_summary(
+            &extract_report,
+            Path::new("'98 Koushien - Koukou Yakyuu Simulation (Japan).yaml"),
         );
+        assert_eq!(
+            extraction,
+            "Extraction complete\n  Sectors: 248051\n  Source SHA-1: 782c50827bf4cf8fe5530b64b188a2d43c75b0e0\n  Recovery warnings: 0\n  Manifest: '98 Koushien - Koukou Yakyuu Simulation (Japan).yaml"
+        );
+
+        let build_report = gcdgold::BuildReport {
+            sectors: 248_051,
+            sha1: "782c50827bf4cf8fe5530b64b188a2d43c75b0e0".to_owned(),
+            sha1_mismatches: Vec::new(),
+        };
+        let build = format_build_summary(
+            &build_report,
+            Path::new("'98 Koushien - Koukou Yakyuu Simulation (Japan).bin"),
+        );
+        assert_eq!(
+            build,
+            "Build complete\n  Sectors: 248051\n  Image SHA-1: 782c50827bf4cf8fe5530b64b188a2d43c75b0e0\n  SHA-1 warnings: 0\n  Image: '98 Koushien - Koukou Yakyuu Simulation (Japan).bin"
+        );
+        assert!(!extraction.contains(';'));
+        assert!(!build.contains(';'));
+    }
+
+    #[test]
+    fn recovery_warnings_format_single_and_ranged_locations() {
+        let single = gcdgold::RecoveryWarning {
+            category: gcdgold::RecoveryCategory::MalformedSystemArea,
+            ranges: vec![gcdgold::RecoveryRange {
+                first_lba: -138,
+                last_lba: -138,
+                first_msf: "00:00:12".to_owned(),
+                last_msf: "00:00:12".to_owned(),
+            }],
+            path: None,
+            description: "recovered malformed framing".to_owned(),
+        };
+        assert_eq!(
+            format_recovery_warning(&single),
+            "Recovery warning\n  Category: malformed-system-area\n  Location: LBA -138 (00:00:12)\n  Details: recovered malformed framing"
+        );
+
+        let ranged = gcdgold::RecoveryWarning {
+            category: gcdgold::RecoveryCategory::DirectoryBufferResidue,
+            ranges: vec![gcdgold::RecoveryRange {
+                first_lba: 24,
+                last_lba: 26,
+                first_msf: "00:02:24".to_owned(),
+                last_msf: "00:02:26".to_owned(),
+            }],
+            path: Some("DATA/PLAYER'S FILE.BIN".to_owned()),
+            description: "retained directory bytes".to_owned(),
+        };
+        assert_eq!(
+            format_recovery_warning(&ranged),
+            "Recovery warning\n  Category: directory-buffer-residue\n  Location: LBAs 24-26 (00:02:24-00:02:26)\n  Path: DATA/PLAYER'S FILE.BIN\n  Details: retained directory bytes"
+        );
+
+        let blocks = format_recovery_warnings(&[single, ranged]);
+        assert_eq!(blocks.matches("\n\n").count(), 1);
+        assert!(!blocks.contains(';'));
+    }
+
+    #[test]
+    fn sha1_mismatch_blocks_name_every_target_and_both_hashes() {
+        let expected = "1111111111111111111111111111111111111111";
+        let actual = "2222222222222222222222222222222222222222";
+        let targets = [
+            (gcdgold::Sha1Target::Track, "track"),
+            (
+                gcdgold::Sha1Target::SystemArea {
+                    path: "disc.system".to_owned(),
+                },
+                "system area disc.system",
+            ),
+            (
+                gcdgold::Sha1Target::Asset {
+                    path: "DATA/PLAYER'S FILE.BIN".to_owned(),
+                },
+                "asset DATA/PLAYER'S FILE.BIN",
+            ),
+        ];
+        let mismatches = targets
+            .into_iter()
+            .map(|(target, _)| gcdgold::Sha1Mismatch {
+                target,
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        for (mismatch, target_text) in mismatches.iter().zip([
+            "track",
+            "system area disc.system",
+            "asset DATA/PLAYER'S FILE.BIN",
+        ]) {
+            assert_eq!(
+                format_sha1_warning(mismatch),
+                format!(
+                    "SHA-1 mismatch\n  Target: {target_text}\n  Expected: {expected}\n  Actual: {actual}"
+                )
+            );
+        }
+        let blocks = format_sha1_warnings(&mismatches);
+        assert_eq!(blocks.matches("\n\n").count(), 2);
+        assert!(!blocks.contains(';'));
     }
 
     #[test]
