@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 
 use crate::iso9660;
@@ -18,8 +19,9 @@ use crate::manifest::{
     XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
-    Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorWriter, XaSubheader,
-    XaSubmode, format_msf, frame_to_msf, parse_image, parse_msf,
+    Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorProtection,
+    SectorWriter, XaSubheader, XaSubmode, finalize_sector_protection, format_msf, frame_to_msf,
+    parse_image, parse_msf,
 };
 
 #[derive(Debug, Clone)]
@@ -1192,6 +1194,7 @@ fn demultiplex_xa_extent(
 
 fn write_xa_extent_sector(
     raw: &mut Vec<u8>,
+    protections: &mut Vec<SectorProtection>,
     writer: &mut SectorWriter,
     frame: u32,
     sector: &XaExtentSector,
@@ -1199,26 +1202,75 @@ fn write_xa_extent_sector(
 ) -> Result<()> {
     match sector {
         XaExtentSector::Form1(form1) => {
-            raw.extend_from_slice(&writer.form1_with_subheaders(
-                frame,
-                form1.subheader,
-                form1.subheader_copy,
-                &form1.payload,
-            )?);
+            append_sector_draft(
+                raw,
+                protections,
+                writer.form1_with_subheaders_draft(
+                    frame,
+                    form1.subheader,
+                    form1.subheader_copy,
+                    &form1.payload,
+                )?,
+                SectorProtection::Mode2Form1,
+            );
         }
         XaExtentSector::Form2(record) => {
-            raw.extend_from_slice(&writer.form2_with_subheaders(
-                frame,
-                record.subheader,
-                record.subheader_copy,
-                &record.payload,
-                form2_edc,
-            )?);
+            append_sector_draft(
+                raw,
+                protections,
+                writer.form2_with_subheaders_draft(
+                    frame,
+                    record.subheader,
+                    record.subheader_copy,
+                    &record.payload,
+                )?,
+                SectorProtection::Mode2Form2 {
+                    computed_edc: form2_edc,
+                },
+            );
         }
         XaExtentSector::XaGap => {
-            raw.extend_from_slice(&writer.xa_gap(frame, XaSubheader::default())?);
+            append_sector_draft(
+                raw,
+                protections,
+                writer.xa_gap(frame, XaSubheader::default())?,
+                SectorProtection::None,
+            );
         }
     }
+    Ok(())
+}
+
+fn append_sector_draft(
+    raw: &mut Vec<u8>,
+    protections: &mut Vec<SectorProtection>,
+    sector: Vec<u8>,
+    protection: SectorProtection,
+) {
+    debug_assert_eq!(sector.len(), RAW_SECTOR_SIZE);
+    raw.extend_from_slice(&sector);
+    protections.push(protection);
+}
+
+fn finalize_track_protection(raw: &mut [u8], protections: &[SectorProtection]) -> Result<()> {
+    ensure!(
+        raw.len().is_multiple_of(RAW_SECTOR_SIZE),
+        "authored raw track size is not a multiple of 2352 bytes"
+    );
+    ensure!(
+        raw.len() / RAW_SECTOR_SIZE == protections.len(),
+        "authored raw sector and protection policy counts differ"
+    );
+    raw.par_chunks_exact_mut(RAW_SECTOR_SIZE)
+        .zip(protections.par_iter().copied())
+        .enumerate()
+        .map(|(index, (sector, protection))| {
+            finalize_sector_protection(sector, protection)
+                .with_context(|| format!("finalizing protection at sector {index}"))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
     Ok(())
 }
 
@@ -3464,6 +3516,7 @@ pub fn build_with_options(
     );
     let mut writer = SectorWriter::new();
     let mut raw = Vec::with_capacity(usize::try_from(layout.volume_blocks)? * RAW_SECTOR_SIZE);
+    let mut protections = Vec::with_capacity(usize::try_from(layout.volume_blocks)?);
     let padded_system_len = usize::from(form1_count) * LOGICAL_BLOCK_SIZE;
     let final_form1_index = system_sector_layout
         .iter()
@@ -3489,7 +3542,12 @@ pub fn build_with_options(
                     FORM1_DATA_SUBHEADER
                 };
                 if manifest.track.mode == TrackMode::Mode1 {
-                    raw.extend_from_slice(&writer.mode1(frame, &payload)?);
+                    append_sector_draft(
+                        &mut raw,
+                        &mut protections,
+                        writer.mode1_draft(frame, &payload)?,
+                        SectorProtection::Mode1,
+                    );
                 } else {
                     if let Some(framing) = manifest
                         .system_area
@@ -3497,25 +3555,42 @@ pub fn build_with_options(
                         .iter()
                         .find(|framing| usize::from(framing.sector) == index)
                     {
-                        raw.extend_from_slice(&writer.form1_with_subheaders(
-                            frame,
-                            framing.subheader,
-                            framing.subheader_copy,
-                            &payload,
-                        )?);
+                        append_sector_draft(
+                            &mut raw,
+                            &mut protections,
+                            writer.form1_with_subheaders_draft(
+                                frame,
+                                framing.subheader,
+                                framing.subheader_copy,
+                                &payload,
+                            )?,
+                            SectorProtection::Mode2Form1,
+                        );
                     } else {
-                        raw.extend_from_slice(&writer.form1(frame, subheader, &payload)?);
+                        append_sector_draft(
+                            &mut raw,
+                            &mut protections,
+                            writer.form1_draft(frame, subheader, &payload)?,
+                            SectorProtection::Mode2Form1,
+                        );
                     }
                 }
             }
-            SystemAreaSectorKind::Form2 => raw.extend_from_slice(&writer.form2(
-                frame,
-                FORM2_SUBHEADER,
-                &[0; 2324],
-                manifest.track.form2_edc,
-            )?),
+            SystemAreaSectorKind::Form2 => append_sector_draft(
+                &mut raw,
+                &mut protections,
+                writer.form2_draft(frame, FORM2_SUBHEADER, &[0; 2324])?,
+                SectorProtection::Mode2Form2 {
+                    computed_edc: manifest.track.form2_edc,
+                },
+            ),
             SystemAreaSectorKind::XaGap => {
-                raw.extend_from_slice(&writer.xa_gap(frame, XaSubheader::default())?)
+                append_sector_draft(
+                    &mut raw,
+                    &mut protections,
+                    writer.xa_gap(frame, XaSubheader::default())?,
+                    SectorProtection::None,
+                );
             }
         }
     }
@@ -3567,31 +3642,48 @@ pub fn build_with_options(
                 .iter()
                 .find(|gap| lba >= gap.start && lba < gap.start + gap.sectors)
                 .expect("matched gap placement");
-            let sector = match gap.kind {
-                crate::manifest::GapKind::Mode1 => {
-                    writer.mode1(start_frame + lba, &[0; LOGICAL_BLOCK_SIZE])?
+            let (sector, protection) = match gap.kind {
+                crate::manifest::GapKind::Mode1 => (
+                    writer.mode1_draft(start_frame + lba, &[0; LOGICAL_BLOCK_SIZE])?,
+                    SectorProtection::Mode1,
+                ),
+                crate::manifest::GapKind::Form1 => (
+                    writer.form1_draft(
+                        start_frame + lba,
+                        gap.subheader.expect("validated Form 1 gap subheader"),
+                        &[0; LOGICAL_BLOCK_SIZE],
+                    )?,
+                    SectorProtection::Mode2Form1,
+                ),
+                crate::manifest::GapKind::Form2 => {
+                    let computed_edc = gap.form2_edc.unwrap_or(manifest.track.form2_edc);
+                    (
+                        writer.form2_draft(
+                            start_frame + lba,
+                            FORM2_SUBHEADER,
+                            &[0; FORM2_PAYLOAD_SIZE],
+                        )?,
+                        SectorProtection::Mode2Form2 { computed_edc },
+                    )
                 }
-                crate::manifest::GapKind::Form1 => writer.form1(
-                    start_frame + lba,
-                    gap.subheader.expect("validated Form 1 gap subheader"),
-                    &[0; LOGICAL_BLOCK_SIZE],
-                )?,
-                crate::manifest::GapKind::Form2 => writer.form2(
-                    start_frame + lba,
-                    FORM2_SUBHEADER,
-                    &[0; FORM2_PAYLOAD_SIZE],
-                    gap.form2_edc.unwrap_or(manifest.track.form2_edc),
-                )?,
                 crate::manifest::GapKind::Xa => {
                     if manifest.track.mode == TrackMode::Mode1 {
-                        writer.mode1(start_frame + lba, &[0; LOGICAL_BLOCK_SIZE])?
+                        (
+                            writer.mode1_draft(start_frame + lba, &[0; LOGICAL_BLOCK_SIZE])?,
+                            SectorProtection::Mode1,
+                        )
                     } else {
-                        writer.xa_gap(start_frame + lba, XaSubheader::default())?
+                        (
+                            writer.xa_gap(start_frame + lba, XaSubheader::default())?,
+                            SectorProtection::None,
+                        )
                     }
                 }
-                crate::manifest::GapKind::RawZero => vec![0; RAW_SECTOR_SIZE],
+                crate::manifest::GapKind::RawZero => {
+                    (vec![0; RAW_SECTOR_SIZE], SectorProtection::None)
+                }
             };
-            raw.extend_from_slice(&sector);
+            append_sector_draft(&mut raw, &mut protections, sector, protection);
             continue;
         }
         if let Some((path, block_index, _)) = file_sector_info.get(&lba)
@@ -3599,6 +3691,7 @@ pub fn build_with_options(
         {
             write_xa_extent_sector(
                 &mut raw,
+                &mut protections,
                 &mut writer,
                 start_frame + lba,
                 &sectors[*block_index],
@@ -3609,6 +3702,7 @@ pub fn build_with_options(
         if let Some((index, block_index)) = unreferenced_sector_info.get(&lba) {
             write_xa_extent_sector(
                 &mut raw,
+                &mut protections,
                 &mut writer,
                 start_frame + lba,
                 &unreferenced_extents[*index][*block_index],
@@ -3657,35 +3751,50 @@ pub fn build_with_options(
         }
         let block = &layout.blocks[usize::try_from(lba)?];
         if manifest.track.mode == TrackMode::Mode1 {
-            raw.extend_from_slice(&writer.mode1(start_frame + lba, block)?);
+            append_sector_draft(
+                &mut raw,
+                &mut protections,
+                writer.mode1_draft(start_frame + lba, block)?,
+                SectorProtection::Mode1,
+            );
         } else {
-            raw.extend_from_slice(&writer.form1(start_frame + lba, subheader, block)?);
+            append_sector_draft(
+                &mut raw,
+                &mut protections,
+                writer.form1_draft(start_frame + lba, subheader, block)?,
+                SectorProtection::Mode2Form1,
+            );
         }
     }
     for lba in u32::try_from(layout.blocks.len())?..layout.volume_blocks {
-        let sector = match layout
+        let (sector, protection) = match layout
             .trailing_gap_kind
             .context("physical track tail has no gap kind")?
         {
             crate::manifest::GapKind::Xa => {
                 if manifest.track.noncompliant_trailing_ecc && lba + 1 == layout.volume_blocks {
-                    writer.xa_gap_with_recorded_header_ecc(
-                        start_frame + lba,
-                        XaSubheader::default(),
-                    )?
+                    (
+                        writer.xa_gap(start_frame + lba, XaSubheader::default())?,
+                        SectorProtection::RecordedHeaderEcc,
+                    )
                 } else {
-                    writer.xa_gap(start_frame + lba, XaSubheader::default())?
+                    (
+                        writer.xa_gap(start_frame + lba, XaSubheader::default())?,
+                        SectorProtection::None,
+                    )
                 }
             }
-            crate::manifest::GapKind::RawZero => vec![0; RAW_SECTOR_SIZE],
+            crate::manifest::GapKind::RawZero => (vec![0; RAW_SECTOR_SIZE], SectorProtection::None),
             crate::manifest::GapKind::Mode1
             | crate::manifest::GapKind::Form1
             | crate::manifest::GapKind::Form2 => {
                 unreachable!("validated terminal gap kind")
             }
         };
-        raw.extend_from_slice(&sector);
+        append_sector_draft(&mut raw, &mut protections, sector, protection);
     }
+
+    finalize_track_protection(&mut raw, &protections)?;
 
     apply_redump_0x55(&mut raw, start_frame, &manifest.track.redump_0x55)
         .context("applying structural Redump 0x55 runs")?;
@@ -4518,6 +4627,83 @@ mod tests {
              \x20 - path: FILE.BIN\n"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn parallel_bulk_protection_matches_synchronous_sector_writing() {
+        let mut writer = SectorWriter::new();
+        let form1_subheader: XaSubheader = [1, 2, 0x08, 4].into();
+        let form2_subheader: XaSubheader = [5, 6, 0x20, 7].into();
+        let expected = [
+            writer.mode1(150, &[0x11; LOGICAL_BLOCK_SIZE]).unwrap(),
+            writer
+                .form1(151, form1_subheader, &[0x22; LOGICAL_BLOCK_SIZE])
+                .unwrap(),
+            writer
+                .form2(152, form2_subheader, &[0x33; FORM2_PAYLOAD_SIZE], true)
+                .unwrap(),
+            writer
+                .form2(153, form2_subheader, &[0x44; FORM2_PAYLOAD_SIZE], false)
+                .unwrap(),
+            writer.xa_gap(154, XaSubheader::default()).unwrap(),
+            vec![0; RAW_SECTOR_SIZE],
+            writer
+                .xa_gap_with_recorded_header_ecc(156, XaSubheader::default())
+                .unwrap(),
+        ]
+        .concat();
+
+        let drafts = [
+            (
+                writer
+                    .mode1_draft(150, &[0x11; LOGICAL_BLOCK_SIZE])
+                    .unwrap(),
+                SectorProtection::Mode1,
+            ),
+            (
+                writer
+                    .form1_draft(151, form1_subheader, &[0x22; LOGICAL_BLOCK_SIZE])
+                    .unwrap(),
+                SectorProtection::Mode2Form1,
+            ),
+            (
+                writer
+                    .form2_draft(152, form2_subheader, &[0x33; FORM2_PAYLOAD_SIZE])
+                    .unwrap(),
+                SectorProtection::Mode2Form2 { computed_edc: true },
+            ),
+            (
+                writer
+                    .form2_draft(153, form2_subheader, &[0x44; FORM2_PAYLOAD_SIZE])
+                    .unwrap(),
+                SectorProtection::Mode2Form2 {
+                    computed_edc: false,
+                },
+            ),
+            (
+                writer.xa_gap(154, XaSubheader::default()).unwrap(),
+                SectorProtection::None,
+            ),
+            (vec![0; RAW_SECTOR_SIZE], SectorProtection::None),
+            (
+                writer.xa_gap(156, XaSubheader::default()).unwrap(),
+                SectorProtection::RecordedHeaderEcc,
+            ),
+        ];
+        let mut raw = Vec::new();
+        let mut protections = Vec::new();
+        for (sector, protection) in drafts {
+            append_sector_draft(&mut raw, &mut protections, sector, protection);
+        }
+        finalize_track_protection(&mut raw, &protections).unwrap();
+        assert_eq!(raw, expected);
+
+        assert_eq!(
+            finalize_track_protection(&mut raw, &protections[..protections.len() - 1])
+                .unwrap_err()
+                .to_string(),
+            "authored raw sector and protection policy counts differ"
+        );
     }
 
     #[test]

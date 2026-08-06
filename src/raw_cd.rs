@@ -2,6 +2,7 @@ use std::fmt;
 
 use anyhow::{Context, Result, bail, ensure};
 use crc::{CRC_32_CD_ROM_EDC, Crc};
+use rayon::prelude::*;
 use serde::de;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -243,100 +244,142 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         "unsupported sector mode at sector 0"
     );
     let start_frame = msf_to_frame([first[12], first[13], first[14]])?;
-    let mut sectors = Vec::with_capacity(bytes.len() / RAW_SECTOR_SIZE);
-
-    for (index, chunk) in bytes.chunks_exact(RAW_SECTOR_SIZE).enumerate() {
-        if chunk.iter().all(|byte| *byte == 0) {
-            let remaining_start = (index + 1) * RAW_SECTOR_SIZE;
-            ensure!(
-                bytes[remaining_start..].iter().all(|byte| *byte == 0),
-                "all-zero raw sectors are supported only as a terminal run"
-            );
-            sectors.push(ParsedSector {
-                bytes: [0; RAW_SECTOR_SIZE],
-                kind: Kind::RawZero,
-                subheader: XaSubheader::default(),
-                subheader_copy: XaSubheader::default(),
-                form2_edc_valid: false,
-                noncompliant_ecc: false,
-            });
-            continue;
-        }
-        ensure!(chunk[..12] == SYNC, "invalid sync at sector {index}");
-        ensure!(
-            chunk[15] == track_mode,
-            "mixed or unsupported sector mode at sector {index}"
-        );
-        let expected = frame_to_msf(start_frame + u32::try_from(index)?)?;
-        ensure!(
-            chunk[12..15] == expected,
-            "non-monotonic MSF at sector {index}"
-        );
-        if track_mode == 1 {
-            ensure!(
-                chunk[2068..2076].iter().all(|byte| *byte == 0),
-                "nonzero Mode 1 reserved bytes are unsupported at sector {index}"
-            );
-            ensure!(
-                edc_matches(&chunk[..2064], &chunk[2064..2068]),
-                "invalid Mode 1 EDC at sector {index}"
-            );
-            ensure!(
-                ecc_matches(chunk, chunk[12..16].try_into()?),
-                "invalid Mode 1 ECC at sector {index}"
-            );
-            let kind = if chunk[16..2064].iter().all(|byte| *byte == 0) {
-                Kind::Mode1Gap
-            } else {
-                Kind::Mode1
-            };
+    let last_nonzero_sector = bytes
+        .chunks_exact(RAW_SECTOR_SIZE)
+        .rposition(|chunk| chunk.iter().any(|byte| *byte != 0))
+        .expect("validated first sector is nonzero");
+    let classifications = bytes
+        .par_chunks_exact(RAW_SECTOR_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            classify_sector(chunk, index, track_mode, start_frame, last_nonzero_sector)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let sectors = bytes
+        .par_chunks_exact(RAW_SECTOR_SIZE)
+        .zip(classifications.into_par_iter())
+        .map(|(chunk, classification)| {
             let mut sector = [0_u8; RAW_SECTOR_SIZE];
             sector.copy_from_slice(chunk);
-            sectors.push(ParsedSector {
+            ParsedSector {
                 bytes: sector,
-                kind,
-                subheader: XaSubheader::default(),
-                subheader_copy: XaSubheader::default(),
-                form2_edc_valid: false,
-                noncompliant_ecc: false,
-            });
-            continue;
-        }
-        let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
-        let subheader = XaSubheader::from(subheader_bytes);
-        let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&chunk[20..24])?);
-        let form2 = subheader.submode.contains(XaSubmodeFlag::Form2);
-        let form2_edc_valid = form2 && edc_matches(&chunk[16..2348], &chunk[2348..2352]);
-        let (kind, noncompliant_ecc) = if form2 {
-            (Kind::Form2, false)
-        } else if chunk[16..].iter().all(|byte| *byte == 0)
-            || (chunk[16..20] == chunk[20..24] && chunk[24..].iter().all(|byte| *byte == 0))
-        {
-            (Kind::XaGap, false)
-        } else if edc_matches(&chunk[16..2072], &chunk[2072..2076]) && ecc_matches(chunk, [0; 4]) {
-            (Kind::Form1, false)
-        } else if !edc_matches(&chunk[16..2348], &chunk[2348..2352])
-            && recorded_header_ecc_matches(chunk)
-        {
-            (Kind::XaGap, true)
-        } else {
-            bail!("unsupported or invalid Mode 2 sector at sector {index}")
-        };
-        let mut sector = [0_u8; RAW_SECTOR_SIZE];
-        sector.copy_from_slice(chunk);
-        sectors.push(ParsedSector {
-            bytes: sector,
-            kind,
-            subheader,
-            subheader_copy,
-            form2_edc_valid,
-            noncompliant_ecc,
-        });
-    }
+                kind: classification.kind,
+                subheader: classification.subheader,
+                subheader_copy: classification.subheader_copy,
+                form2_edc_valid: classification.form2_edc_valid,
+                noncompliant_ecc: classification.noncompliant_ecc,
+            }
+        })
+        .collect();
     Ok((start_frame, sectors))
 }
 
+#[derive(Clone, Copy)]
+struct SectorClassification {
+    kind: Kind,
+    subheader: XaSubheader,
+    subheader_copy: XaSubheader,
+    form2_edc_valid: bool,
+    noncompliant_ecc: bool,
+}
+
+fn classify_sector(
+    chunk: &[u8],
+    index: usize,
+    track_mode: u8,
+    start_frame: u32,
+    last_nonzero_sector: usize,
+) -> Result<SectorClassification> {
+    if chunk.iter().all(|byte| *byte == 0) {
+        ensure!(
+            index > last_nonzero_sector,
+            "all-zero raw sectors are supported only as a terminal run"
+        );
+        return Ok(SectorClassification {
+            kind: Kind::RawZero,
+            subheader: XaSubheader::default(),
+            subheader_copy: XaSubheader::default(),
+            form2_edc_valid: false,
+            noncompliant_ecc: false,
+        });
+    }
+    ensure!(chunk[..12] == SYNC, "invalid sync at sector {index}");
+    ensure!(
+        chunk[15] == track_mode,
+        "mixed or unsupported sector mode at sector {index}"
+    );
+    let expected = frame_to_msf(start_frame + u32::try_from(index)?)?;
+    ensure!(
+        chunk[12..15] == expected,
+        "non-monotonic MSF at sector {index}"
+    );
+    if track_mode == 1 {
+        ensure!(
+            chunk[2068..2076].iter().all(|byte| *byte == 0),
+            "nonzero Mode 1 reserved bytes are unsupported at sector {index}"
+        );
+        ensure!(
+            edc_matches(&chunk[..2064], &chunk[2064..2068]),
+            "invalid Mode 1 EDC at sector {index}"
+        );
+        ensure!(
+            ecc_matches(chunk, chunk[12..16].try_into()?),
+            "invalid Mode 1 ECC at sector {index}"
+        );
+        let kind = if chunk[16..2064].iter().all(|byte| *byte == 0) {
+            Kind::Mode1Gap
+        } else {
+            Kind::Mode1
+        };
+        return Ok(SectorClassification {
+            kind,
+            subheader: XaSubheader::default(),
+            subheader_copy: XaSubheader::default(),
+            form2_edc_valid: false,
+            noncompliant_ecc: false,
+        });
+    }
+    let subheader_bytes: [u8; 4] = chunk[16..20].try_into()?;
+    let subheader = XaSubheader::from(subheader_bytes);
+    let subheader_copy = XaSubheader::from(<[u8; 4]>::try_from(&chunk[20..24])?);
+    let form2 = subheader.submode.contains(XaSubmodeFlag::Form2);
+    let form2_edc_valid = form2 && edc_matches(&chunk[16..2348], &chunk[2348..2352]);
+    let (kind, noncompliant_ecc) = if form2 {
+        (Kind::Form2, false)
+    } else if chunk[16..].iter().all(|byte| *byte == 0)
+        || (chunk[16..20] == chunk[20..24] && chunk[24..].iter().all(|byte| *byte == 0))
+    {
+        (Kind::XaGap, false)
+    } else if edc_matches(&chunk[16..2072], &chunk[2072..2076]) && ecc_matches(chunk, [0; 4]) {
+        (Kind::Form1, false)
+    } else if !edc_matches(&chunk[16..2348], &chunk[2348..2352])
+        && recorded_header_ecc_matches(chunk)
+    {
+        (Kind::XaGap, true)
+    } else {
+        bail!("unsupported or invalid Mode 2 sector at sector {index}")
+    };
+    Ok(SectorClassification {
+        kind,
+        subheader,
+        subheader_copy,
+        form2_edc_valid,
+        noncompliant_ecc,
+    })
+}
+
 pub struct SectorWriter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectorProtection {
+    None,
+    Mode1,
+    Mode2Form1,
+    Mode2Form2 { computed_edc: bool },
+    RecordedHeaderEcc,
+}
 
 impl SectorWriter {
     pub const fn new() -> Self {
@@ -344,15 +387,18 @@ impl SectorWriter {
     }
 
     pub fn mode1(&mut self, frame: u32, data: &[u8]) -> Result<Vec<u8>> {
+        let mut sector = self.mode1_draft(frame, data)?;
+        finalize_sector_protection(&mut sector, SectorProtection::Mode1)?;
+        Ok(sector)
+    }
+
+    pub(crate) fn mode1_draft(&mut self, frame: u32, data: &[u8]) -> Result<Vec<u8>> {
         ensure!(
             data.len() == LOGICAL_BLOCK_SIZE,
             "Mode 1 payload must be 2048 bytes"
         );
         let mut sector = initialized_sector(frame, 1)?;
         sector[16..2064].copy_from_slice(data);
-        let edc = generate_edc(&sector[..2064]).to_le_bytes();
-        sector[2064..2068].copy_from_slice(&edc);
-        write_ecc(&mut sector, frame_header(frame, 1)?);
         Ok(sector)
     }
 
@@ -367,12 +413,33 @@ impl SectorWriter {
         subheader_copy: XaSubheader,
         data: &[u8],
     ) -> Result<Vec<u8>> {
+        let mut sector =
+            self.form1_with_subheaders_draft(frame, subheader, subheader_copy, data)?;
+        finalize_sector_protection(&mut sector, SectorProtection::Mode2Form1)?;
+        Ok(sector)
+    }
+
+    pub(crate) fn form1_draft(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.form1_with_subheaders_draft(frame, subheader, subheader, data)
+    }
+
+    pub(crate) fn form1_with_subheaders_draft(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        subheader_copy: XaSubheader,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
         ensure!(data.len() == 2048, "Form 1 payload must be 2048 bytes");
         let mut sector = initialized_sector(frame, 2)?;
         sector[16..20].copy_from_slice(&<[u8; 4]>::from(subheader));
         sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
         sector[24..2072].copy_from_slice(data);
-        regenerate_mode2_protection(&mut sector, true, false)?;
         Ok(sector)
     }
 
@@ -394,12 +461,33 @@ impl SectorWriter {
         data: &[u8],
         computed_edc: bool,
     ) -> Result<Vec<u8>> {
+        let mut sector =
+            self.form2_with_subheaders_draft(frame, subheader, subheader_copy, data)?;
+        finalize_sector_protection(&mut sector, SectorProtection::Mode2Form2 { computed_edc })?;
+        Ok(sector)
+    }
+
+    pub(crate) fn form2_draft(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.form2_with_subheaders_draft(frame, subheader, subheader, data)
+    }
+
+    pub(crate) fn form2_with_subheaders_draft(
+        &mut self,
+        frame: u32,
+        subheader: XaSubheader,
+        subheader_copy: XaSubheader,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
         ensure!(data.len() == 2324, "Form 2 payload must be 2324 bytes");
         let mut sector = initialized_sector(frame, 2)?;
         sector[16..20].copy_from_slice(&<[u8; 4]>::from(subheader));
         sector[20..24].copy_from_slice(&<[u8; 4]>::from(subheader_copy));
         sector[24..2348].copy_from_slice(data);
-        regenerate_mode2_protection(&mut sector, computed_edc, false)?;
         Ok(sector)
     }
 
@@ -411,15 +499,54 @@ impl SectorWriter {
         Ok(sector)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn xa_gap_with_recorded_header_ecc(
         &mut self,
         frame: u32,
         subheader: XaSubheader,
     ) -> Result<Vec<u8>> {
         let mut sector = self.xa_gap(frame, subheader)?;
-        write_recorded_header_ecc(&mut sector);
+        finalize_sector_protection(&mut sector, SectorProtection::RecordedHeaderEcc)?;
         Ok(sector)
     }
+}
+
+pub(crate) fn finalize_sector_protection(
+    sector: &mut [u8],
+    protection: SectorProtection,
+) -> Result<()> {
+    ensure!(
+        sector.len() == RAW_SECTOR_SIZE,
+        "raw sector must be 2352 bytes"
+    );
+    match protection {
+        SectorProtection::None => {}
+        SectorProtection::Mode1 => {
+            ensure!(sector[15] == 1, "Mode 1 protection requires sector mode 1");
+            let edc = generate_edc(&sector[..2064]).to_le_bytes();
+            sector[2064..2068].copy_from_slice(&edc);
+            write_ecc(sector, sector[12..16].try_into()?);
+        }
+        SectorProtection::Mode2Form1 => {
+            ensure!(
+                regenerate_mode2_protection(sector, true, false)? == Kind::Form1,
+                "Form 1 protection requires a non-Form-2 subheader"
+            );
+        }
+        SectorProtection::Mode2Form2 { computed_edc } => {
+            ensure!(
+                regenerate_mode2_protection(sector, computed_edc, false)? == Kind::Form2,
+                "Form 2 protection requires a Form 2 subheader"
+            );
+        }
+        SectorProtection::RecordedHeaderEcc => {
+            ensure!(
+                regenerate_mode2_protection(sector, false, true)? == Kind::XaGap,
+                "recorded-header ECC requires a non-Form-2 subheader"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn frame_header(frame: u32, mode: u8) -> Result<[u8; 4]> {
@@ -778,6 +905,52 @@ mod tests {
         assert_eq!(start_frame, 150);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1].bytes, [0; RAW_SECTOR_SIZE]);
+    }
+
+    #[test]
+    fn parallel_parse_preserves_order_and_reports_the_first_error() {
+        let mut writer = SectorWriter::new();
+        let mut raw = Vec::new();
+        for index in 0..8_u32 {
+            raw.extend_from_slice(
+                &writer
+                    .mode1(150 + index, &[index as u8; LOGICAL_BLOCK_SIZE])
+                    .unwrap(),
+            );
+        }
+        let (_, parsed) = parse_image(&raw).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|sector| sector.payload()[0])
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+
+        raw[2 * RAW_SECTOR_SIZE + 2076] ^= 1;
+        raw[6 * RAW_SECTOR_SIZE + 2064] ^= 1;
+        assert_eq!(
+            parse_image(&raw).unwrap_err().to_string(),
+            "invalid Mode 1 ECC at sector 2"
+        );
+    }
+
+    #[test]
+    fn parallel_parse_rejects_the_first_nonterminal_raw_zero_sector() {
+        let mut writer = SectorWriter::new();
+        let mut raw = writer
+            .form2(150, [0, 0, 0x20, 0].into(), &[0; 2324], true)
+            .unwrap();
+        raw.extend_from_slice(&[0; RAW_SECTOR_SIZE]);
+        raw.extend_from_slice(
+            &writer
+                .form2(152, [0, 0, 0x20, 0].into(), &[0; 2324], true)
+                .unwrap(),
+        );
+        assert_eq!(
+            parse_image(&raw).unwrap_err().to_string(),
+            "all-zero raw sectors are supported only as a terminal run"
+        );
     }
 
     #[test]
