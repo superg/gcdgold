@@ -650,6 +650,8 @@ pub struct FilePathItem {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xa_assets: Option<XaAssets>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -663,25 +665,25 @@ pub struct FileDirectoryItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileXaExtentItem {
-    pub xa_extent: XaExtentAssets,
+    pub xa_extent: XaAssets,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct XaExtentAssets {
-    pub form1: String,
+pub struct HostAsset {
+    pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub form1_sha1: Option<String>,
-    pub form2: String,
+    pub sha1: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaAssets {
+    pub form1: HostAsset,
+    pub form2: HostAsset,
+    pub index: HostAsset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub form2_sha1: Option<String>,
-    pub index: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index_sha1: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap_index: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap_index_sha1: Option<String>,
+    pub gap_index: Option<HostAsset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -719,6 +721,7 @@ impl FileLayoutItem {
             path: path.into(),
             source: None,
             sha1: None,
+            xa_assets: None,
         })
     }
 
@@ -736,7 +739,7 @@ impl FileLayoutItem {
         })
     }
 
-    pub fn xa_extent(assets: XaExtentAssets) -> Self {
+    pub fn xa_extent(assets: XaAssets) -> Self {
         Self::XaExtent(FileXaExtentItem { xa_extent: assets })
     }
 
@@ -801,13 +804,9 @@ impl FileLayoutItem {
         }
     }
 
-    pub fn as_path_source_with_sha1(&self) -> Option<(&str, &str, Option<&str>)> {
+    pub const fn as_path_item(&self) -> Option<&FilePathItem> {
         match self {
-            Self::Path(item) => Some((
-                &item.path,
-                item.source.as_deref().unwrap_or(&item.path),
-                item.sha1.as_deref(),
-            )),
+            Self::Path(item) => Some(item),
             Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
         }
     }
@@ -819,7 +818,7 @@ impl FileLayoutItem {
         }
     }
 
-    pub const fn as_xa_extent(&self) -> Option<&XaExtentAssets> {
+    pub const fn as_xa_extent(&self) -> Option<&XaAssets> {
         match self {
             Self::XaExtent(item) => Some(&item.xa_extent),
             Self::Path(_) | Self::Directory(_) | Self::Gap(_) => None,
@@ -1074,22 +1073,6 @@ pub struct EntryXa {
     #[serde(skip_serializing_if = "is_zero")]
     pub file_number: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub form1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub form1_sha1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub form2: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub form2_sha1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_sha1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap_index: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap_index_sha1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_length: Option<u32>,
     #[serde(skip_serializing_if = "XaLengthEncoding::is_default")]
     pub length_encoding: XaLengthEncoding,
@@ -1105,14 +1088,6 @@ impl Default for EntryXa {
             permissions: DEFAULT_XA_PERMISSIONS,
             attributes: None,
             file_number: 0,
-            form1: None,
-            form1_sha1: None,
-            form2: None,
-            form2_sha1: None,
-            index: None,
-            index_sha1: None,
-            gap_index: None,
-            gap_index_sha1: None,
             logical_length: None,
             length_encoding: XaLengthEncoding::default(),
             framing_subheader: None,
@@ -1128,14 +1103,6 @@ struct EntryXaFields {
     permissions: u16,
     attributes: Option<XaAttributes>,
     file_number: u8,
-    form1: Option<String>,
-    form1_sha1: Option<String>,
-    form2: Option<String>,
-    form2_sha1: Option<String>,
-    index: Option<String>,
-    index_sha1: Option<String>,
-    gap_index: Option<String>,
-    gap_index_sha1: Option<String>,
     logical_length: Option<u32>,
     length_encoding: XaLengthEncoding,
     framing_subheader: Option<XaSubheader>,
@@ -1149,14 +1116,6 @@ impl Default for EntryXaFields {
             permissions: DEFAULT_XA_PERMISSIONS,
             attributes: None,
             file_number: 0,
-            form1: None,
-            form1_sha1: None,
-            form2: None,
-            form2_sha1: None,
-            index: None,
-            index_sha1: None,
-            gap_index: None,
-            gap_index_sha1: None,
             logical_length: None,
             length_encoding: XaLengthEncoding::default(),
             framing_subheader: None,
@@ -1170,41 +1129,6 @@ impl<'de> Deserialize<'de> for EntryXa {
         D: Deserializer<'de>,
     {
         let fields = EntryXaFields::deserialize(deserializer)?;
-        let asset_count = usize::from(fields.form1.is_some())
-            + usize::from(fields.form2.is_some())
-            + usize::from(fields.index.is_some());
-        if asset_count != 0 && asset_count != 3 {
-            return Err(de::Error::custom(
-                "interleaved XA metadata requires form1, form2, and index together",
-            ));
-        }
-        if fields.gap_index.is_some() && asset_count != 3 {
-            return Err(de::Error::custom(
-                "XA gap index requires form1, form2, and index assets",
-            ));
-        }
-        for (path, sha1, label) in [
-            (&fields.form1, &fields.form1_sha1, "form1_sha1"),
-            (&fields.form2, &fields.form2_sha1, "form2_sha1"),
-            (&fields.index, &fields.index_sha1, "index_sha1"),
-            (&fields.gap_index, &fields.gap_index_sha1, "gap_index_sha1"),
-        ] {
-            if sha1.is_some() && path.is_none() {
-                return Err(de::Error::custom(format_args!(
-                    "XA {label} requires its corresponding asset path"
-                )));
-            }
-        }
-        if fields.logical_length.is_some() && asset_count != 3 {
-            return Err(de::Error::custom(
-                "XA logical length requires form1, form2, and index assets",
-            ));
-        }
-        if !fields.length_encoding.is_default() && asset_count != 3 {
-            return Err(de::Error::custom(
-                "XA length encoding requires form1, form2, and index assets",
-            ));
-        }
         if !fields.length_encoding.is_default() && fields.logical_length.is_some() {
             return Err(de::Error::custom(
                 "XA length encoding cannot be combined with logical_length",
@@ -1216,14 +1140,6 @@ impl<'de> Deserialize<'de> for EntryXa {
             permissions: fields.permissions,
             attributes: fields.attributes,
             file_number: fields.file_number,
-            form1: fields.form1,
-            form1_sha1: fields.form1_sha1,
-            form2: fields.form2,
-            form2_sha1: fields.form2_sha1,
-            index: fields.index,
-            index_sha1: fields.index_sha1,
-            gap_index: fields.gap_index,
-            gap_index_sha1: fields.gap_index_sha1,
             logical_length: fields.logical_length,
             length_encoding: fields.length_encoding,
             framing_subheader: fields.framing_subheader,
@@ -1412,14 +1328,10 @@ mod tests {
         );
         assert!(track(TrackMode::Mode2Xa, "00:02:00").sha1.is_none());
 
-        let xa: EntryXa = yaml_serde::from_str(&format!(
-            "form1: FILE.XA1\nform1_sha1: {hash}\nform2: FILE.XA2\nform2_sha1: {hash}\nindex: FILE.XAI\nindex_sha1: {hash}\n"
-        ))
-        .unwrap();
-        assert_eq!(xa.form1_sha1.as_deref(), Some(hash));
-        assert_eq!(xa.form2_sha1.as_deref(), Some(hash));
-        assert_eq!(xa.index_sha1.as_deref(), Some(hash));
-        assert!(yaml_serde::from_str::<EntryXa>(&format!("form1_sha1: {hash}\n")).is_err());
+        let asset: HostAsset =
+            yaml_serde::from_str(&format!("path: FILE.XA1\nsha1: {hash}\n")).unwrap();
+        assert_eq!(asset.sha1.as_deref(), Some(hash));
+        assert!(yaml_serde::from_str::<HostAsset>(&format!("sha1: {hash}\n")).is_err());
     }
 
     #[test]
@@ -1489,22 +1401,57 @@ mod tests {
 
     #[test]
     fn unreferenced_xa_extent_assets_round_trip_without_ambiguity() {
-        let item = FileLayoutItem::xa_extent(XaExtentAssets {
-            form1: "disc.unreferenced.000.XA1".to_owned(),
-            form1_sha1: Some("1111111111111111111111111111111111111111".to_owned()),
-            form2: "disc.unreferenced.000.XA2".to_owned(),
-            form2_sha1: None,
-            index: "disc.unreferenced.000.XAI".to_owned(),
-            index_sha1: None,
-            gap_index: Some("disc.unreferenced.000.XAG".to_owned()),
-            gap_index_sha1: None,
+        let item = FileLayoutItem::xa_extent(XaAssets {
+            form1: HostAsset {
+                path: "disc.unreferenced.000.XA1".to_owned(),
+                sha1: Some("1111111111111111111111111111111111111111".to_owned()),
+            },
+            form2: HostAsset {
+                path: "disc.unreferenced.000.XA2".to_owned(),
+                sha1: None,
+            },
+            index: HostAsset {
+                path: "disc.unreferenced.000.XAI".to_owned(),
+                sha1: None,
+            },
+            gap_index: Some(HostAsset {
+                path: "disc.unreferenced.000.XAG".to_owned(),
+                sha1: None,
+            }),
         });
         let yaml = yaml_serde::to_string(&item).unwrap();
         assert_eq!(
             yaml,
-            "xa_extent:\n  form1: disc.unreferenced.000.XA1\n  form1_sha1: '1111111111111111111111111111111111111111'\n  form2: disc.unreferenced.000.XA2\n  index: disc.unreferenced.000.XAI\n  gap_index: disc.unreferenced.000.XAG\n"
+            "xa_extent:\n  form1:\n    path: disc.unreferenced.000.XA1\n    sha1: '1111111111111111111111111111111111111111'\n  form2:\n    path: disc.unreferenced.000.XA2\n  index:\n    path: disc.unreferenced.000.XAI\n  gap_index:\n    path: disc.unreferenced.000.XAG\n"
         );
         assert_eq!(yaml_serde::from_str::<FileLayoutItem>(&yaml).unwrap(), item);
+        assert!(
+            yaml_serde::from_str::<FileLayoutItem>(
+                "xa_extent:\n  form1: OLD.XA1\n  form2: OLD.XA2\n  index: OLD.XAI\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn indexed_xa_assets_are_nested_on_the_layout_path() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789";
+        let yaml = format!(
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n    sha1: {hash}\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n"
+        );
+        let item: FileLayoutItem = yaml_serde::from_str(&yaml).unwrap();
+        assert_eq!(yaml_serde::to_string(&item).unwrap(), yaml);
+
+        for invalid in [
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    sha1: 0123456789abcdef0123456789abcdef0123456789\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n",
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n  form2:\n    path: MOVIE.STR.XA2\n",
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n    checksum: bad\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n",
+        ] {
+            assert!(yaml_serde::from_str::<FileLayoutItem>(invalid).is_err());
+        }
+
+        let legacy_entry = "path: MOVIE.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  form1: MOVIE.STR.XA1\n";
+        assert!(yaml_serde::from_str::<Entry>(legacy_entry).is_err());
     }
 
     #[test]
@@ -1595,18 +1542,16 @@ mod tests {
 
     #[test]
     fn interleaved_xa_entry_metadata_round_trips_as_named_fields() {
-        let yaml = "path: PETEXA0.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  attributes:\n  - interleaved\n  file_number: 1\n  form1: PETEXA0.STR.XA1\n  form2: PETEXA0.STR.XA2\n  index: PETEXA0.STR.XAI\n";
+        let yaml = "path: PETEXA0.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  attributes:\n  - interleaved\n  file_number: 1\n";
         let entry: Entry = yaml_serde::from_str(yaml).unwrap();
         let xa = entry.xa.as_ref().unwrap();
-        assert_eq!(xa.form1.as_deref(), Some("PETEXA0.STR.XA1"));
-        assert_eq!(xa.form2.as_deref(), Some("PETEXA0.STR.XA2"));
-        assert_eq!(xa.index.as_deref(), Some("PETEXA0.STR.XAI"));
+        assert_eq!(xa.file_number, 1);
         assert_eq!(yaml_serde::to_string(&entry).unwrap(), yaml);
     }
 
     #[test]
     fn xa_length_encoding_uses_numeric_units() {
-        let yaml = "form1: FILE.XA1\nform2: FILE.XA2\nindex: FILE.XAI\nlength_encoding: 2336\n";
+        let yaml = "length_encoding: 2336\n";
         let value: EntryXa = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(value.length_encoding, XaLengthEncoding::Mode2_2336);
         assert_eq!(yaml_serde::to_string(&value).unwrap(), yaml);

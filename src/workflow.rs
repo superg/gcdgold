@@ -12,11 +12,11 @@ use sha1::{Digest, Sha1};
 use crate::iso9660;
 use crate::manifest::{
     DirectorySlack, EntryReference, EntryReferenceKind, EntrySectorSubheader, FileLayoutItem,
-    Form1Sectors, GCDGOLD_VERSION, GapKind, GcdgoldMetadata, IsoMetadataSubheader, Manifest,
-    MetadataSubheader, MetadataVolume, PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS,
-    SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    Form1Sectors, GCDGOLD_VERSION, GapKind, GcdgoldMetadata, HostAsset, IsoMetadataSubheader,
+    Manifest, MetadataSubheader, MetadataVolume, PathTableSubheader, Redump0x55Run,
+    SYSTEM_AREA_SECTORS, SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
     SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
-    XaAttributeFlag, XaExtentAssets, XaLengthEncoding, decode_sector_patch, serialize_manifest,
+    XaAssets, XaAttributeFlag, XaLengthEncoding, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorProtection,
@@ -1282,11 +1282,11 @@ fn sector_follows_form2_edc_policy(sector: &crate::raw_cd::ParsedSector, compute
     }
 }
 
-fn entry_uses_xa_sidecar(entry: &crate::manifest::Entry) -> bool {
+fn entry_requires_xa_sidecar(entry: &crate::manifest::Entry) -> bool {
     entry
         .xa
         .as_ref()
-        .is_some_and(|xa| xa.form1.is_some() || xa.length_encoding != XaLengthEncoding::Logical2048)
+        .is_some_and(|xa| xa.length_encoding != XaLengthEncoding::Logical2048)
         || entry
             .xa
             .as_ref()
@@ -1398,10 +1398,6 @@ fn mark_entry_record_only(entry: &mut crate::manifest::Entry, extent: u32, lengt
     });
     entry.allocation_padding_hex = None;
     if let Some(xa) = &mut entry.xa {
-        xa.form1 = None;
-        xa.form2 = None;
-        xa.index = None;
-        xa.gap_index = None;
         xa.logical_length = None;
         xa.length_encoding = XaLengthEncoding::default();
         xa.framing_subheader = None;
@@ -1639,7 +1635,7 @@ fn prepare_xa_sidecars(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
     redump_ranges: &[Range<usize>],
-) -> Result<()> {
+) -> Result<HashMap<String, XaAssets>> {
     let iso_paths = parsed_iso
         .manifest
         .entries
@@ -1647,6 +1643,7 @@ fn prepare_xa_sidecars(
         .map(|entry| entry.path.clone())
         .collect::<HashSet<_>>();
     let mut sidecar_paths = HashSet::new();
+    let mut indexed_assets = HashMap::new();
     for file in &parsed_iso.files {
         let start = usize::try_from(file.extent)?;
         let count = usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
@@ -1674,7 +1671,7 @@ fn prepare_xa_sidecars(
         );
         if !observed_mixed
             && !observed_unrepresentable
-            && !entry_uses_xa_sidecar(&parsed_iso.manifest.entries[entry_index])
+            && !entry_requires_xa_sidecar(&parsed_iso.manifest.entries[entry_index])
         {
             continue;
         }
@@ -1696,17 +1693,38 @@ fn prepare_xa_sidecars(
             );
         }
         parsed_iso.manifest.entries[entry_index].allocation_padding_hex = None;
-        let xa = parsed_iso.manifest.entries[entry_index]
-            .xa
-            .get_or_insert_with(crate::manifest::EntryXa::default);
-        xa.form1 = Some(form1);
-        xa.form2 = Some(form2);
-        xa.index = Some(index);
-        xa.gap_index = gap_index;
-        xa.logical_length = (!usize::try_from(file.length)?.is_multiple_of(LOGICAL_BLOCK_SIZE))
-            .then_some(file.length);
+        if !usize::try_from(file.length)?.is_multiple_of(LOGICAL_BLOCK_SIZE) {
+            parsed_iso.manifest.entries[entry_index]
+                .xa
+                .get_or_insert_with(crate::manifest::EntryXa::default)
+                .logical_length = Some(file.length);
+        }
+        ensure!(
+            indexed_assets
+                .insert(
+                    file.path.clone(),
+                    XaAssets {
+                        form1: HostAsset {
+                            path: form1,
+                            sha1: None
+                        },
+                        form2: HostAsset {
+                            path: form2,
+                            sha1: None
+                        },
+                        index: HostAsset {
+                            path: index,
+                            sha1: None
+                        },
+                        gap_index: gap_index.map(|path| HostAsset { path, sha1: None }),
+                    },
+                )
+                .is_none(),
+            "duplicate indexed XA layout path {}",
+            file.path
+        );
     }
-    Ok(())
+    Ok(indexed_assets)
 }
 
 fn detect_metadata_subheader(
@@ -1894,48 +1912,56 @@ fn append_detected_gap(
 
     let ordinal = detected.xa_extent_ranges.len();
     let base = format!("{manifest_stem}.unreferenced.{ordinal:03}");
-    let paths = XaExtentAssets {
-        form1: format!("{base}.XA1"),
-        form1_sha1: None,
-        form2: format!("{base}.XA2"),
-        form2_sha1: None,
-        index: format!("{base}.XAI"),
-        index_sha1: None,
+    let paths = XaAssets {
+        form1: HostAsset {
+            path: format!("{base}.XA1"),
+            sha1: None,
+        },
+        form2: HostAsset {
+            path: format!("{base}.XA2"),
+            sha1: None,
+        },
+        index: HostAsset {
+            path: format!("{base}.XAI"),
+            sha1: None,
+        },
         gap_index: sectors[start..end]
             .iter()
             .any(|sector| sector.kind == Kind::XaGap)
-            .then(|| format!("{base}.XAG")),
-        gap_index_sha1: None,
+            .then(|| HostAsset {
+                path: format!("{base}.XAG"),
+                sha1: None,
+            }),
     };
     let assets = demultiplex_xa_extent(&sectors[start..end], form2_edc)
         .with_context(|| format!("demultiplexing unreferenced XA extent at LBA {start}"))?;
     ensure!(
         detected
             .assets
-            .insert(paths.form1.clone(), assets.form1)
+            .insert(paths.form1.path.clone(), assets.form1)
             .is_none(),
         "duplicate unreferenced XA1 asset path"
     );
     ensure!(
         detected
             .assets
-            .insert(paths.form2.clone(), assets.form2)
+            .insert(paths.form2.path.clone(), assets.form2)
             .is_none(),
         "duplicate unreferenced XA2 asset path"
     );
     ensure!(
         detected
             .assets
-            .insert(paths.index.clone(), assets.form2_index)
+            .insert(paths.index.path.clone(), assets.form2_index)
             .is_none(),
         "duplicate unreferenced XAI asset path"
     );
-    if let Some(path) = &paths.gap_index {
+    if let Some(asset) = &paths.gap_index {
         ensure!(!assets.gap_index.is_empty(), "prepared XAG asset is empty");
         ensure!(
             detected
                 .assets
-                .insert(path.clone(), assets.gap_index)
+                .insert(asset.path.clone(), assets.gap_index)
                 .is_none(),
             "duplicate unreferenced XAG asset path"
         );
@@ -2189,6 +2215,7 @@ pub fn extract_with_options(
         }
     }
     let content_end = sectors.len() - trailing_physical_gap;
+    let mut indexed_assets_by_path = HashMap::new();
     if track_mode == TrackMode::Mode2Xa {
         detect_metadata_subheader(
             &sectors[..content_end],
@@ -2198,10 +2225,20 @@ pub fn extract_with_options(
         detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_mode2_2336_file_lengths(content_end, &mut parsed_iso)?;
         detach_overlapping_xa_files(&sectors[..content_end], &mut parsed_iso)?;
-        prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
-        detect_entry_sector_subheaders(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
+        indexed_assets_by_path =
+            prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
+        let indexed_paths = indexed_assets_by_path
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        detect_entry_sector_subheaders(
+            &sectors[..content_end],
+            &mut parsed_iso,
+            &redump_ranges,
+            &indexed_paths,
+        )?;
     }
-    let detected_layout = detect_file_layout(
+    let mut detected_layout = detect_file_layout(
         &sectors[..content_end],
         &parsed_iso.files,
         &parsed_iso.directories,
@@ -2209,6 +2246,24 @@ pub fn extract_with_options(
         form2_edc,
         manifest_stem,
     )?;
+    for item in &mut detected_layout.items {
+        let FileLayoutItem::Path(file) = item else {
+            continue;
+        };
+        file.xa_assets = indexed_assets_by_path.remove(&file.path);
+    }
+    ensure!(
+        indexed_assets_by_path.is_empty(),
+        "indexed XA file is missing from physical layout"
+    );
+    let indexed_paths = detected_layout
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            FileLayoutItem::Path(file) if file.xa_assets.is_some() => Some(file.path.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     if track_mode == TrackMode::Mode2Xa {
         validate_iso_subheaders_with_xa_extents(
             &sectors,
@@ -2216,6 +2271,7 @@ pub fn extract_with_options(
             trailing_physical_gap,
             &detected_layout.xa_extent_ranges,
             &redump_ranges,
+            &indexed_paths,
         )?;
     }
     parsed_iso.manifest.layout = detected_layout.items;
@@ -2236,13 +2292,15 @@ pub fn extract_with_options(
     }
     let mut extracted_files = detected_layout.assets;
     for file in &parsed_iso.files {
-        let entry_index = parsed_iso
+        let layout_assets = parsed_iso
             .manifest
-            .entries
+            .layout
             .iter()
-            .position(|entry| entry.path == file.path)
-            .context("parsed file has no manifest entry")?;
-        if entry_uses_xa_sidecar(&parsed_iso.manifest.entries[entry_index]) {
+            .find_map(|item| match item {
+                FileLayoutItem::Path(item) if item.path == file.path => item.xa_assets.as_ref(),
+                _ => None,
+            });
+        if let Some(paths) = layout_assets {
             let start = usize::try_from(file.extent)?;
             let count = usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
             ensure!(
@@ -2251,30 +2309,24 @@ pub fn extract_with_options(
             );
             let assets = demultiplex_xa_extent(&sectors[start..start + count], form2_edc)
                 .with_context(|| format!("demultiplexing {}", file.path))?;
-            let xa = parsed_iso.manifest.entries[entry_index]
-                .xa
-                .as_ref()
-                .expect("checked XA metadata");
             for (path, data) in [
-                (xa.form1.clone().expect("prepared XA1 path"), assets.form1),
-                (xa.form2.clone().expect("prepared XA2 path"), assets.form2),
-                (
-                    xa.index.clone().expect("prepared XAI path"),
-                    assets.form2_index,
-                ),
+                (paths.form1.path.clone(), assets.form1),
+                (paths.form2.path.clone(), assets.form2),
+                (paths.index.path.clone(), assets.form2_index),
             ] {
                 ensure!(
                     extracted_files.insert(path.clone(), data).is_none(),
                     "duplicate extraction asset path {path}"
                 );
             }
-            if let Some(path) = &xa.gap_index {
+            if let Some(asset) = &paths.gap_index {
                 ensure!(!assets.gap_index.is_empty(), "prepared XAG asset is empty");
                 ensure!(
                     extracted_files
-                        .insert(path.clone(), assets.gap_index)
+                        .insert(asset.path.clone(), assets.gap_index)
                         .is_none(),
-                    "duplicate extraction asset path {path}"
+                    "duplicate extraction asset path {}",
+                    asset.path
                 );
             } else {
                 ensure!(
@@ -2645,24 +2697,21 @@ fn validate_track_structure(
             ensure!(
                 manifest.iso9660.entries.iter().all(|entry| {
                     entry.sector_subheader == EntrySectorSubheader::Canonical
-                        && !entry_uses_xa_sidecar(entry)
                         && entry.xa.as_ref().is_none_or(|xa| {
-                            xa.form1.is_none()
-                                && xa.form2.is_none()
-                                && xa.index.is_none()
-                                && xa.gap_index.is_none()
-                                && xa.logical_length.is_none()
+                            xa.logical_length.is_none()
+                                && xa.length_encoding.is_default()
                                 && xa.framing_subheader.is_none()
                         })
                 }),
                 "XA sector framing and sidecar assets are not applicable to Mode 1 tracks"
             );
             ensure!(
-                manifest
-                    .iso9660
-                    .layout
-                    .iter()
-                    .all(|item| item.as_xa_extent().is_none()),
+                manifest.iso9660.layout.iter().all(|item| {
+                    item.as_xa_extent().is_none()
+                        && item
+                            .as_path_item()
+                            .is_none_or(|file| file.xa_assets.is_none())
+                }),
                 "unreferenced XA extents are not applicable to Mode 1 tracks"
             );
             ensure!(
@@ -2803,6 +2852,7 @@ fn detect_entry_sector_subheaders(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
     redump_ranges: &[Range<usize>],
+    indexed_paths: &HashSet<String>,
 ) -> Result<()> {
     for file in &parsed_iso.files {
         let entry = parsed_iso
@@ -2811,7 +2861,7 @@ fn detect_entry_sector_subheaders(
             .iter_mut()
             .find(|entry| entry.path == file.path)
             .context("parsed file has no manifest entry")?;
-        if entry_uses_xa_sidecar(entry) {
+        if indexed_paths.contains(&entry.path) {
             continue;
         }
         let blocks = usize::try_from(file.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
@@ -2937,7 +2987,14 @@ fn validate_iso_subheaders(
     parsed_iso: &iso9660::ParsedIso,
     trailing_gap: usize,
 ) -> Result<()> {
-    validate_iso_subheaders_with_xa_extents(sectors, parsed_iso, trailing_gap, &[], &[])
+    validate_iso_subheaders_with_xa_extents(
+        sectors,
+        parsed_iso,
+        trailing_gap,
+        &[],
+        &[],
+        &HashSet::new(),
+    )
 }
 
 fn validate_iso_subheaders_with_xa_extents(
@@ -2946,6 +3003,7 @@ fn validate_iso_subheaders_with_xa_extents(
     trailing_gap: usize,
     xa_extent_ranges: &[Range<usize>],
     redump_ranges: &[Range<usize>],
+    indexed_paths: &HashSet<String>,
 ) -> Result<()> {
     let content_end = sectors
         .len()
@@ -2960,7 +3018,7 @@ fn validate_iso_subheaders_with_xa_extents(
             .iter()
             .find(|entry| entry.path == file.path)
             .context("parsed file has no manifest entry")?;
-        let interleaved = entry_uses_xa_sidecar(entry);
+        let interleaved = indexed_paths.contains(&entry.path);
         for block_index in 0..blocks {
             let lba = usize::try_from(file.extent)? + block_index;
             ensure!(lba < content_end, "file extent reaches outside ISO content");
@@ -3304,68 +3362,64 @@ pub fn build_with_options(
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
     let mut secondary_paths = HashSet::new();
-    for (file, source, ordinary_sha1) in manifest
+    for layout_file in manifest
         .iso9660
         .layout
         .iter()
-        .filter_map(FileLayoutItem::as_path_source_with_sha1)
+        .filter_map(FileLayoutItem::as_path_item)
     {
+        let file = layout_file.path.as_str();
         let entry = entries_by_path[file];
-        if entry_uses_xa_sidecar(entry) {
-            let xa = entry
-                .xa
-                .as_ref()
-                .context("missing interleaved XA metadata")?;
-            let form1_path = xa.form1.as_deref().context("missing XA1 asset path")?;
-            let form2_path = xa.form2.as_deref().context("missing XA2 asset path")?;
-            let index_path = xa.index.as_deref().context("missing XAI asset path")?;
+        if let Some(xa_assets) = &layout_file.xa_assets {
             let mut assets = Vec::new();
-            for (asset, label, expected_sha1) in [
-                (form1_path, "XA1", xa.form1_sha1.as_deref()),
-                (form2_path, "XA2", xa.form2_sha1.as_deref()),
-                (index_path, "XAI", xa.index_sha1.as_deref()),
+            for (asset, label) in [
+                (&xa_assets.form1, "XA1"),
+                (&xa_assets.form2, "XA2"),
+                (&xa_assets.index, "XAI"),
             ] {
+                let path = asset.path.as_str();
                 ensure!(
-                    secondary_paths.insert(asset),
-                    "duplicate XA secondary asset path {asset}"
+                    secondary_paths.insert(path),
+                    "duplicate XA secondary asset path {path}"
                 );
                 ensure!(
-                    asset != manifest.system_area.path,
-                    "XA secondary asset path collides with the system asset: {asset}"
+                    path != manifest.system_area.path,
+                    "XA secondary asset path collides with the system asset: {path}"
                 );
-                let host_path = safe_join(data_dir, asset)?;
+                let host_path = safe_join(data_dir, path)?;
                 validate_input_file(&host_path, label)?;
                 let data = fs::read(&host_path)
                     .with_context(|| format!("reading {label} asset {}", host_path.display()))?;
                 record_sha1_mismatch(
                     &mut sha1_mismatches,
                     Sha1Target::Asset {
-                        path: asset.to_owned(),
+                        path: path.to_owned(),
                     },
-                    expected_sha1,
+                    asset.sha1.as_deref(),
                     &data,
                 );
                 assets.push(data);
             }
-            let gap_index = if let Some(asset) = xa.gap_index.as_deref() {
+            let gap_index = if let Some(asset) = &xa_assets.gap_index {
+                let path = asset.path.as_str();
                 ensure!(
-                    secondary_paths.insert(asset),
-                    "duplicate XA secondary asset path {asset}"
+                    secondary_paths.insert(path),
+                    "duplicate XA secondary asset path {path}"
                 );
                 ensure!(
-                    asset != manifest.system_area.path,
-                    "XA secondary asset path collides with the system asset: {asset}"
+                    path != manifest.system_area.path,
+                    "XA secondary asset path collides with the system asset: {path}"
                 );
-                let host_path = safe_join(data_dir, asset)?;
+                let host_path = safe_join(data_dir, path)?;
                 validate_input_file(&host_path, "XAG")?;
                 let data = fs::read(&host_path)
                     .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
                 record_sha1_mismatch(
                     &mut sha1_mismatches,
                     Sha1Target::Asset {
-                        path: asset.to_owned(),
+                        path: path.to_owned(),
                     },
-                    xa.gap_index_sha1.as_deref(),
+                    asset.sha1.as_deref(),
                     &data,
                 );
                 data
@@ -3374,8 +3428,10 @@ pub fn build_with_options(
             };
             let sectors = multiplex_xa_extent(&assets[0], &assets[1], &assets[2], &gap_index)
                 .with_context(|| format!("multiplexing {file}"))?;
-            let logical_length = xa
-                .logical_length
+            let logical_length = entry
+                .xa
+                .as_ref()
+                .and_then(|xa| xa.logical_length)
                 .map(u64::from)
                 .unwrap_or(u64::try_from(sectors.len())? * LOGICAL_BLOCK_SIZE as u64);
             ensure!(
@@ -3388,6 +3444,7 @@ pub fn build_with_options(
             );
             mixed_extents.insert(file.to_owned(), sectors);
         } else {
+            let source = layout_file.source.as_deref().unwrap_or(file);
             let path = safe_join(data_dir, source)?;
             let data = fs::read(&path)
                 .with_context(|| format!("reading authored file {}", path.display()))?;
@@ -3396,7 +3453,7 @@ pub fn build_with_options(
                 Sha1Target::Asset {
                     path: source.to_owned(),
                 },
-                ordinary_sha1,
+                layout_file.sha1.as_deref(),
                 &data,
             );
             file_lengths.insert(file.to_owned(), u64::try_from(data.len())?);
@@ -3410,77 +3467,81 @@ pub fn build_with_options(
         .filter_map(FileLayoutItem::as_xa_extent)
     {
         let mut data = Vec::new();
-        for (asset, label, expected_sha1) in [
-            (assets.form1.as_str(), "XA1", assets.form1_sha1.as_deref()),
-            (assets.form2.as_str(), "XA2", assets.form2_sha1.as_deref()),
-            (assets.index.as_str(), "XAI", assets.index_sha1.as_deref()),
+        for (asset, label) in [
+            (&assets.form1, "XA1"),
+            (&assets.form2, "XA2"),
+            (&assets.index, "XAI"),
         ] {
+            let path = asset.path.as_str();
             ensure!(
-                secondary_paths.insert(asset),
-                "duplicate XA secondary asset path {asset}"
+                secondary_paths.insert(path),
+                "duplicate XA secondary asset path {path}"
             );
             ensure!(
-                asset != manifest.system_area.path,
-                "XA secondary asset path collides with the system asset: {asset}"
+                path != manifest.system_area.path,
+                "XA secondary asset path collides with the system asset: {path}"
             );
-            let host_path = safe_join(data_dir, asset)?;
+            let host_path = safe_join(data_dir, path)?;
             validate_input_file(&host_path, label)?;
             let bytes = fs::read(&host_path)
                 .with_context(|| format!("reading {label} asset {}", host_path.display()))?;
             record_sha1_mismatch(
                 &mut sha1_mismatches,
                 Sha1Target::Asset {
-                    path: asset.to_owned(),
+                    path: path.to_owned(),
                 },
-                expected_sha1,
+                asset.sha1.as_deref(),
                 &bytes,
             );
             data.push(bytes);
         }
-        let gap_index = if let Some(asset) = assets.gap_index.as_deref() {
+        let gap_index = if let Some(asset) = &assets.gap_index {
+            let path = asset.path.as_str();
             ensure!(
-                secondary_paths.insert(asset),
-                "duplicate XA secondary asset path {asset}"
+                secondary_paths.insert(path),
+                "duplicate XA secondary asset path {path}"
             );
             ensure!(
-                asset != manifest.system_area.path,
-                "XA secondary asset path collides with the system asset: {asset}"
+                path != manifest.system_area.path,
+                "XA secondary asset path collides with the system asset: {path}"
             );
-            let host_path = safe_join(data_dir, asset)?;
+            let host_path = safe_join(data_dir, path)?;
             validate_input_file(&host_path, "XAG")?;
             let data = fs::read(&host_path)
                 .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
             record_sha1_mismatch(
                 &mut sha1_mismatches,
                 Sha1Target::Asset {
-                    path: asset.to_owned(),
+                    path: path.to_owned(),
                 },
-                assets.gap_index_sha1.as_deref(),
+                asset.sha1.as_deref(),
                 &data,
             );
             data
         } else {
             Vec::new()
         };
-        let sectors = multiplex_xa_extent(&data[0], &data[1], &data[2], &gap_index)
-            .with_context(|| format!("multiplexing unreferenced XA extent {}", assets.index))?;
+        let sectors =
+            multiplex_xa_extent(&data[0], &data[1], &data[2], &gap_index).with_context(|| {
+                format!("multiplexing unreferenced XA extent {}", assets.index.path)
+            })?;
         ensure!(!sectors.is_empty(), "unreferenced XA extent is empty");
         ensure!(
             file_lengths
                 .insert(
-                    assets.index.clone(),
+                    assets.index.path.clone(),
                     u64::try_from(sectors.len())? * LOGICAL_BLOCK_SIZE as u64,
                 )
                 .is_none(),
             "duplicate layout data key {}",
-            assets.index
+            assets.index.path
         );
         ensure!(
             unreferenced_extents
-                .insert(assets.index.clone(), sectors)
+                .insert(assets.index.path.clone(), sectors)
                 .is_none(),
             "duplicate unreferenced XA extent {}",
-            assets.index
+            assets.index.path
         );
     }
     let metadata_gap_kind = match manifest.track.mode {
@@ -3879,31 +3940,16 @@ struct ExtractionWritePlan {
 }
 
 fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
-    let entries_by_path = manifest
-        .iso9660
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<HashMap<_, _>>();
     let mut paths = vec![manifest.system_area.path.clone()];
     for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
-                let entry = entries_by_path
-                    .get(file.path.as_str())
-                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
-                if entry_uses_xa_sidecar(entry) {
-                    let xa = entry.xa.as_ref().context("missing indexed XA metadata")?;
+                if let Some(xa) = &file.xa_assets {
                     paths.extend(
-                        [
-                            xa.form1.as_ref(),
-                            xa.form2.as_ref(),
-                            xa.index.as_ref(),
-                            xa.gap_index.as_ref(),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
+                        [&xa.form1, &xa.form2, &xa.index]
+                            .into_iter()
+                            .chain(xa.gap_index.iter())
+                            .map(|asset| asset.path.clone()),
                     );
                 } else {
                     paths.push(file.source.clone().unwrap_or_else(|| file.path.clone()));
@@ -3911,8 +3957,12 @@ fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &item.xa_extent;
-                paths.extend([xa.form1.clone(), xa.form2.clone(), xa.index.clone()]);
-                paths.extend(xa.gap_index.iter().cloned());
+                paths.extend(
+                    [&xa.form1, &xa.form2, &xa.index]
+                        .into_iter()
+                        .chain(xa.gap_index.iter())
+                        .map(|asset| asset.path.clone()),
+                );
             }
             FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
         }
@@ -4119,28 +4169,26 @@ fn plan_extraction_outputs(
         let snapshot = manifest.iso9660.layout[item_index].clone();
         match snapshot {
             FileLayoutItem::Path(file) => {
-                let entry_index = manifest
-                    .iso9660
-                    .entries
-                    .iter()
-                    .position(|entry| entry.path == file.path)
-                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
-                if entry_uses_xa_sidecar(&manifest.iso9660.entries[entry_index]) {
-                    let xa = manifest.iso9660.entries[entry_index]
-                        .xa
-                        .as_mut()
-                        .context("missing indexed XA metadata")?;
-                    for path in [
-                        &mut xa.form1,
-                        &mut xa.form2,
-                        &mut xa.index,
-                        &mut xa.gap_index,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
+                if file.xa_assets.is_some() {
+                    let FileLayoutItem::Path(item) = &mut manifest.iso9660.layout[item_index]
+                    else {
+                        unreachable!("snapshot preserves file layout kind")
+                    };
+                    let xa = item.xa_assets.as_mut().expect("snapshot has XA assets");
+                    for asset in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
                         resolve_mapped_extraction_asset(
-                            path,
+                            &mut asset.path,
+                            assets,
+                            data_dir,
+                            overwrite,
+                            &reserved,
+                            &mut selected,
+                            &mut writes,
+                        )?;
+                    }
+                    if let Some(asset) = &mut xa.gap_index {
+                        resolve_mapped_extraction_asset(
+                            &mut asset.path,
                             assets,
                             data_dir,
                             overwrite,
@@ -4174,9 +4222,9 @@ fn plan_extraction_outputs(
                     unreachable!("snapshot preserves file layout kind")
                 };
                 let xa = &mut item.xa_extent;
-                for path in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
+                for asset in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
                     resolve_mapped_extraction_asset(
-                        path,
+                        &mut asset.path,
                         assets,
                         data_dir,
                         overwrite,
@@ -4185,9 +4233,9 @@ fn plan_extraction_outputs(
                         &mut writes,
                     )?;
                 }
-                if let Some(path) = &mut xa.gap_index {
+                if let Some(asset) = &mut xa.gap_index {
                     resolve_mapped_extraction_asset(
-                        path,
+                        &mut asset.path,
                         assets,
                         data_dir,
                         overwrite,
@@ -4336,22 +4384,16 @@ fn validate_optional_sha1(value: Option<&str>, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_xa_asset_hashes(xa: &crate::manifest::EntryXa, owner: &str) -> Result<()> {
-    for (path, sha1, label) in [
-        (xa.form1.as_deref(), xa.form1_sha1.as_deref(), "form1_sha1"),
-        (xa.form2.as_deref(), xa.form2_sha1.as_deref(), "form2_sha1"),
-        (xa.index.as_deref(), xa.index_sha1.as_deref(), "index_sha1"),
-        (
-            xa.gap_index.as_deref(),
-            xa.gap_index_sha1.as_deref(),
-            "gap_index_sha1",
-        ),
+fn validate_xa_asset_hashes(xa: &XaAssets, owner: &str) -> Result<()> {
+    for (asset, label) in [
+        (&xa.form1, "form1 sha1"),
+        (&xa.form2, "form2 sha1"),
+        (&xa.index, "index sha1"),
     ] {
-        ensure!(
-            sha1.is_none() || path.is_some(),
-            "{owner} {label} requires its corresponding asset path"
-        );
-        validate_optional_sha1(sha1, &format!("{owner} {label}"))?;
+        validate_optional_sha1(asset.sha1.as_deref(), &format!("{owner} {label}"))?;
+    }
+    if let Some(asset) = &xa.gap_index {
+        validate_optional_sha1(asset.sha1.as_deref(), &format!("{owner} gap_index sha1"))?;
     }
     Ok(())
 }
@@ -4359,20 +4401,11 @@ fn validate_xa_asset_hashes(xa: &crate::manifest::EntryXa, owner: &str) -> Resul
 fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
     validate_optional_sha1(manifest.track.sha1.as_deref(), "track sha1")?;
     validate_optional_sha1(manifest.system_area.sha1.as_deref(), "system-area sha1")?;
-    let entries_by_path = manifest
-        .iso9660
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<HashMap<_, _>>();
     for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
                 validate_optional_sha1(file.sha1.as_deref(), &format!("asset {} sha1", file.path))?;
-                if entries_by_path
-                    .get(file.path.as_str())
-                    .is_some_and(|entry| entry_uses_xa_sidecar(entry))
-                {
+                if let Some(assets) = &file.xa_assets {
                     ensure!(
                         file.source.is_none(),
                         "indexed XA file {} cannot declare an ordinary-file source",
@@ -4383,73 +4416,19 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
                         "indexed XA file {} cannot declare an ordinary-file sha1",
                         file.path
                     );
+                    validate_xa_asset_hashes(assets, &format!("indexed XA file {}", file.path))?;
                 }
             }
             FileLayoutItem::XaExtent(item) => {
-                let assets = &item.xa_extent;
-                for (path, sha1, label) in [
-                    (
-                        Some(assets.form1.as_str()),
-                        assets.form1_sha1.as_deref(),
-                        "form1_sha1",
-                    ),
-                    (
-                        Some(assets.form2.as_str()),
-                        assets.form2_sha1.as_deref(),
-                        "form2_sha1",
-                    ),
-                    (
-                        Some(assets.index.as_str()),
-                        assets.index_sha1.as_deref(),
-                        "index_sha1",
-                    ),
-                    (
-                        assets.gap_index.as_deref(),
-                        assets.gap_index_sha1.as_deref(),
-                        "gap_index_sha1",
-                    ),
-                ] {
-                    ensure!(
-                        sha1.is_none() || path.is_some(),
-                        "unreferenced XA {label} requires its corresponding asset path"
-                    );
-                    validate_optional_sha1(sha1, &format!("unreferenced XA {label}"))?;
-                }
+                validate_xa_asset_hashes(&item.xa_extent, "unreferenced XA extent")?;
             }
             FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
-        }
-    }
-    for entry in &manifest.iso9660.entries {
-        if let Some(xa) = &entry.xa {
-            validate_xa_asset_hashes(xa, &format!("entry {}", entry.path))?;
-        }
-        if let Some(xa) = &entry.directory_self_xa {
-            validate_xa_asset_hashes(xa, &format!("entry {} directory_self_xa", entry.path))?;
-        }
-    }
-    for volume in &manifest.iso9660.supplementary_volumes {
-        for entry in &volume.entries {
-            if let Some(xa) = &entry.xa {
-                validate_xa_asset_hashes(xa, &format!("Joliet entry {}", entry.path))?;
-            }
-            if let Some(xa) = &entry.directory_self_xa {
-                validate_xa_asset_hashes(
-                    xa,
-                    &format!("Joliet entry {} directory_self_xa", entry.path),
-                )?;
-            }
         }
     }
     Ok(())
 }
 
 fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
-    let entries_by_path = manifest
-        .iso9660
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<HashMap<_, _>>();
     let mut paths = HashSet::new();
     let mut register = |path: &str, owner: &str| -> Result<()> {
         safe_join(Path::new("."), path)
@@ -4464,20 +4443,14 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
     for item in &manifest.iso9660.layout {
         match item {
             FileLayoutItem::Path(file) => {
-                let entry = entries_by_path
-                    .get(file.path.as_str())
-                    .with_context(|| format!("file layout names unknown entry {}", file.path))?;
-                if entry_uses_xa_sidecar(entry) {
-                    let xa = entry.xa.as_ref().context("missing indexed XA metadata")?;
-                    for (path, label) in [
-                        (xa.form1.as_deref(), "XA1"),
-                        (xa.form2.as_deref(), "XA2"),
-                        (xa.index.as_deref(), "XAI"),
-                        (xa.gap_index.as_deref(), "XAG"),
-                    ] {
-                        if let Some(path) = path {
-                            register(path, &format!("{} {label}", file.path))?;
-                        }
+                if let Some(xa) = &file.xa_assets {
+                    for (asset, label) in
+                        [(&xa.form1, "XA1"), (&xa.form2, "XA2"), (&xa.index, "XAI")]
+                    {
+                        register(&asset.path, &format!("{} {label}", file.path))?;
+                    }
+                    if let Some(asset) = &xa.gap_index {
+                        register(&asset.path, &format!("{} XAG", file.path))?;
                     }
                 } else {
                     register(
@@ -4488,15 +4461,11 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &item.xa_extent;
-                for (path, label) in [
-                    (Some(xa.form1.as_str()), "XA1"),
-                    (Some(xa.form2.as_str()), "XA2"),
-                    (Some(xa.index.as_str()), "XAI"),
-                    (xa.gap_index.as_deref(), "XAG"),
-                ] {
-                    if let Some(path) = path {
-                        register(path, &format!("unreferenced {label}"))?;
-                    }
+                for (asset, label) in [(&xa.form1, "XA1"), (&xa.form2, "XA2"), (&xa.index, "XAI")] {
+                    register(&asset.path, &format!("unreferenced {label}"))?;
+                }
+                if let Some(asset) = &xa.gap_index {
+                    register(&asset.path, "unreferenced XAG")?;
                 }
             }
             FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
@@ -4541,6 +4510,15 @@ fn set_extracted_asset_sha1(
     Ok(())
 }
 
+fn set_host_asset_sha1(
+    asset: &mut HostAsset,
+    assets: &HashMap<String, Vec<u8>>,
+    hashed_paths: &mut HashSet<String>,
+) -> Result<()> {
+    let path = asset.path.clone();
+    set_extracted_asset_sha1(&path, &mut asset.sha1, assets, hashed_paths)
+}
+
 fn add_extracted_hashes(
     manifest: &mut Manifest,
     source_sha1: &str,
@@ -4549,50 +4527,32 @@ fn add_extracted_hashes(
 ) -> Result<()> {
     manifest.track.sha1 = Some(source_sha1.to_owned());
     manifest.system_area.sha1 = Some(sha1_hex(system));
-    let indexed_paths = manifest
-        .iso9660
-        .entries
-        .iter()
-        .filter(|entry| entry_uses_xa_sidecar(entry))
-        .map(|entry| entry.path.clone())
-        .collect::<HashSet<_>>();
     let mut hashed_paths = HashSet::new();
     for item in &mut manifest.iso9660.layout {
         match item {
-            FileLayoutItem::Path(file) if !indexed_paths.contains(&file.path) => {
-                let path = file.source.as_deref().unwrap_or(&file.path);
-                set_extracted_asset_sha1(path, &mut file.sha1, assets, &mut hashed_paths)?;
+            FileLayoutItem::Path(file) => {
+                if let Some(xa) = &mut file.xa_assets {
+                    set_host_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
+                    set_host_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
+                    set_host_asset_sha1(&mut xa.index, assets, &mut hashed_paths)?;
+                    if let Some(asset) = &mut xa.gap_index {
+                        set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
+                    }
+                } else {
+                    let path = file.source.as_deref().unwrap_or(&file.path);
+                    set_extracted_asset_sha1(path, &mut file.sha1, assets, &mut hashed_paths)?;
+                }
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &mut item.xa_extent;
-                set_extracted_asset_sha1(&xa.form1, &mut xa.form1_sha1, assets, &mut hashed_paths)?;
-                set_extracted_asset_sha1(&xa.form2, &mut xa.form2_sha1, assets, &mut hashed_paths)?;
-                set_extracted_asset_sha1(&xa.index, &mut xa.index_sha1, assets, &mut hashed_paths)?;
-                if let Some(path) = xa.gap_index.as_deref() {
-                    set_extracted_asset_sha1(
-                        path,
-                        &mut xa.gap_index_sha1,
-                        assets,
-                        &mut hashed_paths,
-                    )?;
+                set_host_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
+                set_host_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
+                set_host_asset_sha1(&mut xa.index, assets, &mut hashed_paths)?;
+                if let Some(asset) = &mut xa.gap_index {
+                    set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
                 }
             }
-            FileLayoutItem::Path(_) | FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
-        }
-    }
-    for entry in &mut manifest.iso9660.entries {
-        let Some(xa) = entry.xa.as_mut().filter(|xa| xa.form1.is_some()) else {
-            continue;
-        };
-        for (path, destination) in [
-            (xa.form1.as_deref(), &mut xa.form1_sha1),
-            (xa.form2.as_deref(), &mut xa.form2_sha1),
-            (xa.index.as_deref(), &mut xa.index_sha1),
-            (xa.gap_index.as_deref(), &mut xa.gap_index_sha1),
-        ] {
-            if let Some(path) = path {
-                set_extracted_asset_sha1(path, destination, assets, &mut hashed_paths)?;
-            }
+            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
         }
     }
     ensure!(
@@ -4627,6 +4587,35 @@ mod tests {
              \x20 - path: FILE.BIN\n"
         ))
         .unwrap()
+    }
+
+    fn host_asset(path: &str) -> HostAsset {
+        HostAsset {
+            path: path.to_owned(),
+            sha1: None,
+        }
+    }
+
+    fn xa_assets(form1: &str, form2: &str, index: &str, gap_index: Option<&str>) -> XaAssets {
+        XaAssets {
+            form1: host_asset(form1),
+            form2: host_asset(form2),
+            index: host_asset(index),
+            gap_index: gap_index.map(host_asset),
+        }
+    }
+
+    fn set_indexed_assets(manifest: &mut Manifest, path: &str, assets: XaAssets) {
+        let file = manifest
+            .iso9660
+            .layout
+            .iter_mut()
+            .find_map(|item| match item {
+                FileLayoutItem::Path(file) if file.path == path => Some(file),
+                _ => None,
+            })
+            .expect("indexed test path exists");
+        file.xa_assets = Some(assets);
     }
 
     #[test]
@@ -5355,16 +5344,18 @@ mod tests {
 
     #[test]
     fn explicit_xa_assets_can_describe_an_extent_with_omitted_attributes() {
-        let mut entry = test_manifest().iso9660.entries.remove(1);
-        entry.xa = Some(crate::manifest::EntryXa {
+        let mut manifest = test_manifest();
+        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
             attributes: Some(crate::manifest::XaAttributes::from_bits(0)),
-            form1: Some("FILE.BIN.XA1".to_owned()),
-            form2: Some("FILE.BIN.XA2".to_owned()),
-            index: Some("FILE.BIN.XAI".to_owned()),
             ..crate::manifest::EntryXa::default()
         });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            xa_assets("FILE.BIN.XA1", "FILE.BIN.XA2", "FILE.BIN.XAI", None),
+        );
 
-        assert!(entry_uses_xa_sidecar(&entry));
+        iso9660::validate(&manifest.iso9660).unwrap();
     }
 
     #[test]
@@ -5373,12 +5364,12 @@ mod tests {
         sectors[17] = parsed_xa_sector(true, 1);
         let mut parsed = parsed_iso();
 
-        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
-        let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
-        assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
-        assert_eq!(xa.form2.as_deref(), Some("FILE.BIN.XA2"));
-        assert_eq!(xa.index.as_deref(), Some("FILE.BIN.XAI"));
+        let xa = &assets["FILE.BIN"];
+        assert_eq!(xa.form1.path, "FILE.BIN.XA1");
+        assert_eq!(xa.form2.path, "FILE.BIN.XA2");
+        assert_eq!(xa.index.path, "FILE.BIN.XAI");
         assert_eq!(xa.gap_index, None);
     }
 
@@ -5390,13 +5381,20 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.files[0].length = 1;
 
-        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
-        let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
-        assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
-        assert_eq!(xa.form2.as_deref(), Some("FILE.BIN.XA2"));
-        assert_eq!(xa.index.as_deref(), Some("FILE.BIN.XAI"));
-        assert_eq!(xa.logical_length, Some(1));
+        let xa = &assets["FILE.BIN"];
+        assert_eq!(xa.form1.path, "FILE.BIN.XA1");
+        assert_eq!(xa.form2.path, "FILE.BIN.XA2");
+        assert_eq!(xa.index.path, "FILE.BIN.XAI");
+        assert_eq!(
+            parsed.manifest.entries[1]
+                .xa
+                .as_ref()
+                .unwrap()
+                .logical_length,
+            Some(1)
+        );
     }
 
     #[test]
@@ -5431,7 +5429,7 @@ mod tests {
 
         detect_mode2_2336_file_lengths(sectors.len(), &mut parsed).unwrap();
         detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
-        prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
 
         assert_eq!(
             parsed
@@ -5446,10 +5444,8 @@ mod tests {
         );
         let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
         assert_eq!(xa.length_encoding, XaLengthEncoding::Mode2_2336);
-        assert_eq!(xa.form1.as_deref(), Some("FILE.BIN.XA1"));
-        assert_eq!(xa.form2.as_deref(), Some("FILE.BIN.XA2"));
-        assert_eq!(xa.index.as_deref(), Some("FILE.BIN.XAI"));
         assert_eq!(xa.logical_length, None);
+        assert_eq!(assets["FILE.BIN"].index.path, "FILE.BIN.XAI");
     }
 
     #[test]
@@ -5630,7 +5626,7 @@ mod tests {
             },
         ];
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[], &HashSet::new()).unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
@@ -5893,9 +5889,6 @@ mod tests {
         let xa = entry.xa.as_ref().unwrap();
         assert_eq!(xa.attributes, Some(attributes));
         assert_eq!(xa.length_encoding, XaLengthEncoding::Logical2048);
-        assert!(xa.form1.is_none());
-        assert!(xa.form2.is_none());
-        assert!(xa.index.is_none());
         parsed.manifest.layout.clear();
         iso9660::layout(&parsed.manifest, &HashMap::new()).unwrap();
     }
@@ -6240,7 +6233,7 @@ mod tests {
             length: (2 * LOGICAL_BLOCK_SIZE) as u32,
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[], &HashSet::new()).unwrap();
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::IsoMetadata
@@ -6258,7 +6251,7 @@ mod tests {
         file_subheaders[16] = PVD_SUBHEADER;
         let file_sectors = parsed_form1_sequence(&file_subheaders);
         let mut file_iso = parsed_iso();
-        detect_entry_sector_subheaders(&file_sectors, &mut file_iso, &[]).unwrap();
+        detect_entry_sector_subheaders(&file_sectors, &mut file_iso, &[], &HashSet::new()).unwrap();
         assert_eq!(
             file_iso.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::Data
@@ -6294,7 +6287,13 @@ mod tests {
             length: (2 * LOGICAL_BLOCK_SIZE) as u32,
         });
 
-        detect_entry_sector_subheaders(&directory_sectors, &mut directory_iso, &[]).unwrap();
+        detect_entry_sector_subheaders(
+            &directory_sectors,
+            &mut directory_iso,
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(
             directory_iso.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::DataUntilFinal
@@ -6333,7 +6332,7 @@ mod tests {
             length: LOGICAL_BLOCK_SIZE as u32,
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[], &HashSet::new()).unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
@@ -6376,7 +6375,8 @@ mod tests {
         });
 
         let redump_ranges = std::iter::once(18..19).collect::<Vec<_>>();
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &redump_ranges).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &redump_ranges, &HashSet::new())
+            .unwrap();
 
         assert_eq!(
             parsed.manifest.entries[1]
@@ -6389,7 +6389,15 @@ mod tests {
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::DataUntilFinal
         );
-        validate_iso_subheaders_with_xa_extents(&sectors, &parsed, 0, &[], &redump_ranges).unwrap();
+        validate_iso_subheaders_with_xa_extents(
+            &sectors,
+            &parsed,
+            0,
+            &[],
+            &redump_ranges,
+            &HashSet::new(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -6512,7 +6520,7 @@ mod tests {
         let sectors = parsed_form1_sequence(&subheaders);
         let mut parsed = parsed_iso();
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[], &HashSet::new()).unwrap();
         assert_eq!(
             parsed.manifest.entries[1].sector_subheader,
             EntrySectorSubheader::EndOfFileData
@@ -6535,7 +6543,7 @@ mod tests {
             ..crate::manifest::EntryXa::default()
         });
 
-        detect_entry_sector_subheaders(&sectors, &mut parsed, &[]).unwrap();
+        detect_entry_sector_subheaders(&sectors, &mut parsed, &[], &HashSet::new()).unwrap();
         validate_iso_subheaders(&sectors, &parsed, 0).unwrap();
     }
 
@@ -6623,12 +6631,11 @@ mod tests {
         manifest.track.sha1 = Some("not-a-sha1".to_owned());
         assert!(validate_manifest_hashes(&manifest).is_err());
         manifest.track.sha1 = Some(uppercase.to_owned());
-        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
-            form1: Some("FILE.BIN.XA1".to_owned()),
-            form2: Some("FILE.BIN.XA2".to_owned()),
-            index: Some("FILE.BIN.XAI".to_owned()),
-            ..crate::manifest::EntryXa::default()
-        });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            xa_assets("FILE.BIN.XA1", "FILE.BIN.XA2", "FILE.BIN.XAI", None),
+        );
         assert_eq!(
             validate_manifest_hashes(&manifest).unwrap_err().to_string(),
             "indexed XA file FILE.BIN cannot declare an ordinary-file sha1"
@@ -6637,20 +6644,20 @@ mod tests {
         if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
             file.sha1 = None;
         }
-        manifest.iso9660.entries[1].xa = None;
         manifest
             .iso9660
             .layout
-            .push(FileLayoutItem::xa_extent(XaExtentAssets {
-                form1: "EXTRA.XA1".to_owned(),
-                form1_sha1: None,
-                form2: "EXTRA.XA2".to_owned(),
-                form2_sha1: None,
-                index: "EXTRA.XAI".to_owned(),
-                index_sha1: None,
-                gap_index: None,
-                gap_index_sha1: Some(uppercase.to_owned()),
-            }));
+            .push(FileLayoutItem::xa_extent(xa_assets(
+                "EXTRA.XA1",
+                "EXTRA.XA2",
+                "EXTRA.XAI",
+                None,
+            )));
+        let extra = manifest.iso9660.layout.last_mut().unwrap();
+        let FileLayoutItem::XaExtent(extra) = extra else {
+            unreachable!()
+        };
+        extra.xa_extent.form1.sha1 = Some("invalid".to_owned());
         assert!(validate_manifest_hashes(&manifest).is_err());
     }
 
@@ -6664,26 +6671,25 @@ mod tests {
             .iso9660
             .layout
             .push(FileLayoutItem::path("ORDINARY.BIN"));
-        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
-            form1: Some("FILE.BIN.XA1".to_owned()),
-            form2: Some("FILE.BIN.XA2".to_owned()),
-            index: Some("FILE.BIN.XAI".to_owned()),
-            gap_index: Some("FILE.BIN.XAG".to_owned()),
-            ..crate::manifest::EntryXa::default()
-        });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            xa_assets(
+                "FILE.BIN.XA1",
+                "FILE.BIN.XA2",
+                "FILE.BIN.XAI",
+                Some("FILE.BIN.XAG"),
+            ),
+        );
         manifest
             .iso9660
             .layout
-            .push(FileLayoutItem::xa_extent(XaExtentAssets {
-                form1: "EXTRA.XA1".to_owned(),
-                form1_sha1: None,
-                form2: "EXTRA.XA2".to_owned(),
-                form2_sha1: None,
-                index: "EXTRA.XAI".to_owned(),
-                index_sha1: None,
-                gap_index: Some("EXTRA.XAG".to_owned()),
-                gap_index_sha1: None,
-            }));
+            .push(FileLayoutItem::xa_extent(xa_assets(
+                "EXTRA.XA1",
+                "EXTRA.XA2",
+                "EXTRA.XAI",
+                Some("EXTRA.XAG"),
+            )));
         let assets = [
             ("ORDINARY.BIN", vec![1]),
             ("FILE.BIN.XA1", Vec::new()),
@@ -6708,14 +6714,17 @@ mod tests {
             manifest.system_area.sha1.as_deref(),
             Some(system_sha1.as_str())
         );
-        let xa = manifest.iso9660.entries[1].xa.as_ref().unwrap();
+        let FileLayoutItem::Path(indexed) = &manifest.iso9660.layout[0] else {
+            unreachable!()
+        };
+        let xa = indexed.xa_assets.as_ref().unwrap();
         assert_eq!(
-            xa.form1_sha1.as_deref(),
+            xa.form1.sha1.as_deref(),
             Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
         );
-        assert!(xa.form2_sha1.is_some());
-        assert!(xa.index_sha1.is_some());
-        assert!(xa.gap_index_sha1.is_some());
+        assert!(xa.form2.sha1.is_some());
+        assert!(xa.index.sha1.is_some());
+        assert!(xa.gap_index.as_ref().unwrap().sha1.is_some());
         if let FileLayoutItem::Path(file) = &manifest.iso9660.layout[1] {
             let expected = sha1_hex(&[1]);
             assert_eq!(file.sha1.as_deref(), Some(expected.as_str()));
@@ -6723,16 +6732,16 @@ mod tests {
             panic!("ordinary asset is not a path item");
         }
         if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.layout[2] {
-            assert!(item.xa_extent.form1_sha1.is_some());
-            assert!(item.xa_extent.form2_sha1.is_some());
-            assert!(item.xa_extent.index_sha1.is_some());
-            assert!(item.xa_extent.gap_index_sha1.is_some());
+            assert!(item.xa_extent.form1.sha1.is_some());
+            assert!(item.xa_extent.form2.sha1.is_some());
+            assert!(item.xa_extent.index.sha1.is_some());
+            assert!(item.xa_extent.gap_index.as_ref().unwrap().sha1.is_some());
         } else {
             panic!("unreferenced asset is not an XA extent");
         }
         let yaml = serialize_manifest(&manifest).unwrap();
         assert!(yaml.contains(&format!("sha1: {track_sha1}")));
-        assert!(yaml.contains("form1_sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+        assert!(yaml.contains("sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));
         let reparsed: Manifest = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(reparsed.track.sha1, manifest.track.sha1);
     }
@@ -6770,16 +6779,30 @@ mod tests {
                 crate::manifest::XaAttributes::MODE2_FORM1.bits()
                     | crate::manifest::XaAttributes::INTERLEAVED.bits(),
             )),
-            form1: Some("FILE.XA1".to_owned()),
-            form1_sha1: Some(sha1_hex(&assets.form1)),
-            form2: Some("FILE.XA2".to_owned()),
-            form2_sha1: Some(sha1_hex(&assets.form2)),
-            index: Some("FILE.XAI".to_owned()),
-            index_sha1: Some(sha1_hex(&assets.form2_index)),
-            gap_index: Some("FILE.XAG".to_owned()),
-            gap_index_sha1: Some(sha1_hex(&assets.gap_index)),
             ..crate::manifest::EntryXa::default()
         });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            XaAssets {
+                form1: HostAsset {
+                    path: "FILE.XA1".to_owned(),
+                    sha1: Some(sha1_hex(&assets.form1)),
+                },
+                form2: HostAsset {
+                    path: "FILE.XA2".to_owned(),
+                    sha1: Some(sha1_hex(&assets.form2)),
+                },
+                index: HostAsset {
+                    path: "FILE.XAI".to_owned(),
+                    sha1: Some(sha1_hex(&assets.form2_index)),
+                },
+                gap_index: Some(HostAsset {
+                    path: "FILE.XAG".to_owned(),
+                    sha1: Some(sha1_hex(&assets.gap_index)),
+                }),
+            },
+        );
         let manifest_path = project.path().join("disc.yaml");
         fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
         let unchanged = build(
@@ -6793,11 +6816,10 @@ mod tests {
 
         let mut warning_only_manifest = manifest.clone();
         warning_only_manifest.system_area.sha1 = Some("0".repeat(40));
-        warning_only_manifest.iso9660.entries[1]
-            .xa
-            .as_mut()
-            .unwrap()
-            .form1_sha1 = Some("1".repeat(40));
+        let FileLayoutItem::Path(file) = &mut warning_only_manifest.iso9660.layout[0] else {
+            unreachable!()
+        };
+        file.xa_assets.as_mut().unwrap().form1.sha1 = Some("1".repeat(40));
         let warning_only_manifest_path = project.path().join("warning-only.yaml");
         fs::write(
             &warning_only_manifest_path,
@@ -6977,8 +6999,8 @@ mod tests {
                 .iso9660
                 .layout
                 .iter()
-                .filter_map(FileLayoutItem::as_path_source_with_sha1)
-                .all(|(_, _, sha1)| sha1.is_some())
+                .filter_map(FileLayoutItem::as_path_item)
+                .all(|file| file.sha1.is_some())
         );
 
         let data_dir = project.path().join("hashed-assets");
@@ -6999,9 +7021,9 @@ mod tests {
             .iso9660
             .layout
             .iter()
-            .filter_map(FileLayoutItem::as_path_source_with_sha1)
-            .find(|(path, _, _)| *path == "FILE.BIN")
-            .and_then(|(_, _, sha1)| sha1)
+            .filter_map(FileLayoutItem::as_path_item)
+            .find(|file| file.path == "FILE.BIN")
+            .and_then(|file| file.sha1.as_deref())
             .unwrap();
         assert_eq!(
             file_sha1,
@@ -7255,26 +7277,20 @@ mod tests {
     fn extraction_output_planning_rewrites_system_and_xa_asset_paths() {
         let project = tempfile::tempdir().unwrap();
         let mut manifest = test_manifest();
-        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
-            form1: Some("FILE.XA1".to_owned()),
-            form2: Some("FILE.XA2".to_owned()),
-            index: Some("FILE.XAI".to_owned()),
-            gap_index: Some("FILE.XAG".to_owned()),
-            ..crate::manifest::EntryXa::default()
-        });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            xa_assets("FILE.XA1", "FILE.XA2", "FILE.XAI", Some("FILE.XAG")),
+        );
         manifest
             .iso9660
             .layout
-            .push(FileLayoutItem::xa_extent(XaExtentAssets {
-                form1: "EXTRA.XA1".to_owned(),
-                form1_sha1: None,
-                form2: "EXTRA.XA2".to_owned(),
-                form2_sha1: None,
-                index: "EXTRA.XAI".to_owned(),
-                index_sha1: None,
-                gap_index: Some("EXTRA.XAG".to_owned()),
-                gap_index_sha1: None,
-            }));
+            .push(FileLayoutItem::xa_extent(xa_assets(
+                "EXTRA.XA1",
+                "EXTRA.XA2",
+                "EXTRA.XAI",
+                Some("EXTRA.XAG"),
+            )));
         let mut assets = HashMap::from([
             ("FILE.XA1".to_owned(), vec![1]),
             ("FILE.XA2".to_owned(), vec![2]),
@@ -7292,11 +7308,14 @@ mod tests {
             plan_extraction_outputs(&mut manifest, &mut assets, b"system", project.path(), false)
                 .unwrap();
         assert_eq!(manifest.system_area.path, "sample.system.1");
-        let xa = manifest.iso9660.entries[1].xa.as_ref().unwrap();
-        assert_eq!(xa.form1.as_deref(), Some("FILE.XA1.1"));
-        assert_eq!(xa.form2.as_deref(), Some("FILE.XA2.1"));
-        assert_eq!(xa.index.as_deref(), Some("FILE.XAI.1"));
-        assert_eq!(xa.gap_index.as_deref(), Some("FILE.XAG.1"));
+        let FileLayoutItem::Path(file) = &manifest.iso9660.layout[0] else {
+            unreachable!()
+        };
+        let xa = file.xa_assets.as_ref().unwrap();
+        assert_eq!(xa.form1.path, "FILE.XA1.1");
+        assert_eq!(xa.form2.path, "FILE.XA2.1");
+        assert_eq!(xa.index.path, "FILE.XAI.1");
+        assert_eq!(xa.gap_index.as_ref().unwrap().path, "FILE.XAG.1");
         let extra = manifest
             .iso9660
             .layout
@@ -7304,10 +7323,10 @@ mod tests {
             .unwrap()
             .as_xa_extent()
             .unwrap();
-        assert_eq!(extra.form1, "EXTRA.XA1.1");
-        assert_eq!(extra.form2, "EXTRA.XA2.1");
-        assert_eq!(extra.index, "EXTRA.XAI.1");
-        assert_eq!(extra.gap_index.as_deref(), Some("EXTRA.XAG.1"));
+        assert_eq!(extra.form1.path, "EXTRA.XA1.1");
+        assert_eq!(extra.form2.path, "EXTRA.XA2.1");
+        assert_eq!(extra.index.path, "EXTRA.XAI.1");
+        assert_eq!(extra.gap_index.as_ref().unwrap().path, "EXTRA.XAG.1");
         assert!(plan.system);
         assert_eq!(plan.assets.len(), assets.len());
         assert!(assets.contains_key("FILE.XAG.1"));
@@ -7425,20 +7444,19 @@ mod tests {
     #[test]
     fn indexed_sources_and_duplicate_or_unsafe_host_paths_are_rejected() {
         let mut manifest = test_manifest();
-        manifest.iso9660.entries[1].xa = Some(crate::manifest::EntryXa {
-            form1: Some("FILE.XA1".to_owned()),
-            form2: Some("FILE.XA2".to_owned()),
-            index: Some("FILE.XAI".to_owned()),
-            ..crate::manifest::EntryXa::default()
-        });
+        set_indexed_assets(
+            &mut manifest,
+            "FILE.BIN",
+            xa_assets("FILE.XA1", "FILE.XA2", "FILE.XAI", None),
+        );
         let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] else {
             panic!("expected path item")
         };
         file.source = Some("OTHER.BIN".to_owned());
         assert!(validate_manifest_hashes(&manifest).is_err());
 
-        manifest.iso9660.entries[1].xa = None;
         if let FileLayoutItem::Path(file) = &mut manifest.iso9660.layout[0] {
+            file.xa_assets = None;
             file.source = Some("../escape".to_owned());
         }
         assert!(validate_manifest_asset_paths(&manifest).is_err());
