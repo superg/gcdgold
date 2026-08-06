@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import BinaryIO, Sequence, TextIO
+from typing import BinaryIO, Callable, Sequence, TextIO
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("test_rom_catalog.toml")
@@ -36,7 +36,7 @@ class Configuration:
     roms: Path
     output: Path
     manifests: Path | None
-    temporary_directory: Path | None
+    extracted_projects: Path | None
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,6 @@ class Discovery:
 @dataclass(frozen=True)
 class CatalogItem:
     image: Path
-    cue: Path | None
 
 
 def resolve_configured_path(config_path: Path, value: str) -> Path:
@@ -85,7 +84,7 @@ def load_configuration(path: Path) -> Configuration:
         raise CatalogError(f"invalid TOML in {config_path}: {error}") from error
 
     required = {"gcdgold", "roms", "output"}
-    optional = {"manifests", "temporary_directory"}
+    optional = {"extracted_projects", "manifests"}
     expected = required | optional
     actual = set(document)
     if not required.issubset(actual) or not actual.issubset(expected):
@@ -110,7 +109,7 @@ def load_configuration(path: Path) -> Configuration:
         roms=values["roms"],
         output=values["output"],
         manifests=values.get("manifests"),
-        temporary_directory=values.get("temporary_directory"),
+        extracted_projects=values.get("extracted_projects"),
     )
 
 
@@ -160,21 +159,20 @@ def validate_configuration(configuration: Configuration) -> None:
             )
         configuration.manifests.mkdir(parents=True, exist_ok=True)
 
-    if configuration.temporary_directory is not None:
-        if not configuration.temporary_directory.exists():
+    if configuration.extracted_projects is not None:
+        if (
+            configuration.extracted_projects.exists()
+            and not configuration.extracted_projects.is_dir()
+        ):
             raise CatalogError(
-                "temporary directory does not exist: "
-                f"{configuration.temporary_directory}"
+                "extracted project output path is not a directory: "
+                f"{configuration.extracted_projects}"
             )
-        if not configuration.temporary_directory.is_dir():
+        configuration.extracted_projects.mkdir(parents=True, exist_ok=True)
+        if not os.access(configuration.extracted_projects, os.W_OK | os.X_OK):
             raise CatalogError(
-                "temporary directory path is not a directory: "
-                f"{configuration.temporary_directory}"
-            )
-        if not os.access(configuration.temporary_directory, os.W_OK | os.X_OK):
-            raise CatalogError(
-                "temporary directory is not writable: "
-                f"{configuration.temporary_directory}"
+                "extracted project output directory is not writable: "
+                f"{configuration.extracted_projects}"
             )
 
 
@@ -196,7 +194,8 @@ def cue_file_path(cue: Path, value: str) -> Path:
 
 def parse_cue(cue: Path) -> tuple[list[Path], list[str]]:
     active_file: str | None = None
-    images: list[Path] = []
+    selected: list[tuple[Path, int]] = []
+    track_counts: dict[Path, int] = {}
     errors: list[str] = []
 
     try:
@@ -221,18 +220,38 @@ def parse_cue(cue: Path) -> tuple[list[Path], list[str]]:
 
         match = TRACK_PATTERN.fullmatch(line)
         if match is None:
+            if active_file is not None:
+                image = cue_file_path(cue, active_file)
+                track_counts[image] = track_counts.get(image, 0) + 1
             errors.append(f"malformed TRACK declaration at line {line_number}")
             continue
         mode = match.group("mode")
+        image = cue_file_path(cue, active_file) if active_file is not None else None
+        if image is not None:
+            track_counts[image] = track_counts.get(image, 0) + 1
         if mode.upper() == "AUDIO":
             continue
         if not mode.upper().endswith("/2352"):
             errors.append(f"unsupported data track mode {mode} at line {line_number}")
-        elif active_file is None:
+        elif image is None:
             errors.append(f"data track at line {line_number} has no preceding FILE")
         else:
-            images.append(cue_file_path(cue, active_file))
-        break
+            selected.append((image, line_number))
+
+    images: list[Path] = []
+    reported_shared: set[Path] = set()
+    for image, line_number in selected:
+        count = track_counts[image]
+        if count > 1:
+            if image not in reported_shared:
+                reported_shared.add(image)
+                errors.append(
+                    f"data track at line {line_number} shares FILE {image.name!r} "
+                    f"with {count} TRACK declarations; shared multi-track BIN "
+                    "files are unsupported"
+                )
+            continue
+        images.append(image)
 
     return images, errors
 
@@ -275,47 +294,70 @@ def discover_images(roms: Path) -> Discovery:
                 continue
             if image not in seen:
                 seen.add(image)
-                items.append(CatalogItem(image=image, cue=cue))
+                items.append(CatalogItem(image=image))
 
     return Discovery(items=tuple(items), errors=tuple(errors))
 
 
-def associate_cues(images: Sequence[Path], roms: Path) -> tuple[CatalogItem, ...]:
-    cues_by_image: dict[Path, Path] = {}
-    wanted = set(images)
-    for cue in discover_cues(roms):
-        cue_images, _ = parse_cue(cue)
-        for image in cue_images:
-            if image in wanted and image not in cues_by_image:
-                cues_by_image[image] = cue
-    return tuple(CatalogItem(image=image, cue=cues_by_image.get(image)) for image in images)
+def track_name(image: Path) -> str:
+    name = image.stem
+    if not name or name in {".", ".."}:
+        raise CatalogError(f"data track path has no usable filename stem: {image}")
+    return name
 
 
-def manifest_destination(directory: Path, cue: Path) -> Path:
-    return directory / cue.with_suffix(".yaml").name
+def manifest_destination(directory: Path, image: Path) -> Path:
+    return directory / f"{track_name(image)}.yaml"
 
 
-def manifest_preflight_failures(
-    items: Sequence[CatalogItem], directory: Path
+def project_destination(directory: Path, image: Path) -> Path:
+    return directory / track_name(image)
+
+
+def destination_preflight_failures(
+    items: Sequence[CatalogItem],
+    directory: Path,
+    label: str,
+    destination: Callable[[Path, Path], Path],
 ) -> dict[Path, str]:
     targets: dict[Path, list[CatalogItem]] = {}
     failures: dict[Path, str] = {}
     for item in items:
-        if item.cue is None:
-            failures[item.image] = (
-                "manifest: no top-level CUE sheet selects this data track"
-            )
-            continue
-        target = manifest_destination(directory, item.cue)
+        target = destination(directory, item.image)
         targets.setdefault(target, []).append(item)
 
     for target, matching_items in targets.items():
         if len(matching_items) < 2:
             continue
-        cue_names = ", ".join(item.cue.name for item in matching_items if item.cue)
-        reason = f"manifest: destination conflict for {target.name}: {cue_names}"
+        image_names = ", ".join(item.image.name for item in matching_items)
+        reason = f"{label}: destination conflict for {target.name}: {image_names}"
         for item in matching_items:
             failures[item.image] = reason
+    return failures
+
+
+def output_preflight_failures(
+    items: Sequence[CatalogItem], configuration: Configuration
+) -> dict[Path, str]:
+    failures: dict[Path, str] = {}
+    if configuration.manifests is not None:
+        failures.update(
+            destination_preflight_failures(
+                items,
+                configuration.manifests,
+                "manifest",
+                manifest_destination,
+            )
+        )
+    if configuration.extracted_projects is not None:
+        failures.update(
+            destination_preflight_failures(
+                items,
+                configuration.extracted_projects,
+                "extracted project",
+                project_destination,
+            )
+        )
     return failures
 
 
@@ -403,7 +445,7 @@ def run_round_trip(
     gcdgold: Path,
     image: Path,
     saved_manifest: Path | None = None,
-    temporary_directory: Path | None = None,
+    extracted_projects: Path | None = None,
 ) -> AttemptOutcome:
     if not image.exists():
         return AttemptOutcome(
@@ -416,57 +458,97 @@ def run_round_trip(
             reason=f"input: data track path is not a regular file: {image}",
         )
 
-    with tempfile.TemporaryDirectory(
-        prefix="gcdgold-catalog-", dir=temporary_directory
-    ) as temporary:
+    with tempfile.TemporaryDirectory(prefix="gcdgold-catalog-") as temporary:
         project = Path(temporary)
         manifest = project / "disc.yaml"
-        data_dir = project / "assets"
         rebuilt = project / "rebuilt.bin"
 
-        extraction = run_command(
-            [
-                str(gcdgold),
-                "extract",
-                "--image",
-                str(image),
-                "--manifest",
-                str(manifest),
-                "--data-dir",
-                str(data_dir),
-            ]
-        )
-        if extraction.returncode != 0:
-            return command_failure("extract", extraction)
+        if extracted_projects is None:
+            data_dir = project / "assets"
+            retained_manifest = None
+            retained_project = None
+            staging_project = None
+        else:
+            data_dir = Path(
+                tempfile.mkdtemp(prefix=".gcdgold-project-", dir=extracted_projects)
+            )
+            retained_project = project_destination(extracted_projects, image)
+            retained_manifest = retained_project / f"{track_name(image)}.yaml"
+            staging_project = data_dir
 
-        if saved_manifest is not None:
-            try:
-                install_manifest(manifest, saved_manifest)
-            except (CatalogError, OSError) as error:
-                return AttemptOutcome(
-                    passed=False,
-                    reason=(
-                        "manifest: I/O error: "
-                        f"{normalize_message(str(error))}"
-                    ),
-                )
+        try:
+            extraction = run_command(
+                [
+                    str(gcdgold),
+                    "extract",
+                    "--image",
+                    str(image),
+                    "--manifest",
+                    str(manifest),
+                    "--data-dir",
+                    str(data_dir),
+                ]
+            )
+            if extraction.returncode != 0:
+                return command_failure("extract", extraction)
 
-        building = run_command(
-            [
-                str(gcdgold),
-                "build",
-                "--manifest",
-                str(manifest),
-                "--image",
-                str(rebuilt),
-                "--data-dir",
-                str(data_dir),
-            ]
-        )
-        if building.returncode != 0:
-            return command_failure("build", building)
+            if retained_project is not None and retained_manifest is not None:
+                staged_manifest = data_dir / retained_manifest.name
+                if staged_manifest.exists() or staged_manifest.is_symlink():
+                    return AttemptOutcome(
+                        passed=False,
+                        reason=(
+                            "extracted project: manifest path collides with an "
+                            f"extracted asset: {retained_manifest.name}"
+                        ),
+                    )
+                try:
+                    copy_and_fsync(manifest, staged_manifest)
+                    fsync_directory(data_dir)
+                    install_project(data_dir, retained_project)
+                except (CatalogError, OSError) as error:
+                    return AttemptOutcome(
+                        passed=False,
+                        reason=(
+                            "extracted project: I/O error: "
+                            f"{normalize_message(str(error))}"
+                        ),
+                    )
+                data_dir = retained_project
+                manifest = retained_manifest
+                staging_project = None
 
-        return AttemptOutcome(passed=True, reason="")
+            if saved_manifest is not None:
+                try:
+                    install_manifest(manifest, saved_manifest)
+                except (CatalogError, OSError) as error:
+                    return AttemptOutcome(
+                        passed=False,
+                        reason=(
+                            "manifest: I/O error: "
+                            f"{normalize_message(str(error))}"
+                        ),
+                    )
+
+            building = run_command(
+                [
+                    str(gcdgold),
+                    "build",
+                    "--manifest",
+                    str(manifest),
+                    "--image",
+                    str(rebuilt),
+                    "--data-dir",
+                    str(data_dir),
+                ]
+            )
+            if building.returncode != 0:
+                return command_failure("build", building)
+
+            return AttemptOutcome(passed=True, reason="")
+        finally:
+            if staging_project is not None:
+                shutil.rmtree(staging_project, ignore_errors=True)
 
 
 def fsync_file(output: TextIO) -> None:
@@ -493,6 +575,35 @@ def install_manifest(source: Path, destination: Path) -> None:
 
     copy_and_fsync(source, temporary)
     os.replace(temporary, destination)
+    fsync_directory(destination.parent)
+
+
+def install_project(source: Path, destination: Path) -> None:
+    backup = appended_path(destination, ".bak.tmp")
+    for label, path in (("project", destination), ("project backup", backup)):
+        if path.is_symlink():
+            raise CatalogError(f"{label} path must not be a symlink: {path}")
+    if destination.exists() and not destination.is_dir():
+        raise CatalogError(f"project path is not a directory: {destination}")
+    if backup.exists():
+        raise CatalogError(f"project backup path already exists: {backup}")
+
+    if not destination.exists():
+        os.replace(source, destination)
+        fsync_directory(destination.parent)
+        return
+
+    os.replace(destination, backup)
+    fsync_directory(destination.parent)
+    try:
+        os.replace(source, destination)
+    except BaseException:
+        os.replace(backup, destination)
+        fsync_directory(destination.parent)
+        raise
+
+    fsync_directory(destination.parent)
+    shutil.rmtree(backup)
     fsync_directory(destination.parent)
 
 
@@ -527,21 +638,14 @@ def pass_rate(passed: int, failed: int) -> float:
 def process_catalog(configuration: Configuration) -> int:
     if configuration.output.exists():
         images = load_retry_images(configuration.output, configuration.roms)
-        if configuration.manifests is None:
-            items = tuple(CatalogItem(image=image, cue=None) for image in images)
-        else:
-            items = associate_cues(images, configuration.roms)
+        items = tuple(CatalogItem(image=image) for image in images)
         discovery_errors: tuple[str, ...] = ()
     else:
         discovery = discover_images(configuration.roms)
         items = discovery.items
         discovery_errors = discovery.errors
 
-    manifest_failures = (
-        manifest_preflight_failures(items, configuration.manifests)
-        if configuration.manifests is not None
-        else {}
-    )
+    preflight_failures = output_preflight_failures(items, configuration)
 
     for message in discovery_errors:
         print(f"discovery error: {message}", file=sys.stderr, flush=True)
@@ -556,20 +660,20 @@ def process_catalog(configuration: Configuration) -> int:
             image = item.image
             data_path = relative_image_path(image, configuration.roms)
             started = time.monotonic()
-            preflight_failure = manifest_failures.get(image)
+            preflight_failure = preflight_failures.get(image)
             if preflight_failure is not None:
                 outcome = AttemptOutcome(passed=False, reason=preflight_failure)
             else:
                 saved_manifest = (
-                    manifest_destination(configuration.manifests, item.cue)
-                    if configuration.manifests is not None and item.cue is not None
+                    manifest_destination(configuration.manifests, image)
+                    if configuration.manifests is not None
                     else None
                 )
                 outcome = run_round_trip(
                     configuration.gcdgold,
                     image,
                     saved_manifest,
-                    configuration.temporary_directory,
+                    configuration.extracted_projects,
                 )
             elapsed = time.monotonic() - started
 
