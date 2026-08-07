@@ -211,6 +211,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         directory_slack: None,
         allocation_padding_hex: None,
         directory_self_xa: None,
+        directory_parent_xa: None,
         sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, xa_system_use)?,
     };
@@ -238,21 +239,28 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         let (records, observation, directory_slack) = read_directory(blocks, extent, length)
             .with_context(|| format!("reading directory {directory_path} at LBA {extent}"))?;
         packing_observation.merge(observation);
-        entries
-            .iter_mut()
-            .find(|entry| entry.path == directory_path)
-            .context("directory entry is missing")?
-            .directory_slack = directory_slack;
+        let directory_index = entries
+            .iter()
+            .position(|entry| entry.path == directory_path)
+            .context("directory entry is missing")?;
+        entries[directory_index].directory_slack = directory_slack;
         ensure!(records.len() >= 2, "directory lacks dot records");
         let dot_xa = entry_xa(&records[0], true, xa_system_use)?;
-        let directory_entry = entries
-            .iter_mut()
-            .find(|entry| entry.path == directory_path)
-            .context("directory entry is missing")?;
-        let advertised_system_use = serialize_xa_system_use(directory_entry, true)?;
-        let dot_system_use = serialize_xa_system_use_parts(directory_path, dot_xa.as_ref(), true)?;
-        if advertised_system_use != dot_system_use {
-            directory_entry.directory_self_xa = Some(dot_xa.unwrap_or_default());
+        let parent_xa = entry_xa(&records[1], true, xa_system_use)?;
+        let expected_dot_system_use =
+            serialize_directory_record_system_use(&entries[directory_index], true, xa_system_use)?;
+        let parent_directory_path = parent_path(directory_path);
+        let parent_index = entries
+            .iter()
+            .position(|entry| entry.path == parent_directory_path)
+            .context("parent directory entry is missing")?;
+        let expected_parent_system_use =
+            serialize_directory_record_system_use(&entries[parent_index], true, xa_system_use)?;
+        if expected_dot_system_use != records[0].system_use {
+            entries[directory_index].directory_self_xa = Some(dot_xa.unwrap_or_default());
+        }
+        if expected_parent_system_use != records[1].system_use {
+            entries[directory_index].directory_parent_xa = Some(parent_xa.unwrap_or_default());
         }
         if directory_path != ROOT_PATH {
             let current_time = &entries
@@ -351,6 +359,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                     .then(|| file_allocation_padding_hex(blocks, &record))
                     .flatten(),
                 directory_self_xa: None,
+                directory_parent_xa: None,
                 sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                 xa,
             };
@@ -848,6 +857,7 @@ fn parse_joliet(
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
         xa: entry_xa(dot, true, xa_system_use)?,
         directory_self_xa: None,
+        directory_parent_xa: None,
     };
     let primary_sources = primary_files.iter().fold(
         HashMap::<(u32, u32), Vec<&str>>::new(),
@@ -881,15 +891,39 @@ fn parse_joliet(
         } else {
             parent.as_str()
         };
-        let directory_entry = entries
-            .iter_mut()
-            .find(|entry| entry.path == directory_path)
+        let directory_index = entries
+            .iter()
+            .position(|entry| entry.path == directory_path)
             .context("Joliet directory entry is missing")?;
-        let advertised_system_use =
-            serialize_xa_system_use_parts(directory_path, directory_entry.xa.as_ref(), true)?;
-        let dot_system_use = serialize_xa_system_use_parts(directory_path, dot_xa.as_ref(), true)?;
-        if advertised_system_use != dot_system_use {
-            directory_entry.directory_self_xa = Some(dot_xa.unwrap_or_default());
+        let parent_xa = entry_xa(&records[1], true, xa_system_use)?;
+        let expected_dot_system_use = if xa_system_use {
+            serialize_xa_system_use_parts(
+                directory_path,
+                entries[directory_index].xa.as_ref(),
+                true,
+            )?
+        } else {
+            Vec::new()
+        };
+        let parent_directory_path = parent_path(directory_path);
+        let parent_index = entries
+            .iter()
+            .position(|entry| entry.path == parent_directory_path)
+            .context("Joliet parent directory entry is missing")?;
+        let expected_parent_system_use = if xa_system_use {
+            serialize_xa_system_use_parts(
+                &parent_directory_path,
+                entries[parent_index].xa.as_ref(),
+                true,
+            )?
+        } else {
+            Vec::new()
+        };
+        if expected_dot_system_use != records[0].system_use {
+            entries[directory_index].directory_self_xa = Some(dot_xa.unwrap_or_default());
+        }
+        if expected_parent_system_use != records[1].system_use {
+            entries[directory_index].directory_parent_xa = Some(parent_xa.unwrap_or_default());
         }
         for record in &records {
             let directory = record.flags & DIRECTORY_FLAG != 0;
@@ -932,6 +966,7 @@ fn parse_joliet(
                 associated: record.flags & ASSOCIATED_FLAG != 0,
                 xa: entry_xa(&record, is_dir, xa_system_use)?,
                 directory_self_xa: None,
+                directory_parent_xa: None,
             });
             if is_dir {
                 directories.push(ParsedDirectory {
@@ -2694,18 +2729,29 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 entry.path
             );
             ensure!(
-                entry.directory_self_xa.is_none()
+                [
+                    entry.directory_self_xa.as_ref(),
+                    entry.directory_parent_xa.as_ref(),
+                ]
+                .into_iter()
+                .all(|xa| xa.is_none())
                     || (entry.source.is_none() && volume.xa_system_use),
-                "Joliet directory_self_xa is supported only for directories: {}",
+                "Joliet directory XA overrides are supported only for directories: {}",
                 entry.path
             );
             ensure!(
-                entry.directory_self_xa.as_ref().is_none_or(|xa| {
+                [
+                    entry.directory_self_xa.as_ref(),
+                    entry.directory_parent_xa.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|xa| {
                     xa.logical_length.is_none()
                         && xa.length_encoding.is_default()
                         && xa.framing_subheader.is_none()
                 }),
-                "Joliet directory_self_xa supports only directory-record XA fields: {}",
+                "Joliet directory XA overrides support only directory-record XA fields: {}",
                 entry.path
             );
         }
@@ -2802,17 +2848,24 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         );
         ensure!(
             is_file
-                || entry.directory_self_xa.as_ref().is_none_or(|xa| {
+                || [
+                    entry.directory_self_xa.as_ref(),
+                    entry.directory_parent_xa.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|xa| {
                     xa.logical_length.is_none()
                         && xa.length_encoding.is_default()
                         && xa.framing_subheader.is_none()
                 }),
-            "directory_self_xa supports only directory-record XA fields: {}",
+            "directory XA overrides support only directory-record XA fields: {}",
             entry.path
         );
         ensure!(
-            entry.directory_self_xa.is_none() || (!is_file && iso.xa_system_use),
-            "directory_self_xa requires XA system use on a directory: {}",
+            (entry.directory_self_xa.is_none() && entry.directory_parent_xa.is_none())
+                || (!is_file && iso.xa_system_use),
+            "directory XA overrides require XA system use on a directory: {}",
             entry.path
         );
         serialize_directory_record_system_use(
@@ -3622,9 +3675,9 @@ fn serialize_directory(
     )?);
     let mut parent_metadata = (*parent_entry).clone();
     parent_metadata.xa = metadata
-        .directory_self_xa
+        .directory_parent_xa
         .clone()
-        .or_else(|| metadata.xa.clone());
+        .or_else(|| parent_entry.xa.clone());
     let mut parent_record = make_record_with_padding(
         &parent_metadata,
         parent.extent,
@@ -3740,9 +3793,9 @@ fn serialize_joliet_directory(
     )?);
     let mut parent_metadata = parent_entry.clone();
     parent_metadata.xa = metadata
-        .directory_self_xa
+        .directory_parent_xa
         .clone()
-        .or_else(|| metadata.xa.clone());
+        .or_else(|| parent_entry.xa.clone());
     let mut parent_record = make_joliet_record(
         &parent_metadata,
         parent.extent,
@@ -4344,6 +4397,7 @@ mod tests {
             directory_slack: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
+            directory_parent_xa: None,
             sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
             xa: None,
         }
@@ -4954,6 +5008,7 @@ mod tests {
                     associated: false,
                     xa: None,
                     directory_self_xa: None,
+                    directory_parent_xa: None,
                 },
                 crate::manifest::JolietEntry {
                     path: "file.bin".to_owned(),
@@ -4964,6 +5019,7 @@ mod tests {
                     associated: false,
                     xa: None,
                     directory_self_xa: None,
+                    directory_parent_xa: None,
                 },
             ],
         }];
@@ -5118,6 +5174,7 @@ mod tests {
                 associated: false,
                 xa: None,
                 directory_self_xa: None,
+                directory_parent_xa: None,
             },
         );
         volume.entries[2].path = "dir/file.bin".to_owned();
@@ -5942,14 +5999,20 @@ mod tests {
     }
 
     #[test]
-    fn directory_self_xa_can_differ_from_its_parent_record() {
+    fn directory_dot_and_parent_xa_can_differ_from_advertisement() {
+        let mut root = test_entry(ROOT_PATH);
+        root.xa = Some(EntryXa {
+            file_number: 0xfa,
+            ..EntryXa::default()
+        });
         let mut directory = test_entry("DIR");
         directory.xa = Some(EntryXa {
             file_number: 0xff,
             ..EntryXa::default()
         });
         directory.directory_self_xa = Some(EntryXa::default());
-        let iso = test_iso(vec![test_entry(ROOT_PATH), directory], vec![]);
+        directory.directory_parent_xa = Some(EntryXa::default());
+        let iso = test_iso(vec![root, directory], vec![]);
 
         let authored = layout(&iso, &HashMap::new()).unwrap();
         let parsed = parse(&authored.blocks).unwrap();
@@ -5965,9 +6028,46 @@ mod tests {
             0
         );
         assert_eq!(
+            parsed_directory
+                .directory_parent_xa
+                .as_ref()
+                .unwrap()
+                .file_number,
+            0
+        );
+        assert_eq!(
             layout(&parsed.manifest, &HashMap::new()).unwrap().blocks,
             authored.blocks
         );
+    }
+
+    #[test]
+    fn parent_record_uses_parent_directory_xa_by_default() {
+        let mut root = test_entry(ROOT_PATH);
+        root.xa = Some(EntryXa {
+            file_number: 1,
+            ..EntryXa::default()
+        });
+        let iso = test_iso(vec![root, test_entry("DIR")], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let root_record = parse_record(&authored.blocks[16][156..]).unwrap();
+        let (root_records, _, _) =
+            read_directory(&authored.blocks, root_record.extent, root_record.length).unwrap();
+        let directory_record = &root_records[2];
+        let (directory_records, _, _) = read_directory(
+            &authored.blocks,
+            directory_record.extent,
+            directory_record.length,
+        )
+        .unwrap();
+        let parent_xa = entry_xa(&directory_records[1], true, true).unwrap();
+
+        assert_eq!(parent_xa.map(|xa| xa.file_number), Some(1));
+        let parsed = parse(&authored.blocks).unwrap();
+        let parsed_directory = &parsed.manifest.entries[1];
+        assert!(parsed_directory.directory_self_xa.is_none());
+        assert!(parsed_directory.directory_parent_xa.is_none());
     }
 
     #[test]
@@ -6100,6 +6200,7 @@ mod tests {
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
+                    directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                 },
@@ -6140,6 +6241,7 @@ mod tests {
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
+                    directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                 },
@@ -6179,6 +6281,7 @@ mod tests {
                     directory_slack: None,
                     allocation_padding_hex: None,
                     directory_self_xa: None,
+                    directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
                 },

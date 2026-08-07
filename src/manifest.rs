@@ -15,8 +15,34 @@ pub(crate) const GCDGOLD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Manifest {
     pub gcdgold: GcdgoldMetadata,
     pub track: Track,
-    pub system_area: SystemArea,
-    pub iso9660: Iso9660,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_area: Option<SystemArea>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso9660: Option<Iso9660>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form1: Option<Form1Project>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Form1Project {
+    pub layout: Vec<Form1LayoutItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Form1LayoutItem {
+    Asset(Form1Asset),
+    Gap(FileGapItem),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Form1Asset {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
+    pub subheader: EntrySectorSubheader,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +498,8 @@ pub struct JolietEntry {
     pub xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_self_xa: Option<EntryXa>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_xa: Option<EntryXa>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -972,6 +1000,8 @@ pub struct Entry {
     pub allocation_padding_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_self_xa: Option<EntryXa>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]

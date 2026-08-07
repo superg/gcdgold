@@ -460,7 +460,7 @@ def run_round_trip(
 
     with tempfile.TemporaryDirectory(prefix="gcdgold-catalog-") as temporary:
         project = Path(temporary)
-        manifest = project / "disc.yaml"
+        manifest = project / f"{track_name(image)}.yaml"
         rebuilt = project / "rebuilt.bin"
 
         if extracted_projects is None:

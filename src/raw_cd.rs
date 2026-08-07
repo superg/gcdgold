@@ -237,13 +237,21 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         "raw image size is not a multiple of 2352 bytes"
     );
     ensure!(!bytes.is_empty(), "raw image is empty");
-    let first = &bytes[..RAW_SECTOR_SIZE];
+    let first_nonzero_sector = bytes
+        .chunks_exact(RAW_SECTOR_SIZE)
+        .position(|chunk| chunk.iter().any(|byte| *byte != 0))
+        .context("raw image contains only all-zero sectors")?;
+    let first_start = first_nonzero_sector * RAW_SECTOR_SIZE;
+    let first = &bytes[first_start..first_start + RAW_SECTOR_SIZE];
     let track_mode = first[15];
     ensure!(
         matches!(track_mode, 1 | 2),
-        "unsupported sector mode at sector 0"
+        "unsupported sector mode at sector {first_nonzero_sector}"
     );
-    let start_frame = msf_to_frame([first[12], first[13], first[14]])?;
+    let first_frame = msf_to_frame([first[12], first[13], first[14]])?;
+    let start_frame = first_frame
+        .checked_sub(u32::try_from(first_nonzero_sector)?)
+        .context("leading raw-zero sectors precede MSF 00:00:00")?;
     let last_nonzero_sector = bytes
         .chunks_exact(RAW_SECTOR_SIZE)
         .rposition(|chunk| chunk.iter().any(|byte| *byte != 0))
@@ -252,7 +260,14 @@ pub fn parse_image(bytes: &[u8]) -> Result<(u32, Vec<ParsedSector>)> {
         .par_chunks_exact(RAW_SECTOR_SIZE)
         .enumerate()
         .map(|(index, chunk)| {
-            classify_sector(chunk, index, track_mode, start_frame, last_nonzero_sector)
+            classify_sector(
+                chunk,
+                index,
+                track_mode,
+                start_frame,
+                first_nonzero_sector,
+                last_nonzero_sector,
+            )
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -290,12 +305,13 @@ fn classify_sector(
     index: usize,
     track_mode: u8,
     start_frame: u32,
+    first_nonzero_sector: usize,
     last_nonzero_sector: usize,
 ) -> Result<SectorClassification> {
     if chunk.iter().all(|byte| *byte == 0) {
         ensure!(
-            index > last_nonzero_sector,
-            "all-zero raw sectors are supported only as a terminal run"
+            index < first_nonzero_sector || index > last_nonzero_sector,
+            "all-zero raw sectors are supported only as boundary runs"
         );
         return Ok(SectorClassification {
             kind: Kind::RawZero,
@@ -908,6 +924,23 @@ mod tests {
     }
 
     #[test]
+    fn leading_all_zero_raw_run_backtracks_the_framed_start_msf() {
+        let mut raw = vec![0; 2 * RAW_SECTOR_SIZE];
+        raw.extend(
+            SectorWriter::new()
+                .form1(152, XaSubheader::with_submode(XaSubmode::DATA), &[7; 2048])
+                .unwrap(),
+        );
+
+        let (start_frame, parsed) = parse_image(&raw).unwrap();
+
+        assert_eq!(start_frame, 150);
+        assert_eq!(parsed[0].kind, Kind::RawZero);
+        assert_eq!(parsed[1].kind, Kind::RawZero);
+        assert_eq!(parsed[2].kind, Kind::Form1);
+    }
+
+    #[test]
     fn parallel_parse_preserves_order_and_reports_the_first_error() {
         let mut writer = SectorWriter::new();
         let mut raw = Vec::new();
@@ -949,7 +982,7 @@ mod tests {
         );
         assert_eq!(
             parse_image(&raw).unwrap_err().to_string(),
-            "all-zero raw sectors are supported only as a terminal run"
+            "all-zero raw sectors are supported only as boundary runs"
         );
     }
 
