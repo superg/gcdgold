@@ -1,5 +1,6 @@
 gcdgold = "../target/release/gcdgold"
 roms = "../data/roms"
-output = "../data/failures.csv"
+failures = "../data/failures.csv"
+passed = "../data/passed.txt"
 manifests = "../data/manifests"
 # extracted_projects = "../data/extracted-projects"

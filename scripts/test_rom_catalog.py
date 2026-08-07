@@ -7,7 +7,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -15,10 +15,11 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import BinaryIO, Callable, Sequence, TextIO
+from typing import BinaryIO, Sequence, TextIO
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().with_name("test_rom_catalog.toml")
+CONFIG_NAME = "test_rom_catalog.toml"
+SCRIPT_CONFIG = Path(__file__).resolve().with_name(CONFIG_NAME)
 FILE_PATTERN = re.compile(
     r'^\s*FILE\s+(?:"(?P<quoted>[^"]+)"|(?P<plain>[^"\s]\S*))\s+\S+(?:\s+.*)?$',
     re.IGNORECASE,
@@ -27,14 +28,15 @@ TRACK_PATTERN = re.compile(r"^\s*TRACK\s+\d+\s+(?P<mode>\S+)\s*$", re.IGNORECASE
 
 
 class CatalogError(ValueError):
-    """The catalog configuration or failure list is invalid."""
+    """The catalog configuration or passed list is invalid."""
 
 
 @dataclass(frozen=True)
 class Configuration:
     gcdgold: Path
     roms: Path
-    output: Path
+    failures: Path
+    passed: Path
     manifests: Path | None
     extracted_projects: Path | None
 
@@ -70,6 +72,13 @@ def resolve_configured_path(config_path: Path, value: str) -> Path:
     return path.resolve()
 
 
+def default_configuration_path() -> Path:
+    cwd_config = Path.cwd() / CONFIG_NAME
+    if cwd_config.exists():
+        return cwd_config
+    return SCRIPT_CONFIG
+
+
 def load_configuration(path: Path) -> Configuration:
     config_path = path.expanduser().resolve()
     if not config_path.exists():
@@ -83,7 +92,7 @@ def load_configuration(path: Path) -> Configuration:
     except tomllib.TOMLDecodeError as error:
         raise CatalogError(f"invalid TOML in {config_path}: {error}") from error
 
-    required = {"gcdgold", "roms", "output"}
+    required = {"failures", "gcdgold", "passed", "roms"}
     optional = {"extracted_projects", "manifests"}
     expected = required | optional
     actual = set(document)
@@ -107,7 +116,8 @@ def load_configuration(path: Path) -> Configuration:
     return Configuration(
         gcdgold=values["gcdgold"],
         roms=values["roms"],
-        output=values["output"],
+        failures=values["failures"],
+        passed=values["passed"],
         manifests=values.get("manifests"),
         extracted_projects=values.get("extracted_projects"),
     )
@@ -131,26 +141,16 @@ def validate_configuration(configuration: Configuration) -> None:
     if not os.access(configuration.gcdgold, os.X_OK):
         raise CatalogError(f"gcdgold path is not executable: {configuration.gcdgold}")
 
-    configuration.output.parent.mkdir(parents=True, exist_ok=True)
-    if configuration.output.is_symlink():
-        raise CatalogError(f"output path must not be a symlink: {configuration.output}")
-    if configuration.output.exists() and not configuration.output.is_file():
+    if configuration.failures == configuration.passed:
+        raise CatalogError("failures and passed paths must be distinct")
+    configuration.failures.parent.mkdir(parents=True, exist_ok=True)
+    configuration.passed.parent.mkdir(parents=True, exist_ok=True)
+    if configuration.passed.is_symlink():
+        raise CatalogError(f"passed path must not be a symlink: {configuration.passed}")
+    if configuration.passed.exists() and not configuration.passed.is_file():
         raise CatalogError(
-            f"output path is not a regular file: {configuration.output}"
+            f"passed path is not a regular file: {configuration.passed}"
         )
-
-    for path in (
-        appended_path(configuration.output, ".tmp"),
-        appended_path(configuration.output, ".bak.tmp"),
-    ):
-        if path.is_symlink():
-            raise CatalogError(f"staging path must not be a symlink: {path}")
-        if path.exists() and not path.is_file():
-            raise CatalogError(f"staging path is not a regular file: {path}")
-
-    backup = appended_path(configuration.output, ".bak")
-    if backup.exists() and backup.is_dir():
-        raise CatalogError(f"backup path is a directory: {backup}")
 
     if configuration.manifests is not None:
         if configuration.manifests.exists() and not configuration.manifests.is_dir():
@@ -314,96 +314,48 @@ def project_destination(directory: Path, image: Path) -> Path:
     return directory / track_name(image)
 
 
-def destination_preflight_failures(
-    items: Sequence[CatalogItem],
-    directory: Path,
-    label: str,
-    destination: Callable[[Path, Path], Path],
-) -> dict[Path, str]:
-    targets: dict[Path, list[CatalogItem]] = {}
-    failures: dict[Path, str] = {}
-    for item in items:
-        target = destination(directory, item.image)
-        targets.setdefault(target, []).append(item)
+def load_passed_images(passed: Path, roms: Path) -> set[Path]:
+    if not passed.exists():
+        return set()
 
-    for target, matching_items in targets.items():
-        if len(matching_items) < 2:
-            continue
-        image_names = ", ".join(item.image.name for item in matching_items)
-        reason = f"{label}: destination conflict for {target.name}: {image_names}"
-        for item in matching_items:
-            failures[item.image] = reason
-    return failures
-
-
-def output_preflight_failures(
-    items: Sequence[CatalogItem], configuration: Configuration
-) -> dict[Path, str]:
-    failures: dict[Path, str] = {}
-    if configuration.manifests is not None:
-        failures.update(
-            destination_preflight_failures(
-                items,
-                configuration.manifests,
-                "manifest",
-                manifest_destination,
-            )
-        )
-    if configuration.extracted_projects is not None:
-        failures.update(
-            destination_preflight_failures(
-                items,
-                configuration.extracted_projects,
-                "extracted project",
-                project_destination,
-            )
-        )
-    return failures
-
-
-def load_retry_images(output: Path, roms: Path) -> tuple[Path, ...]:
-    images: list[Path] = []
     seen: set[Path] = set()
-
     try:
         source: TextIO
-        with output.open("r", encoding="utf-8", newline="") as source:
-            reader = csv.reader(source)
-            for row in reader:
-                if len(row) != 2:
-                    raise CatalogError(
-                        f"invalid failure CSV record at line {reader.line_num}: "
-                        "expected exactly two fields"
-                    )
-                path_text, reason = row
+        with passed.open("r", encoding="utf-8", newline="") as source:
+            for line_number, line in enumerate(source, start=1):
+                path_text = line.rstrip("\r\n")
                 if not path_text:
                     raise CatalogError(
-                        f"invalid failure CSV record at line {reader.line_num}: "
+                        f"invalid passed record at line {line_number}: "
                         "data track path is empty"
                     )
-                if any(character in path_text for character in "\r\n") or any(
-                    character in reason for character in "\r\n"
-                ):
+                if "\r" in path_text or "\n" in path_text:
                     raise CatalogError(
-                        f"invalid failure CSV record at line {reader.line_num}: "
-                        "fields must remain on one line"
+                        f"invalid passed record at line {line_number}: "
+                        "path must remain on one line"
                     )
-
-                relative = Path(path_text)
+                relative = PurePosixPath(path_text)
                 if relative.is_absolute() or ".." in relative.parts:
                     raise CatalogError(
-                        f"invalid failure CSV path at line {reader.line_num}: "
-                        f"path must remain relative to the ROM directory: {path_text}"
+                        f"invalid passed path at line {line_number}: path must remain "
+                        f"relative to the ROM directory: {path_text}"
                     )
-                image = (roms / relative).resolve()
+                if relative.as_posix() != path_text:
+                    raise CatalogError(
+                        f"invalid passed path at line {line_number}: path must use "
+                        f"canonical POSIX form: {path_text}"
+                    )
+                image = roms.joinpath(*relative.parts).resolve()
                 relative_image_path(image, roms)
-                if image not in seen:
-                    seen.add(image)
-                    images.append(image)
-    except csv.Error as error:
-        raise CatalogError(f"invalid failure CSV {output}: {error}") from error
+                if image in seen:
+                    raise CatalogError(
+                        f"duplicate passed path at line {line_number}: {path_text}"
+                    )
+                seen.add(image)
+    except UnicodeDecodeError as error:
+        raise CatalogError(f"passed file is not valid UTF-8: {passed}") from error
 
-    return tuple(images)
+    return seen
 
 
 def run_command(arguments: Sequence[str]) -> CommandExecution:
@@ -615,17 +567,23 @@ def fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def install_results(output: Path, temporary_output: Path) -> None:
-    backup = appended_path(output, ".bak")
-    temporary_backup = appended_path(output, ".bak.tmp")
+def append_passed_result(passed: Path, data_path: str) -> None:
+    separator = ""
+    if passed.exists() and passed.stat().st_size > 0:
+        with passed.open("rb") as source:
+            source.seek(-1, os.SEEK_END)
+            if source.read(1) != b"\n":
+                separator = "\n"
+    with passed.open("a", encoding="utf-8", newline="") as output:
+        output.write(f"{separator}{data_path}\n")
+        fsync_file(output)
 
-    if output.exists():
-        copy_and_fsync(output, temporary_backup)
-        os.replace(temporary_backup, backup)
-        fsync_directory(output.parent)
 
-    os.replace(temporary_output, output)
-    fsync_directory(output.parent)
+def append_failure_result(failures: Path, data_path: str, reason: str) -> None:
+    with failures.open("a", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+        writer.writerow([data_path, reason])
+        fsync_file(output)
 
 
 def pass_rate(passed: int, failed: int) -> float:
@@ -636,76 +594,61 @@ def pass_rate(passed: int, failed: int) -> float:
 
 
 def process_catalog(configuration: Configuration) -> int:
-    if configuration.output.exists():
-        images = load_retry_images(configuration.output, configuration.roms)
-        items = tuple(CatalogItem(image=image) for image in images)
-        discovery_errors: tuple[str, ...] = ()
-    else:
-        discovery = discover_images(configuration.roms)
-        items = discovery.items
-        discovery_errors = discovery.errors
-
-    preflight_failures = output_preflight_failures(items, configuration)
+    passed_images = load_passed_images(configuration.passed, configuration.roms)
+    discovery = discover_images(configuration.roms)
+    items = tuple(item for item in discovery.items if item.image not in passed_images)
+    discovery_errors = discovery.errors
+    skipped = len(discovery.items) - len(items)
 
     for message in discovery_errors:
         print(f"discovery error: {message}", file=sys.stderr, flush=True)
 
-    temporary_output = appended_path(configuration.output, ".tmp")
     passed = 0
     failed = 0
+    for position, item in enumerate(items, start=1):
+        image = item.image
+        data_path = relative_image_path(image, configuration.roms)
+        started = time.monotonic()
+        saved_manifest = (
+            manifest_destination(configuration.manifests, image)
+            if configuration.manifests is not None
+            else None
+        )
+        outcome = run_round_trip(
+            configuration.gcdgold,
+            image,
+            saved_manifest,
+            configuration.extracted_projects,
+        )
+        elapsed = time.monotonic() - started
 
-    with temporary_output.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
-        for position, item in enumerate(items, start=1):
-            image = item.image
-            data_path = relative_image_path(image, configuration.roms)
-            started = time.monotonic()
-            preflight_failure = preflight_failures.get(image)
-            if preflight_failure is not None:
-                outcome = AttemptOutcome(passed=False, reason=preflight_failure)
-            else:
-                saved_manifest = (
-                    manifest_destination(configuration.manifests, image)
-                    if configuration.manifests is not None
-                    else None
-                )
-                outcome = run_round_trip(
-                    configuration.gcdgold,
-                    image,
-                    saved_manifest,
-                    configuration.extracted_projects,
-                )
-            elapsed = time.monotonic() - started
-
-            if outcome.passed:
-                passed += 1
-                rate = pass_rate(passed, failed)
-                print(
-                    f"[{position}/{len(items)}, rate: {rate:.2f}%] "
-                    f"PASS {data_path} ({elapsed:.1f}s)",
-                    flush=True,
-                )
-                continue
-
-            failed += 1
+        if outcome.passed:
+            append_passed_result(configuration.passed, data_path)
+            passed += 1
             rate = pass_rate(passed, failed)
-            writer.writerow([data_path, outcome.reason])
-            fsync_file(output)
             print(
                 f"[{position}/{len(items)}, rate: {rate:.2f}%] "
-                f"FAIL {data_path}: "
-                f"{outcome.reason} ({elapsed:.1f}s)",
+                f"PASS {data_path} ({elapsed:.1f}s)",
                 flush=True,
             )
+            continue
 
-        fsync_file(output)
+        append_failure_result(configuration.failures, data_path, outcome.reason)
+        failed += 1
+        rate = pass_rate(passed, failed)
+        print(
+            f"[{position}/{len(items)}, rate: {rate:.2f}%] "
+            f"FAIL {data_path}: "
+            f"{outcome.reason} ({elapsed:.1f}s)",
+            flush=True,
+        )
 
-    install_results(configuration.output, temporary_output)
     rate = pass_rate(passed, failed)
     print(
         "summary: "
         f"passed={passed} failed={failed} rate={rate:.2f}% "
-        f"discovery_errors={len(discovery_errors)} total={len(items)}",
+        f"skipped={skipped} discovery_errors={len(discovery_errors)} "
+        f"total={len(items)}",
         flush=True,
     )
     return 1 if failed or discovery_errors else 0
@@ -718,8 +661,11 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
-        help=f"configuration file (default: {DEFAULT_CONFIG})",
+        default=default_configuration_path(),
+        help=(
+            f"configuration file (default: ./{CONFIG_NAME} when present, "
+            f"otherwise {SCRIPT_CONFIG})"
+        ),
     )
     return parser
 
