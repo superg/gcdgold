@@ -9,7 +9,7 @@ use crate::manifest::{
     JolietVolume, MetadataLayoutItem, MetadataPathTable, MetadataSubheader, MetadataVolume,
     PathTableCopies, PathTableOrder, PathTableSubheader, PrimaryVolume,
     PrimaryVolumeApplicationUse, PvdU16Encoding, RootDirectoryIdentifier,
-    VolumeTerminatorSubheader, XaAttributes, XaLengthEncoding,
+    VolumeTerminatorSubheader, XaAssets, XaAttributes, XaLengthEncoding,
 };
 use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader};
 
@@ -1963,19 +1963,17 @@ pub(crate) fn layout_with_metadata_gap_kind(
                     .checked_add(sectors)
                     .context("gap placement overflow")?;
             }
-            let length = *file_lengths.get(&assets.index.path).with_context(|| {
-                format!(
-                    "missing unreferenced XA extent data for {}",
-                    assets.index.path
-                )
-            })?;
+            let key = &assets.form1.path;
+            let length = *file_lengths
+                .get(key)
+                .with_context(|| format!("missing unreferenced XA extent data for {}", key))?;
             ensure!(
                 length > 0 && length.is_multiple_of(LOGICAL_BLOCK_SIZE as u64),
                 "unreferenced XA extent must contain whole sectors"
             );
             let sectors = u32::try_from(length / LOGICAL_BLOCK_SIZE as u64)?;
             xa_extents.push(XaExtentPlacement {
-                index: assets.index.path.clone(),
+                index: key.clone(),
                 start: next_extent,
                 sectors,
             });
@@ -2521,21 +2519,22 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 "indexed XA file {path} cannot declare an ordinary-file source or sha1"
             );
             if let Some(assets) = &file.xa_assets {
+                validate_xa_asset_schema(assets)?;
                 indexed_file_paths.insert(path);
-                for asset in [&assets.form1, &assets.form2, &assets.index]
+                for path in [&assets.form1.path, &assets.form2.path]
                     .into_iter()
-                    .chain(assets.gap_index.iter())
+                    .chain(assets.index.iter().map(|asset| &asset.path))
                 {
-                    ensure!(!asset.path.is_empty(), "XA asset path must not be empty");
+                    ensure!(!path.is_empty(), "XA asset path must not be empty");
                     ensure!(
-                        !paths.contains(asset.path.as_str()),
+                        !paths.contains(path.as_str()),
                         "XA asset path collides with ISO entry {}",
-                        asset.path
+                        path
                     );
                     ensure!(
-                        xa_extent_asset_paths.insert(asset.path.as_str()),
+                        xa_extent_asset_paths.insert(path.as_str()),
                         "duplicate XA asset path {}",
-                        asset.path
+                        path
                     );
                 }
             }
@@ -2567,23 +2566,24 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             continue;
         }
         if let Some(assets) = item.as_xa_extent() {
-            for asset in [&assets.form1, &assets.form2, &assets.index]
+            validate_xa_asset_schema(assets)?;
+            for path in [&assets.form1.path, &assets.form2.path]
                 .into_iter()
-                .chain(assets.gap_index.iter())
+                .chain(assets.index.iter().map(|asset| &asset.path))
             {
                 ensure!(
-                    !asset.path.is_empty(),
+                    !path.is_empty(),
                     "unreferenced XA asset path must not be empty"
                 );
                 ensure!(
-                    !paths.contains(asset.path.as_str()),
+                    !paths.contains(path.as_str()),
                     "unreferenced XA asset path collides with ISO entry {}",
-                    asset.path
+                    path
                 );
                 ensure!(
-                    xa_extent_asset_paths.insert(asset.path.as_str()),
+                    xa_extent_asset_paths.insert(path.as_str()),
                     "duplicate unreferenced XA asset path {}",
-                    asset.path
+                    path
                 );
             }
             previous_gap = None;
@@ -2954,6 +2954,31 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         }
     }
     Ok(file_paths)
+}
+
+fn validate_xa_asset_schema(assets: &XaAssets) -> Result<()> {
+    for (asset, payload_suffix, stored_suffix, label) in [
+        (&assets.form1, ".F1", ".F1S", "Form 1"),
+        (&assets.form2, ".F2", ".F2S", "Form 2"),
+    ] {
+        let expected = if asset.framing.is_some() {
+            payload_suffix
+        } else {
+            stored_suffix
+        };
+        ensure!(
+            asset.path.ends_with(expected),
+            "{label} asset must use {expected} for its framing representation"
+        );
+    }
+    ensure!(
+        assets.index.is_some() ^ assets.interleave.is_some(),
+        "XA assets require exactly one of index or interleave"
+    );
+    if let Some(index) = &assets.index {
+        ensure!(index.path.ends_with(".I"), "explicit XA index must use .I");
+    }
+    Ok(())
 }
 
 fn validate_path(path: &str, is_file: bool) -> Result<()> {
@@ -4356,7 +4381,7 @@ fn format_volume_time(time: VolumeTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{HostAsset, XaAssets};
+    use crate::manifest::{HostAsset, XaAssets, XaFormAsset};
 
     fn asset(path: &str) -> HostAsset {
         HostAsset {
@@ -4367,10 +4392,19 @@ mod tests {
 
     fn xa_assets(form1: &str, form2: &str, index: &str) -> XaAssets {
         XaAssets {
-            form1: asset(form1),
-            form2: asset(form2),
-            index: asset(index),
-            gap_index: None,
+            form1: XaFormAsset {
+                path: form1.to_owned(),
+                sha1: None,
+                framing: None,
+            },
+            form2: XaFormAsset {
+                path: form2.to_owned(),
+                sha1: None,
+                framing: None,
+            },
+            index: Some(asset(index)),
+            interleave: None,
+            gap_overrides: Vec::new(),
         }
     }
 
@@ -5722,7 +5756,7 @@ mod tests {
         set_indexed_assets(
             &mut iso,
             "MOVIE.STR",
-            xa_assets("MOVIE.STR.XA1", "MOVIE.STR.XA2", "MOVIE.STR.XAI"),
+            xa_assets("MOVIE.STR.F1S", "MOVIE.STR.F2S", "MOVIE.STR.I"),
         );
         let lengths = HashMap::from([("MOVIE.STR".to_owned(), 2 * LOGICAL_BLOCK_SIZE as u64)]);
 
@@ -5789,16 +5823,16 @@ mod tests {
             vec!["A.BIN", "B.BIN"],
         );
         let assets = xa_assets(
-            "disc.unreferenced.000.XA1",
-            "disc.unreferenced.000.XA2",
-            "disc.unreferenced.000.XAI",
+            "disc.unreferenced.000.F1S",
+            "disc.unreferenced.000.F2S",
+            "disc.unreferenced.000.I",
         );
         iso.layout
             .insert(1, FileLayoutItem::xa_extent(assets.clone()));
         let lengths = HashMap::from([
             ("A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
             ("B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
-            (assets.index.path.clone(), 2 * LOGICAL_BLOCK_SIZE as u64),
+            (assets.form1.path.clone(), 2 * LOGICAL_BLOCK_SIZE as u64),
         ]);
 
         let authored = layout(&iso, &lengths).unwrap();
@@ -5812,7 +5846,7 @@ mod tests {
             vec![("A.BIN", 23), ("B.BIN", 26)]
         );
         assert_eq!(authored.xa_extents.len(), 1);
-        assert_eq!(authored.xa_extents[0].index, assets.index.path);
+        assert_eq!(authored.xa_extents[0].index, assets.form1.path);
         assert_eq!(authored.xa_extents[0].start, 24);
         assert_eq!(authored.xa_extents[0].sectors, 2);
     }
@@ -5993,7 +6027,7 @@ mod tests {
         set_indexed_assets(
             &mut iso,
             "MOVIE.STR",
-            xa_assets("MOVIE.STR.XA1", "MOVIE.STR.XA2", "MOVIE.STR.XAI"),
+            xa_assets("MOVIE.STR.F1S", "MOVIE.STR.F2S", "MOVIE.STR.I"),
         );
         validate(&iso).unwrap();
     }
@@ -6386,11 +6420,11 @@ mod tests {
             "fixed XA reference is not backed by a physical XA extent: FIRST.XA"
         );
         iso.layout.push(FileLayoutItem::xa_extent(xa_assets(
-            "stream.XA1",
-            "stream.XA2",
-            "stream.XAI",
+            "stream.F1S",
+            "stream.F2S",
+            "stream.I",
         )));
-        let lengths = HashMap::from([(String::from("stream.XAI"), 6144_u64)]);
+        let lengths = HashMap::from([(String::from("stream.F1S"), 6144_u64)]);
 
         let authored = layout(&iso, &lengths).unwrap();
 

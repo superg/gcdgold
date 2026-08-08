@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::raw_cd::XaSubheader;
+use crate::raw_cd::{XaSubheader, XaSubmode};
 
 pub const SYSTEM_AREA_SECTORS: usize = 16;
 pub const DEFAULT_XA_PERMISSIONS: u16 = 0x0555;
@@ -411,6 +411,14 @@ const fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+const fn default_one_u32() -> u32 {
+    1
+}
+
+const fn is_one_u32(value: &u32) -> bool {
+    *value == 1
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectoryRecordPacking {
@@ -706,12 +714,226 @@ pub struct HostAsset {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct XaAssets {
-    pub form1: HostAsset,
-    pub form2: HostAsset,
-    pub index: HostAsset,
+pub struct XaFormAsset {
+    pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap_index: Option<HostAsset>,
+    pub sha1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing: Option<XaFraming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum XaFraming {
+    Named(XaFramingPolicy),
+    Detailed(XaFramingSettings),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XaFramingPolicy {
+    Channel,
+    ChannelOrGeneric,
+    Phase,
+    Runs,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct XaAssetSubheader {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub file: u8,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub channel: u8,
+    #[serde(skip_serializing_if = "XaSubmode::is_empty")]
+    pub submode: XaSubmode,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub coding_info: u8,
+}
+
+impl From<XaSubheader> for XaAssetSubheader {
+    fn from(value: XaSubheader) -> Self {
+        Self {
+            file: value.file_number,
+            channel: value.channel,
+            submode: value.submode,
+            coding_info: value.coding_info,
+        }
+    }
+}
+
+impl From<XaAssetSubheader> for XaSubheader {
+    fn from(value: XaAssetSubheader) -> Self {
+        Self {
+            file_number: value.file,
+            channel: value.channel,
+            submode: value.submode,
+            coding_info: value.coding_info,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaFramingSettings {
+    pub policy: XaFramingPolicy,
+    #[serde(default, skip_serializing_if = "XaEofPolicy::is_default")]
+    pub eof: XaEofPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<XaAssetSubheader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<XaFramingTail>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<XaPhaseFraming>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<XaStateFraming>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<XaFramingRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<XaFramingOverride>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XaEofPolicy {
+    #[default]
+    None,
+    FinalRecord,
+    ChannelSegmentEnd,
+}
+
+impl XaEofPolicy {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaFramingTail {
+    pub sectors: u32,
+    pub subheader: XaAssetSubheader,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaPhaseFraming {
+    pub phase: u32,
+    pub subheader: XaAssetSubheader,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XaChannelState {
+    UnusedFirst,
+    Unused,
+    BeforeStart,
+    Active,
+    FirstAfterEnd,
+    AfterEnd,
+    BetweenSegments,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaStateFraming {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<u32>,
+    pub state: XaChannelState,
+    pub subheader: XaAssetSubheader,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaFramingRun {
+    pub sectors: u32,
+    pub subheader: XaAssetSubheader,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaPositionSpan {
+    pub start: u32,
+    #[serde(default = "default_one_u32", skip_serializing_if = "is_one_u32")]
+    pub stride: u32,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaFramingOverride {
+    #[serde(flatten)]
+    pub positions: XaPositionSpan,
+    pub subheader: XaAssetSubheader,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaInterleave {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub tail_slots: u32,
+    pub channels: Vec<XaInterleaveChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaInterleaveChannel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cycle: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_cycle: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<XaCycleSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_start: Option<XaPadding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub between_segments: Option<XaPadding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_end: Option<XaPadding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<XaPadding>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaCycleSegment {
+    pub start_cycle: u32,
+    pub end_cycle: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XaPadding {
+    XaGap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XaAssets {
+    pub form1: XaFormAsset,
+    pub form2: XaFormAsset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<HostAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interleave: Option<XaInterleave>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gap_overrides: Vec<XaPositionSpan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1432,27 +1654,31 @@ mod tests {
     #[test]
     fn unreferenced_xa_extent_assets_round_trip_without_ambiguity() {
         let item = FileLayoutItem::xa_extent(XaAssets {
-            form1: HostAsset {
-                path: "disc.unreferenced.000.XA1".to_owned(),
+            form1: XaFormAsset {
+                path: "disc.unreferenced.000.F1S".to_owned(),
                 sha1: Some("1111111111111111111111111111111111111111".to_owned()),
+                framing: None,
             },
-            form2: HostAsset {
-                path: "disc.unreferenced.000.XA2".to_owned(),
+            form2: XaFormAsset {
+                path: "disc.unreferenced.000.F2S".to_owned(),
                 sha1: None,
+                framing: None,
             },
-            index: HostAsset {
-                path: "disc.unreferenced.000.XAI".to_owned(),
-                sha1: None,
-            },
-            gap_index: Some(HostAsset {
-                path: "disc.unreferenced.000.XAG".to_owned(),
+            index: Some(HostAsset {
+                path: "disc.unreferenced.000.I".to_owned(),
                 sha1: None,
             }),
+            interleave: None,
+            gap_overrides: vec![XaPositionSpan {
+                start: 7,
+                stride: 8,
+                count: 2,
+            }],
         });
         let yaml = yaml_serde::to_string(&item).unwrap();
         assert_eq!(
             yaml,
-            "xa_extent:\n  form1:\n    path: disc.unreferenced.000.XA1\n    sha1: '1111111111111111111111111111111111111111'\n  form2:\n    path: disc.unreferenced.000.XA2\n  index:\n    path: disc.unreferenced.000.XAI\n  gap_index:\n    path: disc.unreferenced.000.XAG\n"
+            "xa_extent:\n  form1:\n    path: disc.unreferenced.000.F1S\n    sha1: '1111111111111111111111111111111111111111'\n  form2:\n    path: disc.unreferenced.000.F2S\n  index:\n    path: disc.unreferenced.000.I\n  gap_overrides:\n  - start: 7\n    stride: 8\n    count: 2\n"
         );
         assert_eq!(yaml_serde::from_str::<FileLayoutItem>(&yaml).unwrap(), item);
         assert!(
@@ -1467,21 +1693,46 @@ mod tests {
     fn indexed_xa_assets_are_nested_on_the_layout_path() {
         let hash = "0123456789abcdef0123456789abcdef0123456789";
         let yaml = format!(
-            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n    sha1: {hash}\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n"
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.F1S\n    sha1: {hash}\n  form2:\n    path: MOVIE.STR.F2S\n  index:\n    path: MOVIE.STR.I\n"
         );
         let item: FileLayoutItem = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(yaml_serde::to_string(&item).unwrap(), yaml);
 
         for invalid in [
-            "path: MOVIE.STR\nxa_assets:\n  form1:\n    sha1: 0123456789abcdef0123456789abcdef0123456789\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n",
-            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n  form2:\n    path: MOVIE.STR.XA2\n",
-            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.XA1\n    checksum: bad\n  form2:\n    path: MOVIE.STR.XA2\n  index:\n    path: MOVIE.STR.XAI\n",
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    sha1: 0123456789abcdef0123456789abcdef0123456789\n  form2:\n    path: MOVIE.STR.F2S\n  index:\n    path: MOVIE.STR.I\n",
+            "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.STR.F1S\n    checksum: bad\n  form2:\n    path: MOVIE.STR.F2S\n  index:\n    path: MOVIE.STR.I\n",
         ] {
             assert!(yaml_serde::from_str::<FileLayoutItem>(invalid).is_err());
         }
 
         let legacy_entry = "path: MOVIE.STR\nrecording_time: 1998-01-01T00:00:00+00:00\nxa:\n  form1: MOVIE.STR.XA1\n";
         assert!(yaml_serde::from_str::<Entry>(legacy_entry).is_err());
+    }
+
+    #[test]
+    fn xa_framing_supports_scalar_and_parameterized_forms() {
+        let scalar: XaFormAsset =
+            yaml_serde::from_str("path: MOVIE.F2\nframing: channel\n").unwrap();
+        assert_eq!(
+            scalar.framing,
+            Some(XaFraming::Named(XaFramingPolicy::Channel))
+        );
+
+        let detailed: XaFormAsset = yaml_serde::from_str(
+            "path: MOVIE.F1\nframing:\n  policy: runs\n  eof: final_record\n  default:\n    submode:\n    - data\n  runs:\n  - sectors: 2\n    subheader:\n      file: 1\n      submode:\n      - data\n  overrides:\n  - start: 3\n    stride: 8\n    count: 2\n    subheader:\n      submode:\n      - data\n",
+        )
+        .unwrap();
+        let yaml = yaml_serde::to_string(&detailed).unwrap();
+        assert_eq!(
+            yaml_serde::from_str::<XaFormAsset>(&yaml).unwrap(),
+            detailed
+        );
+    }
+
+    #[test]
+    fn removed_xa_gap_asset_field_is_rejected() {
+        let yaml = "path: MOVIE.STR\nxa_assets:\n  form1:\n    path: MOVIE.F1S\n  form2:\n    path: MOVIE.F2S\n  index:\n    path: MOVIE.I\n  gap_index:\n    path: MOVIE.XAG\n";
+        assert!(yaml_serde::from_str::<FileLayoutItem>(yaml).is_err());
     }
 
     #[test]

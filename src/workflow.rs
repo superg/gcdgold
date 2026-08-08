@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::ops::Range;
@@ -16,8 +16,10 @@ use crate::manifest::{
     GapKind, GcdgoldMetadata, HostAsset, IsoMetadataSubheader, Manifest, MetadataSubheader,
     MetadataVolume, PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS, SectorPatch,
     SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing, SystemAreaSectorKind,
-    SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader, XaAssets, XaAttributeFlag,
-    XaLengthEncoding, decode_sector_patch, serialize_manifest,
+    SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader, XaAssetSubheader, XaAssets,
+    XaAttributeFlag, XaChannelState, XaCycleSegment, XaEofPolicy, XaFormAsset, XaFraming,
+    XaFramingPolicy, XaFramingRun, XaFramingSettings, XaInterleave, XaInterleaveChannel,
+    XaLengthEncoding, XaPadding, XaPositionSpan, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorProtection,
@@ -947,8 +949,11 @@ enum XaExtentSector {
 struct XaSidecarAssets {
     form1: Vec<u8>,
     form2: Vec<u8>,
-    form2_index: Vec<u8>,
-    gap_index: Vec<u8>,
+    form1_framing: Option<XaFraming>,
+    form2_framing: Option<XaFraming>,
+    index: Option<Vec<u8>>,
+    interleave: Option<XaInterleave>,
+    gap_overrides: Vec<XaPositionSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -958,34 +963,116 @@ struct XaForm1Sector {
     payload: [u8; LOGICAL_BLOCK_SIZE],
 }
 
-fn encode_xa_form1_record(sector: &crate::raw_cd::ParsedSector) -> Result<Vec<u8>> {
+fn encode_xa_form1_record(
+    sector: &crate::raw_cd::ParsedSector,
+    stored_framing: bool,
+) -> Result<Vec<u8>> {
     ensure!(
         sector.kind == Kind::Form1,
         "XA1 record source is not Form 1"
     );
-    let mut result = Vec::with_capacity(XA_FORM1_RECORD_SIZE);
-    result.extend_from_slice(&<[u8; 4]>::from(sector.subheader));
-    result.extend_from_slice(&<[u8; 4]>::from(sector.subheader_copy));
+    let mut result = Vec::with_capacity(if stored_framing {
+        XA_FORM1_RECORD_SIZE
+    } else {
+        LOGICAL_BLOCK_SIZE
+    });
+    if stored_framing {
+        result.extend_from_slice(&<[u8; 4]>::from(sector.subheader));
+        result.extend_from_slice(&<[u8; 4]>::from(sector.subheader_copy));
+    }
     result.extend_from_slice(sector.payload());
     Ok(result)
 }
 
-fn encode_xa_form2_record(sector: &crate::raw_cd::ParsedSector) -> Result<Vec<u8>> {
+fn encode_xa_form2_record(
+    sector: &crate::raw_cd::ParsedSector,
+    stored_framing: bool,
+) -> Result<Vec<u8>> {
     ensure!(
         sector.kind == Kind::Form2,
         "XA2 record source is not Form 2"
     );
-    let mut result = Vec::with_capacity(XA_FORM2_RECORD_SIZE);
-    result.extend_from_slice(&<[u8; 4]>::from(sector.subheader));
-    result.extend_from_slice(&<[u8; 4]>::from(sector.subheader_copy));
+    let mut result = Vec::with_capacity(if stored_framing {
+        XA_FORM2_RECORD_SIZE
+    } else {
+        FORM2_PAYLOAD_SIZE
+    });
+    if stored_framing {
+        result.extend_from_slice(&<[u8; 4]>::from(sector.subheader));
+        result.extend_from_slice(&<[u8; 4]>::from(sector.subheader_copy));
+    }
     result.extend_from_slice(sector.payload());
     Ok(result)
 }
 
-fn parse_xa_form1_records(bytes: &[u8]) -> Result<Vec<XaForm1Sector>> {
+fn framing_runs(sectors: &[&crate::raw_cd::ParsedSector], form2: bool) -> Option<XaFraming> {
+    if sectors
+        .iter()
+        .any(|sector| sector.subheader != sector.subheader_copy)
+    {
+        return None;
+    }
+    let mut runs: Vec<XaFramingRun> = Vec::new();
+    for sector in sectors {
+        if let Some(last) = runs.last_mut()
+            && last.subheader == sector.subheader.into()
+        {
+            last.sectors += 1;
+        } else {
+            runs.push(XaFramingRun {
+                sectors: 1,
+                subheader: sector.subheader.into(),
+            });
+        }
+    }
+    if runs.len() > 256 {
+        return None;
+    }
+    Some(XaFraming::Detailed(XaFramingSettings {
+        policy: XaFramingPolicy::Runs,
+        eof: XaEofPolicy::None,
+        default: sectors.is_empty().then(|| {
+            XaAssetSubheader::from(XaSubheader::with_submode(if form2 {
+                XaSubmode::FORM2
+            } else {
+                XaSubmode::DATA
+            }))
+        }),
+        tail: None,
+        phases: Vec::new(),
+        states: Vec::new(),
+        runs,
+        overrides: Vec::new(),
+    }))
+}
+
+fn parse_xa_form1_records(
+    bytes: &[u8],
+    asset: &XaFormAsset,
+    positions: &[u32],
+    resolved: &ResolvedXaPositions,
+) -> Result<Vec<XaForm1Sector>> {
+    if asset.framing.is_some() {
+        ensure!(
+            bytes.len().is_multiple_of(LOGICAL_BLOCK_SIZE),
+            "F1 asset size must be a multiple of {LOGICAL_BLOCK_SIZE} bytes"
+        );
+        let framing = generate_framing(asset, positions, resolved, false)?;
+        return bytes
+            .chunks_exact(LOGICAL_BLOCK_SIZE)
+            .zip(framing)
+            .map(|(payload, subheader)| {
+                Ok(XaForm1Sector {
+                    subheader,
+                    subheader_copy: subheader,
+                    payload: payload.try_into()?,
+                })
+            })
+            .collect();
+    }
     ensure!(
         bytes.len().is_multiple_of(XA_FORM1_RECORD_SIZE),
-        "XA1 asset size must be a multiple of {XA_FORM1_RECORD_SIZE} bytes"
+        "F1S asset size must be a multiple of {XA_FORM1_RECORD_SIZE} bytes"
     );
     bytes
         .chunks_exact(XA_FORM1_RECORD_SIZE)
@@ -996,7 +1083,7 @@ fn parse_xa_form1_records(bytes: &[u8]) -> Result<Vec<XaForm1Sector>> {
                 !subheader
                     .submode
                     .contains(crate::raw_cd::XaSubmodeFlag::Form2),
-                "XA1 record {index} is marked Form 2"
+                "F1S record {index} is marked Form 2"
             );
             Ok(XaForm1Sector {
                 subheader,
@@ -1007,10 +1094,33 @@ fn parse_xa_form1_records(bytes: &[u8]) -> Result<Vec<XaForm1Sector>> {
         .collect()
 }
 
-fn parse_xa_form2_records(bytes: &[u8]) -> Result<Vec<XaSidecarRecord>> {
+fn parse_xa_form2_records(
+    bytes: &[u8],
+    asset: &XaFormAsset,
+    positions: &[u32],
+    resolved: &ResolvedXaPositions,
+) -> Result<Vec<XaSidecarRecord>> {
+    if asset.framing.is_some() {
+        ensure!(
+            bytes.len().is_multiple_of(FORM2_PAYLOAD_SIZE),
+            "F2 asset size must be a multiple of {FORM2_PAYLOAD_SIZE} bytes"
+        );
+        let framing = generate_framing(asset, positions, resolved, true)?;
+        return bytes
+            .chunks_exact(FORM2_PAYLOAD_SIZE)
+            .zip(framing)
+            .map(|(payload, subheader)| {
+                Ok(XaSidecarRecord {
+                    subheader,
+                    subheader_copy: subheader,
+                    payload: payload.try_into()?,
+                })
+            })
+            .collect();
+    }
     ensure!(
         bytes.len().is_multiple_of(XA_FORM2_RECORD_SIZE),
-        "XA2 asset size must be a multiple of {XA_FORM2_RECORD_SIZE} bytes"
+        "F2S asset size must be a multiple of {XA_FORM2_RECORD_SIZE} bytes"
     );
     bytes
         .chunks_exact(XA_FORM2_RECORD_SIZE)
@@ -1021,7 +1131,7 @@ fn parse_xa_form2_records(bytes: &[u8]) -> Result<Vec<XaSidecarRecord>> {
                 subheader
                     .submode
                     .contains(crate::raw_cd::XaSubmodeFlag::Form2),
-                "XA2 record {index} is not marked Form 2"
+                "F2S record {index} is not marked Form 2"
             );
             Ok(XaSidecarRecord {
                 subheader,
@@ -1041,11 +1151,7 @@ fn encode_xa_index(indices: &[u32]) -> Vec<u8> {
 }
 
 fn parse_xa_index(bytes: &[u8]) -> Result<Vec<u32>> {
-    parse_xa_positions(bytes, "XAI")
-}
-
-fn parse_xa_gap_index(bytes: &[u8]) -> Result<Vec<u32>> {
-    parse_xa_positions(bytes, "XAG")
+    parse_xa_positions(bytes, "I")
 }
 
 fn parse_xa_positions(bytes: &[u8], label: &str) -> Result<Vec<u32>> {
@@ -1064,44 +1170,747 @@ fn parse_xa_positions(bytes: &[u8], label: &str) -> Result<Vec<u32>> {
     Ok(indices)
 }
 
-fn multiplex_xa_extent(
-    form1: &[u8],
-    form2: &[u8],
-    index: &[u8],
-    gap_index: &[u8],
-) -> Result<Vec<XaExtentSector>> {
-    let form1 = parse_xa_form1_records(form1)?;
-    let form2 = parse_xa_form2_records(form2)?;
-    let indices = parse_xa_index(index)?;
-    let gap_indices = parse_xa_gap_index(gap_index)?;
+fn validate_xa_assets(assets: &XaAssets) -> Result<()> {
+    for (asset, payload_suffix, stored_suffix, label) in [
+        (&assets.form1, ".F1", ".F1S", "Form 1"),
+        (&assets.form2, ".F2", ".F2S", "Form 2"),
+    ] {
+        ensure!(
+            !asset.path.is_empty(),
+            "{label} asset path must not be empty"
+        );
+        if asset.framing.is_some() {
+            ensure!(
+                asset.path.ends_with(payload_suffix),
+                "{label} asset with structural framing must use {payload_suffix}"
+            );
+        } else {
+            ensure!(
+                asset.path.ends_with(stored_suffix),
+                "{label} asset without structural framing must use {stored_suffix}"
+            );
+        }
+    }
+    if let Some(index) = &assets.index {
+        ensure!(index.path.ends_with(".I"), "explicit XA index must use .I");
+    }
     ensure!(
-        indices.len() == form2.len(),
-        "XAI record count does not match XA2 record count"
+        assets.index.is_some() ^ assets.interleave.is_some(),
+        "XA assets require exactly one of index or interleave"
     );
-    let sector_count = form1.len() + form2.len() + gap_indices.len();
+    Ok(())
+}
+
+fn compress_positions(positions: &[u32]) -> Vec<XaPositionSpan> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < positions.len() {
+        let stride = positions
+            .get(start + 1)
+            .map_or(1, |next| next - positions[start]);
+        let mut end = start + 1;
+        while end < positions.len() && positions[end] - positions[end - 1] == stride {
+            end += 1;
+        }
+        spans.push(XaPositionSpan {
+            start: positions[start],
+            stride,
+            count: u32::try_from(end - start).expect("position count fits u32"),
+        });
+        start = end;
+    }
+    spans
+}
+
+fn gcd_u32(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+fn detect_arithmetic_interleave(
+    sectors: &[crate::raw_cd::ParsedSector],
+    positions: &[u32],
+    gap_positions: &[u32],
+) -> (Option<XaInterleave>, Vec<u32>) {
+    let mut groups: BTreeMap<(u8, u8), Vec<u32>> = BTreeMap::new();
+    for position in positions {
+        let Ok(position_index) = usize::try_from(*position) else {
+            return (None, gap_positions.to_vec());
+        };
+        let sector = &sectors[position_index];
+        groups
+            .entry((sector.subheader.file_number, sector.subheader.channel))
+            .or_default()
+            .push(*position);
+    }
+    if groups.is_empty() {
+        return (
+            Some(XaInterleave {
+                stride: None,
+                cycles: None,
+                tail_slots: 0,
+                channels: Vec::new(),
+            }),
+            gap_positions.to_vec(),
+        );
+    }
+    let cadence = groups
+        .values()
+        .flat_map(|group| group.windows(2).map(|pair| pair[1] - pair[0]))
+        .reduce(gcd_u32);
+    let shared_candidates = cadence
+        .filter(|stride| matches!(stride, 4 | 8 | 16 | 32))
+        .into_iter();
+    for stride in shared_candidates {
+        let Ok(length) = u32::try_from(sectors.len()) else {
+            return (None, gap_positions.to_vec());
+        };
+        let cycles = length / stride;
+        let tail_slots = length % stride;
+        let mut channels = Vec::new();
+        let mut valid = true;
+        let mut used_phases = HashSet::new();
+        let gaps = gap_positions.iter().copied().collect::<HashSet<_>>();
+        let mut semantic_gaps = HashSet::new();
+        for ((file, channel), group) in &groups {
+            let phase = group[0] % stride;
+            if !used_phases.insert(phase)
+                || group.iter().any(|position| position % stride != phase)
+                || group
+                    .windows(2)
+                    .any(|pair| !(pair[1] - pair[0]).is_multiple_of(stride))
+            {
+                valid = false;
+                break;
+            }
+            let active_cycles = group
+                .iter()
+                .map(|position| position / stride)
+                .collect::<Vec<_>>();
+            let start_cycle = active_cycles[0];
+            let end_cycle = active_cycles.last().copied().unwrap() + 1;
+            let mut segments = Vec::new();
+            let mut segment_start = active_cycles[0];
+            let mut previous = active_cycles[0];
+            for cycle in active_cycles.iter().copied().skip(1) {
+                if cycle != previous + 1 {
+                    segments.push(XaCycleSegment {
+                        start_cycle: segment_start,
+                        end_cycle: previous + 1,
+                    });
+                    segment_start = cycle;
+                }
+                previous = cycle;
+            }
+            segments.push(XaCycleSegment {
+                start_cycle: segment_start,
+                end_cycle: previous + 1,
+            });
+            if segments.len() > 8 {
+                valid = false;
+                break;
+            }
+            let slot_cycles = (0..=cycles)
+                .filter(|cycle| cycle * stride + phase < length)
+                .collect::<Vec<_>>();
+            let before = slot_cycles
+                .iter()
+                .copied()
+                .filter(|cycle| *cycle < start_cycle)
+                .collect::<Vec<_>>();
+            let after = slot_cycles
+                .iter()
+                .copied()
+                .filter(|cycle| *cycle >= end_cycle)
+                .collect::<Vec<_>>();
+            let between = slot_cycles
+                .iter()
+                .copied()
+                .filter(|cycle| {
+                    *cycle >= start_cycle
+                        && *cycle < end_cycle
+                        && active_cycles.binary_search(cycle).is_err()
+                })
+                .collect::<Vec<_>>();
+            let before_gap = !before.is_empty()
+                && before
+                    .iter()
+                    .all(|cycle| gaps.contains(&(cycle * stride + phase)));
+            let after_gap = !after.is_empty()
+                && after
+                    .iter()
+                    .all(|cycle| gaps.contains(&(cycle * stride + phase)));
+            let between_gap = !between.is_empty()
+                && between
+                    .iter()
+                    .all(|cycle| gaps.contains(&(cycle * stride + phase)));
+            if before_gap {
+                semantic_gaps.extend(before.iter().map(|cycle| cycle * stride + phase));
+            }
+            if after_gap {
+                semantic_gaps.extend(after.iter().map(|cycle| cycle * stride + phase));
+            }
+            if between_gap {
+                semantic_gaps.extend(between.iter().map(|cycle| cycle * stride + phase));
+            }
+            let full_end = cycles + u32::from(tail_slots > phase);
+            let multiple_segments = segments.len() > 1;
+            channels.push(XaInterleaveChannel {
+                file: Some(*file),
+                channel: Some(*channel),
+                phase: Some(phase),
+                start_cycle: (!multiple_segments && start_cycle != 0).then_some(start_cycle),
+                end_cycle: (!multiple_segments && end_cycle != full_end).then_some(end_cycle),
+                segments: if multiple_segments {
+                    segments
+                } else {
+                    Vec::new()
+                },
+                start: None,
+                stride: None,
+                count: None,
+                before_start: before_gap.then_some(XaPadding::XaGap),
+                between_segments: between_gap.then_some(XaPadding::XaGap),
+                after_end: after_gap.then_some(XaPadding::XaGap),
+                fill: None,
+            });
+        }
+        if valid {
+            for phase in 0..stride {
+                if used_phases.contains(&phase) {
+                    continue;
+                }
+                let slots = (0..=cycles)
+                    .map(|cycle| cycle * stride + phase)
+                    .filter(|position| *position < length)
+                    .collect::<Vec<_>>();
+                if !slots.is_empty() && slots.iter().all(|position| gaps.contains(position)) {
+                    semantic_gaps.extend(slots);
+                    channels.push(XaInterleaveChannel {
+                        file: None,
+                        channel: None,
+                        phase: Some(phase),
+                        start_cycle: None,
+                        end_cycle: None,
+                        segments: Vec::new(),
+                        start: None,
+                        stride: None,
+                        count: None,
+                        before_start: None,
+                        between_segments: None,
+                        after_end: None,
+                        fill: Some(XaPadding::XaGap),
+                    });
+                }
+            }
+            let remaining = gap_positions
+                .iter()
+                .copied()
+                .filter(|position| !semantic_gaps.contains(position))
+                .collect();
+            return (
+                Some(XaInterleave {
+                    stride: Some(stride),
+                    cycles: Some(cycles),
+                    tail_slots,
+                    channels,
+                }),
+                remaining,
+            );
+        }
+    }
+    let mut channels = Vec::new();
+    for ((file, channel), group) in groups {
+        let stride = group.windows(2).next().map_or(1, |pair| pair[1] - pair[0]);
+        if group.windows(2).any(|pair| pair[1] - pair[0] != stride) {
+            return (None, gap_positions.to_vec());
+        }
+        channels.push(XaInterleaveChannel {
+            file: Some(file),
+            channel: Some(channel),
+            phase: None,
+            start_cycle: None,
+            end_cycle: None,
+            segments: Vec::new(),
+            start: Some(group[0]),
+            stride: Some(stride),
+            count: Some(match u32::try_from(group.len()) {
+                Ok(count) => count,
+                Err(_) => return (None, gap_positions.to_vec()),
+            }),
+            before_start: None,
+            between_segments: None,
+            after_end: None,
+            fill: None,
+        });
+    }
+    (
+        Some(XaInterleave {
+            stride: None,
+            cycles: None,
+            tail_slots: 0,
+            channels,
+        }),
+        gap_positions.to_vec(),
+    )
+}
+
+#[derive(Default)]
+struct ResolvedXaPositions {
+    form2: Vec<u32>,
+    gaps: Vec<u32>,
+    sector_count: usize,
+    identities: HashMap<u32, (u8, u8)>,
+    phase_identities: HashMap<u32, (u8, u8)>,
+    shared_stride: Option<u32>,
+    states: HashMap<u32, XaChannelState>,
+}
+
+fn expand_span(span: XaPositionSpan, label: &str) -> Result<Vec<u32>> {
+    ensure!(span.stride > 0, "{label} stride must be positive");
+    (0..span.count)
+        .map(|offset| {
+            span.start
+                .checked_add(
+                    offset
+                        .checked_mul(span.stride)
+                        .context("position overflow")?,
+                )
+                .context("position overflow")
+        })
+        .collect()
+}
+
+fn resolve_xa_positions(
+    assets: &XaAssets,
+    index: Option<&[u8]>,
+    form1_count: usize,
+    form2_count: usize,
+) -> Result<ResolvedXaPositions> {
     ensure!(
-        indices
-            .last()
-            .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
-        "XAI sector index is outside the interleaved extent"
+        assets.index.is_some() ^ assets.interleave.is_some(),
+        "XA assets require exactly one of index or interleave"
+    );
+    let mut resolved = ResolvedXaPositions::default();
+    if let Some(interleave) = &assets.interleave {
+        match (interleave.stride, interleave.cycles) {
+            (Some(stride), Some(cycles)) => {
+                ensure!(stride > 0, "interleave stride must be positive");
+                ensure!(
+                    interleave.tail_slots < stride,
+                    "interleave tail_slots must be less than stride"
+                );
+                let total = cycles
+                    .checked_mul(stride)
+                    .and_then(|value| value.checked_add(interleave.tail_slots))
+                    .context("interleave extent length overflow")?;
+                resolved.sector_count = usize::try_from(total)?;
+                resolved.shared_stride = Some(stride);
+                let mut occupied = HashSet::new();
+                for channel in &interleave.channels {
+                    let phase = channel
+                        .phase
+                        .context("shared interleave channel needs phase")?;
+                    ensure!(phase < stride, "interleave channel phase is outside stride");
+                    ensure!(
+                        channel.start.is_none()
+                            && channel.stride.is_none()
+                            && channel.count.is_none(),
+                        "shared interleave channel cannot use arithmetic fields"
+                    );
+                    if let (Some(file), Some(number)) = (channel.file, channel.channel) {
+                        ensure!(
+                            resolved
+                                .phase_identities
+                                .insert(phase, (file, number))
+                                .is_none(),
+                            "duplicate interleave phase {phase}"
+                        );
+                    }
+                    let full_duration = channel.segments.is_empty()
+                        && channel.start_cycle.is_none()
+                        && channel.end_cycle.is_none();
+                    let slot_end_cycle = cycles + u32::from(phase < interleave.tail_slots);
+                    let segments = if channel.segments.is_empty() {
+                        vec![XaCycleSegment {
+                            start_cycle: channel.start_cycle.unwrap_or(0),
+                            end_cycle: channel.end_cycle.unwrap_or(slot_end_cycle),
+                        }]
+                    } else {
+                        ensure!(
+                            channel.start_cycle.is_none() && channel.end_cycle.is_none(),
+                            "interleave segments cannot be combined with start_cycle/end_cycle"
+                        );
+                        channel.segments.clone()
+                    };
+                    let mut previous_end = 0;
+                    for segment in &segments {
+                        if full_duration && cycles == 0 {
+                            continue;
+                        }
+                        ensure!(
+                            segment.start_cycle < segment.end_cycle
+                                && segment.end_cycle <= slot_end_cycle
+                                && segment.start_cycle >= previous_end,
+                            "interleave segments must be ordered, nonoverlapping, and in range"
+                        );
+                        previous_end = segment.end_cycle;
+                    }
+                    for cycle in 0..=cycles {
+                        let position = cycle
+                            .checked_mul(stride)
+                            .and_then(|value| value.checked_add(phase))
+                            .context("interleave position overflow")?;
+                        if position >= total {
+                            continue;
+                        }
+                        let active = channel.fill.is_none()
+                            && (full_duration
+                                || segments.iter().any(|segment| {
+                                    cycle >= segment.start_cycle && cycle < segment.end_cycle
+                                }));
+                        let before = cycle < segments.first().map_or(0, |s| s.start_cycle);
+                        let after_start = segments.last().map_or(0, |s| s.end_cycle);
+                        let after = cycle >= after_start;
+                        let state = if channel.fill.is_some() {
+                            if cycle == 0 {
+                                XaChannelState::UnusedFirst
+                            } else {
+                                XaChannelState::Unused
+                            }
+                        } else if active {
+                            XaChannelState::Active
+                        } else if before {
+                            XaChannelState::BeforeStart
+                        } else if after && cycle == after_start {
+                            XaChannelState::FirstAfterEnd
+                        } else if after {
+                            XaChannelState::AfterEnd
+                        } else {
+                            XaChannelState::BetweenSegments
+                        };
+                        resolved.states.insert(position, state);
+                        if active {
+                            let identity = (
+                                channel.file.context("active channel needs file")?,
+                                channel.channel.context("active channel needs channel")?,
+                            );
+                            ensure!(
+                                occupied.insert(position),
+                                "overlapping Form 2 position {position}"
+                            );
+                            resolved.form2.push(position);
+                            resolved.identities.insert(position, identity);
+                        } else {
+                            let padded = channel.fill == Some(XaPadding::XaGap)
+                                || (before && channel.before_start == Some(XaPadding::XaGap))
+                                || (after && channel.after_end == Some(XaPadding::XaGap))
+                                || (!before
+                                    && !after
+                                    && channel.between_segments == Some(XaPadding::XaGap));
+                            if padded {
+                                ensure!(
+                                    occupied.insert(position),
+                                    "overlapping XA-gap position {position}"
+                                );
+                                resolved.gaps.push(position);
+                            }
+                        }
+                    }
+                }
+            }
+            (None, None) => {
+                for channel in &interleave.channels {
+                    ensure!(
+                        channel.phase.is_none()
+                            && channel.start_cycle.is_none()
+                            && channel.end_cycle.is_none()
+                            && channel.segments.is_empty(),
+                        "arithmetic interleave channel cannot use shared-cycle fields"
+                    );
+                    let span = XaPositionSpan {
+                        start: channel.start.context("arithmetic channel needs start")?,
+                        stride: channel.stride.context("arithmetic channel needs stride")?,
+                        count: channel.count.context("arithmetic channel needs count")?,
+                    };
+                    let identity = (
+                        channel.file.context("arithmetic channel needs file")?,
+                        channel
+                            .channel
+                            .context("arithmetic channel needs channel")?,
+                    );
+                    for position in expand_span(span, "interleave channel")? {
+                        ensure!(
+                            !resolved.identities.contains_key(&position),
+                            "overlapping Form 2 position {position}"
+                        );
+                        resolved.identities.insert(position, identity);
+                        resolved.form2.push(position);
+                    }
+                }
+            }
+            _ => anyhow::bail!("interleave stride and cycles must be specified together"),
+        }
+    } else {
+        resolved.form2 = parse_xa_index(index.context("missing I asset bytes")?)?;
+    }
+    for span in &assets.gap_overrides {
+        resolved.gaps.extend(expand_span(*span, "gap override")?);
+    }
+    resolved.form2.sort_unstable();
+    resolved.gaps.sort_unstable();
+    ensure!(
+        resolved.form2.windows(2).all(|p| p[0] < p[1]),
+        "duplicate Form 2 positions"
     );
     ensure!(
-        gap_indices
-            .last()
-            .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
-        "XAG sector index is outside the interleaved extent"
+        resolved.gaps.windows(2).all(|p| p[0] < p[1]),
+        "overlapping gap overrides"
     );
     ensure!(
-        indices
+        resolved
+            .form2
             .iter()
-            .all(|index| gap_indices.binary_search(index).is_err()),
-        "XAI and XAG sector indices overlap"
+            .all(|position| resolved.gaps.binary_search(position).is_err()),
+        "Form 2 and XA-gap positions overlap"
+    );
+    ensure!(
+        resolved.form2.len() == form2_count,
+        "interleave Form 2 count does not match F2 asset"
+    );
+    if resolved.sector_count == 0 {
+        resolved.sector_count = form1_count + form2_count + resolved.gaps.len();
+    }
+    ensure!(
+        resolved
+            .form2
+            .last()
+            .into_iter()
+            .chain(resolved.gaps.last())
+            .all(|position| usize::try_from(*position)
+                .is_ok_and(|position| position < resolved.sector_count)),
+        "XA position is outside the interleaved extent"
+    );
+    ensure!(
+        resolved.sector_count == form1_count + form2_count + resolved.gaps.len(),
+        "interleave extent length does not consume all Form records"
+    );
+    Ok(resolved)
+}
+
+fn generate_framing(
+    asset: &XaFormAsset,
+    positions: &[u32],
+    resolved: &ResolvedXaPositions,
+    form2: bool,
+) -> Result<Vec<XaSubheader>> {
+    let framing = asset
+        .framing
+        .as_ref()
+        .context("payload-only Form asset needs framing")?;
+    let (policy, settings) = match framing {
+        XaFraming::Named(policy) => (*policy, None),
+        XaFraming::Detailed(settings) => (settings.policy, Some(settings)),
+    };
+    let mut generated: Vec<XaSubheader> = Vec::with_capacity(positions.len());
+    if policy == XaFramingPolicy::Runs {
+        let settings = settings.context("runs framing requires a settings map")?;
+        for run in &settings.runs {
+            ensure!(run.sectors > 0, "framing run must contain sectors");
+            generated.extend(std::iter::repeat_n(
+                XaSubheader::from(run.subheader),
+                usize::try_from(run.sectors)?,
+            ));
+        }
+        if generated.is_empty() {
+            generated.resize(
+                positions.len(),
+                settings
+                    .default
+                    .context("empty runs framing needs default")?
+                    .into(),
+            );
+        }
+        ensure!(
+            generated.len() == positions.len(),
+            "framing runs do not match Form record count"
+        );
+    } else {
+        for position in positions {
+            let identity = resolved.identities.get(position).copied().or_else(|| {
+                resolved
+                    .shared_stride
+                    .and_then(|stride| resolved.phase_identities.get(&(position % stride)).copied())
+            });
+            let mut subheader = settings
+                .and_then(|value| value.default)
+                .map(XaSubheader::from)
+                .unwrap_or_else(|| {
+                    XaSubheader::with_submode(if form2 {
+                        XaSubmode::FORM2
+                    } else {
+                        XaSubmode::DATA
+                    })
+                });
+            if matches!(
+                policy,
+                XaFramingPolicy::Channel | XaFramingPolicy::ChannelOrGeneric
+            ) && let Some((file, channel)) = identity
+            {
+                subheader.file_number = file;
+                subheader.channel = channel;
+            } else if policy == XaFramingPolicy::Channel && identity.is_none() {
+                anyhow::bail!(
+                    "channel framing has no channel identity for Form record position {position}"
+                );
+            }
+            generated.push(subheader);
+        }
+    }
+    if let Some(settings) = settings {
+        if !settings.phases.is_empty() {
+            let stride = resolved
+                .shared_stride
+                .context("phase framing requires shared interleave")?;
+            for phase in &settings.phases {
+                ensure!(
+                    phase.phase < stride,
+                    "framing phase is outside interleave stride"
+                );
+                for (index, position) in positions.iter().enumerate() {
+                    if position % stride == phase.phase {
+                        generated[index] = phase.subheader.into();
+                    }
+                }
+            }
+        }
+        if !settings.states.is_empty() {
+            let stride = resolved
+                .shared_stride
+                .context("state framing requires shared interleave")?;
+            for (index, position) in positions.iter().enumerate() {
+                let phase = position % stride;
+                let state = resolved.states.get(position).copied();
+                for override_ in &settings.states {
+                    if override_.phase.is_none_or(|value| value == phase)
+                        && Some(override_.state) == state
+                    {
+                        generated[index] = override_.subheader.into();
+                    }
+                }
+            }
+        }
+        if settings.eof == XaEofPolicy::FinalRecord
+            && let Some(last) = generated.last_mut()
+        {
+            last.submode = last.submode.union(XaSubmode::END_OF_FILE);
+        }
+        if settings.eof == XaEofPolicy::ChannelSegmentEnd {
+            let stride = resolved
+                .shared_stride
+                .context("channel_segment_end EOF requires shared interleave")?;
+            for (index, position) in positions.iter().enumerate() {
+                let identity = resolved.identities.get(position);
+                let continues = position
+                    .checked_add(stride)
+                    .and_then(|next| resolved.identities.get(&next))
+                    == identity;
+                if identity.is_some() && !continues {
+                    generated[index].submode =
+                        generated[index].submode.union(XaSubmode::END_OF_FILE);
+                }
+            }
+        }
+        if let Some(tail) = settings.tail {
+            let count = usize::try_from(tail.sectors)?;
+            ensure!(
+                count <= generated.len(),
+                "framing tail exceeds Form record count"
+            );
+            let start = generated.len() - count;
+            generated[start..].fill(tail.subheader.into());
+        }
+        for override_ in &settings.overrides {
+            for position in expand_span(override_.positions, "framing override")? {
+                let record = usize::try_from(position)?;
+                ensure!(
+                    record < generated.len(),
+                    "framing override is outside Form records"
+                );
+                generated[record] = override_.subheader.into();
+            }
+        }
+    }
+    for (index, subheader) in generated.iter().enumerate() {
+        ensure!(
+            subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::Form2)
+                == form2,
+            "generated framing has wrong Form bit at record {index}"
+        );
+    }
+    Ok(generated)
+}
+
+fn multiplex_xa_extent(
+    assets: &XaAssets,
+    form1_bytes: &[u8],
+    form2_bytes: &[u8],
+    index_bytes: Option<&[u8]>,
+) -> Result<Vec<XaExtentSector>> {
+    validate_xa_assets(assets)?;
+    let form1_count = form1_bytes.len()
+        / if assets.form1.framing.is_some() {
+            LOGICAL_BLOCK_SIZE
+        } else {
+            XA_FORM1_RECORD_SIZE
+        };
+    let form2_count = form2_bytes.len()
+        / if assets.form2.framing.is_some() {
+            FORM2_PAYLOAD_SIZE
+        } else {
+            XA_FORM2_RECORD_SIZE
+        };
+    let resolved = resolve_xa_positions(assets, index_bytes, form1_count, form2_count)?;
+    let form2_positions = resolved.form2.clone();
+    let gap_positions = resolved.gaps.clone();
+    let form2_set = form2_positions.iter().copied().collect::<HashSet<_>>();
+    let gap_set = gap_positions.iter().copied().collect::<HashSet<_>>();
+    let form1_positions = (0..resolved.sector_count)
+        .filter_map(|position| {
+            let position = u32::try_from(position).ok()?;
+            (!form2_set.contains(&position) && !gap_set.contains(&position)).then_some(position)
+        })
+        .collect::<Vec<_>>();
+    let form1 = parse_xa_form1_records(form1_bytes, &assets.form1, &form1_positions, &resolved)?;
+    let form2 = parse_xa_form2_records(form2_bytes, &assets.form2, &form2_positions, &resolved)?;
+    let sector_count = resolved.sector_count;
+    ensure!(
+        form2_positions
+            .last()
+            .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
+        "I sector index is outside the interleaved extent"
+    );
+    ensure!(
+        gap_positions
+            .last()
+            .is_none_or(|index| usize::try_from(*index).is_ok_and(|value| value < sector_count)),
+        "XA-gap position is outside the interleaved extent"
+    );
+    ensure!(
+        form2_positions
+            .iter()
+            .all(|index| gap_positions.binary_search(index).is_err()),
+        "Form 2 and XA-gap positions overlap"
     );
     let mut result = Vec::with_capacity(sector_count);
     let mut form1 = form1.into_iter();
     let mut form2 = form2.into_iter();
-    let mut indices = indices.into_iter().peekable();
-    let mut gap_indices = gap_indices.into_iter().peekable();
+    let mut indices = form2_positions.into_iter().peekable();
+    let mut gap_indices = gap_positions.into_iter().peekable();
     for sector_index in 0..sector_count {
         if gap_indices
             .peek()
@@ -1121,26 +1930,117 @@ fn multiplex_xa_extent(
             result.push(XaExtentSector::Form1(Box::new(
                 form1
                     .next()
-                    .context("XAI leaves too many Form 1 positions")?,
+                    .context("interleave leaves too many Form 1 positions")?,
             )));
         }
     }
-    ensure!(indices.next().is_none(), "XAI position was not consumed");
+    ensure!(indices.next().is_none(), "Form 2 position was not consumed");
     ensure!(
         gap_indices.next().is_none(),
-        "XAG position was not consumed"
+        "XA-gap position was not consumed"
     );
-    ensure!(form1.next().is_none(), "XA1 record was not consumed");
-    ensure!(form2.next().is_none(), "XA2 record was not consumed");
+    ensure!(form1.next().is_none(), "F1 record was not consumed");
+    ensure!(form2.next().is_none(), "F2 record was not consumed");
     Ok(result)
+}
+
+fn phase_framing(
+    sectors: &[crate::raw_cd::ParsedSector],
+    kind: Kind,
+    stride: u32,
+) -> Option<XaFraming> {
+    let records = sectors
+        .iter()
+        .enumerate()
+        .filter(|(_, sector)| sector.kind == kind)
+        .collect::<Vec<_>>();
+    if records.is_empty()
+        || records
+            .iter()
+            .any(|(_, sector)| sector.subheader != sector.subheader_copy)
+    {
+        return None;
+    }
+    let eof_positions = records
+        .iter()
+        .filter_map(|(position, sector)| {
+            sector
+                .subheader
+                .submode
+                .contains(crate::raw_cd::XaSubmodeFlag::EndOfFile)
+                .then_some(*position)
+        })
+        .collect::<BTreeSet<_>>();
+    let final_position = records.last().map(|(position, _)| *position)?;
+    let mut segment_ends = BTreeSet::new();
+    let mut by_phase: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (position, _) in &records {
+        by_phase
+            .entry(u32::try_from(*position).ok()? % stride)
+            .or_default()
+            .push(*position);
+    }
+    for positions in by_phase.values() {
+        for pair in positions.windows(2) {
+            if pair[1] - pair[0] != usize::try_from(stride).ok()? {
+                segment_ends.insert(pair[0]);
+            }
+        }
+        segment_ends.insert(*positions.last()?);
+    }
+    let eof = if eof_positions.is_empty() {
+        XaEofPolicy::None
+    } else if eof_positions == BTreeSet::from([final_position]) {
+        XaEofPolicy::FinalRecord
+    } else if eof_positions == segment_ends {
+        XaEofPolicy::ChannelSegmentEnd
+    } else {
+        XaEofPolicy::None
+    };
+    let strip_eof = eof != XaEofPolicy::None;
+    let mut phases = Vec::new();
+    for (phase, positions) in by_phase {
+        let mut expected = None;
+        for position in positions {
+            let mut subheader = sectors[position].subheader;
+            if strip_eof {
+                subheader.submode =
+                    XaSubmode::from_bits(subheader.submode.bits() & !XaSubmode::END_OF_FILE.bits());
+            }
+            if expected.is_some_and(|value| value != subheader) {
+                return None;
+            }
+            expected = Some(subheader);
+        }
+        phases.push(crate::manifest::XaPhaseFraming {
+            phase,
+            subheader: expected?.into(),
+        });
+    }
+    Some(XaFraming::Detailed(XaFramingSettings {
+        policy: XaFramingPolicy::Phase,
+        eof,
+        default: None,
+        tail: None,
+        phases,
+        states: Vec::new(),
+        runs: Vec::new(),
+        overrides: Vec::new(),
+    }))
 }
 
 fn demultiplex_xa_extent(
     sectors: &[crate::raw_cd::ParsedSector],
     form2_edc: bool,
 ) -> Result<XaSidecarAssets> {
-    let mut form1 = Vec::new();
-    let mut form2 = Vec::new();
+    let form1_sectors = sectors
+        .iter()
+        .filter(|sector| sector.kind == Kind::Form1)
+        .collect::<Vec<_>>();
+    let form2_sectors = sectors
+        .iter()
+        .filter(|sector| sector.kind == Kind::Form2)
+        .collect::<Vec<_>>();
     let mut indices = Vec::new();
     let mut gap_indices = Vec::new();
     for (index, sector) in sectors.iter().enumerate() {
@@ -1148,15 +2048,12 @@ fn demultiplex_xa_extent(
             Kind::Mode1 | Kind::Mode1Gap => {
                 anyhow::bail!("Mode 1 sector inside interleaved XA extent at sector {index}")
             }
-            Kind::Form1 => {
-                form1.extend_from_slice(&encode_xa_form1_record(sector)?);
-            }
+            Kind::Form1 => {}
             Kind::Form2 => {
                 ensure!(
                     sector_follows_form2_edc_policy(sector, form2_edc),
                     "interleaved Form 2 sector {index} does not follow track Form 2 EDC policy"
                 );
-                form2.extend_from_slice(&encode_xa_form2_record(sector)?);
                 indices.push(u32::try_from(index)?);
             }
             Kind::XaGap => {
@@ -1173,9 +2070,64 @@ fn demultiplex_xa_extent(
             }
         }
     }
-    let index = encode_xa_index(&indices);
-    let gap_index = encode_xa_index(&gap_indices);
-    let reconstructed = multiplex_xa_extent(&form1, &form2, &index, &gap_index)?;
+    let (interleave, remaining_gaps) =
+        detect_arithmetic_interleave(sectors, &indices, &gap_indices);
+    let shared_stride = interleave.as_ref().and_then(|value| value.stride);
+    let form1_runs = framing_runs(&form1_sectors, false);
+    let form2_runs = framing_runs(&form2_sectors, true);
+    let choose_framing = |phase: Option<XaFraming>, runs: Option<XaFraming>| phase.or(runs);
+    let form1_framing = choose_framing(
+        shared_stride.and_then(|stride| phase_framing(sectors, Kind::Form1, stride)),
+        form1_runs,
+    );
+    let form2_framing = choose_framing(
+        shared_stride.and_then(|stride| phase_framing(sectors, Kind::Form2, stride)),
+        form2_runs,
+    );
+    let mut form1 = Vec::new();
+    let mut form2 = Vec::new();
+    for sector in sectors {
+        match sector.kind {
+            Kind::Form1 => {
+                form1.extend_from_slice(&encode_xa_form1_record(sector, form1_framing.is_none())?)
+            }
+            Kind::Form2 => {
+                form2.extend_from_slice(&encode_xa_form2_record(sector, form2_framing.is_none())?)
+            }
+            Kind::Mode1 | Kind::Mode1Gap | Kind::XaGap | Kind::RawZero => {}
+        }
+    }
+    let index = interleave.is_none().then(|| encode_xa_index(&indices));
+    let gap_overrides = compress_positions(&remaining_gaps);
+    let assets = XaAssets {
+        form1: XaFormAsset {
+            path: if form1_framing.is_some() {
+                "analysis.F1"
+            } else {
+                "analysis.F1S"
+            }
+            .to_owned(),
+            sha1: None,
+            framing: form1_framing.clone(),
+        },
+        form2: XaFormAsset {
+            path: if form2_framing.is_some() {
+                "analysis.F2"
+            } else {
+                "analysis.F2S"
+            }
+            .to_owned(),
+            sha1: None,
+            framing: form2_framing.clone(),
+        },
+        index: index.as_ref().map(|_| HostAsset {
+            path: "analysis.I".to_owned(),
+            sha1: None,
+        }),
+        interleave: interleave.clone(),
+        gap_overrides: gap_overrides.clone(),
+    };
+    let reconstructed = multiplex_xa_extent(&assets, &form1, &form2, index.as_deref())?;
     ensure!(
         reconstructed.len() == sectors.len(),
         "indexed XA assets do not reproduce the source extent length"
@@ -1201,8 +2153,11 @@ fn demultiplex_xa_extent(
     Ok(XaSidecarAssets {
         form1,
         form2,
-        form2_index: index,
-        gap_index,
+        form1_framing,
+        form2_framing,
+        index,
+        interleave,
+        gap_overrides,
     })
 }
 
@@ -1649,6 +2604,7 @@ fn prepare_xa_sidecars(
     sectors: &[crate::raw_cd::ParsedSector],
     parsed_iso: &mut iso9660::ParsedIso,
     redump_ranges: &[Range<usize>],
+    form2_edc: bool,
 ) -> Result<HashMap<String, XaAssets>> {
     let iso_paths = parsed_iso
         .manifest
@@ -1689,20 +2645,16 @@ fn prepare_xa_sidecars(
         {
             continue;
         }
-        let form1 = format!("{}.XA1", file.path);
-        let form2 = format!("{}.XA2", file.path);
-        let index = format!("{}.XAI", file.path);
-        let gap_index = sectors[start..start + count]
-            .iter()
-            .any(|sector| sector.kind == Kind::XaGap)
-            .then(|| format!("{}.XAG", file.path));
-        for path in [&form1, &form2, &index].into_iter().chain(gap_index.iter()) {
+        let analyzed = demultiplex_xa_extent(&sectors[start..start + count], form2_edc)
+            .with_context(|| format!("analyzing XA assets for {}", file.path))?;
+        let xa_assets = name_xa_assets(&file.path, &analyzed);
+        for path in xa_asset_paths(&xa_assets) {
             ensure!(
-                !iso_paths.contains(path.as_str()),
+                !iso_paths.contains(path),
                 "XA asset path collides with ISO entry {path}"
             );
             ensure!(
-                sidecar_paths.insert(path.clone()),
+                sidecar_paths.insert(path.to_owned()),
                 "duplicate XA asset path {path}"
             );
         }
@@ -1715,30 +2667,54 @@ fn prepare_xa_sidecars(
         }
         ensure!(
             indexed_assets
-                .insert(
-                    file.path.clone(),
-                    XaAssets {
-                        form1: HostAsset {
-                            path: form1,
-                            sha1: None
-                        },
-                        form2: HostAsset {
-                            path: form2,
-                            sha1: None
-                        },
-                        index: HostAsset {
-                            path: index,
-                            sha1: None
-                        },
-                        gap_index: gap_index.map(|path| HostAsset { path, sha1: None }),
-                    },
-                )
+                .insert(file.path.clone(), xa_assets,)
                 .is_none(),
             "duplicate indexed XA layout path {}",
             file.path
         );
     }
     Ok(indexed_assets)
+}
+
+fn name_xa_assets(base: &str, assets: &XaSidecarAssets) -> XaAssets {
+    XaAssets {
+        form1: XaFormAsset {
+            path: format!(
+                "{base}.{}",
+                if assets.form1_framing.is_some() {
+                    "F1"
+                } else {
+                    "F1S"
+                }
+            ),
+            sha1: None,
+            framing: assets.form1_framing.clone(),
+        },
+        form2: XaFormAsset {
+            path: format!(
+                "{base}.{}",
+                if assets.form2_framing.is_some() {
+                    "F2"
+                } else {
+                    "F2S"
+                }
+            ),
+            sha1: None,
+            framing: assets.form2_framing.clone(),
+        },
+        index: assets.index.as_ref().map(|_| HostAsset {
+            path: format!("{base}.I"),
+            sha1: None,
+        }),
+        interleave: assets.interleave.clone(),
+        gap_overrides: assets.gap_overrides.clone(),
+    }
+}
+
+fn xa_asset_paths(assets: &XaAssets) -> impl Iterator<Item = &str> {
+    [assets.form1.path.as_str(), assets.form2.path.as_str()]
+        .into_iter()
+        .chain(assets.index.iter().map(|asset| asset.path.as_str()))
 }
 
 fn detect_metadata_subheader(
@@ -1926,63 +2902,27 @@ fn append_detected_gap(
 
     let ordinal = detected.xa_extent_ranges.len();
     let base = format!("{manifest_stem}.unreferenced.{ordinal:03}");
-    let paths = XaAssets {
-        form1: HostAsset {
-            path: format!("{base}.XA1"),
-            sha1: None,
-        },
-        form2: HostAsset {
-            path: format!("{base}.XA2"),
-            sha1: None,
-        },
-        index: HostAsset {
-            path: format!("{base}.XAI"),
-            sha1: None,
-        },
-        gap_index: sectors[start..end]
-            .iter()
-            .any(|sector| sector.kind == Kind::XaGap)
-            .then(|| HostAsset {
-                path: format!("{base}.XAG"),
-                sha1: None,
-            }),
-    };
     let assets = demultiplex_xa_extent(&sectors[start..end], form2_edc)
         .with_context(|| format!("demultiplexing unreferenced XA extent at LBA {start}"))?;
+    let paths = name_xa_assets(&base, &assets);
     ensure!(
         detected
             .assets
             .insert(paths.form1.path.clone(), assets.form1)
             .is_none(),
-        "duplicate unreferenced XA1 asset path"
+        "duplicate unreferenced F1 asset path"
     );
     ensure!(
         detected
             .assets
             .insert(paths.form2.path.clone(), assets.form2)
             .is_none(),
-        "duplicate unreferenced XA2 asset path"
+        "duplicate unreferenced F2 asset path"
     );
-    ensure!(
-        detected
-            .assets
-            .insert(paths.index.path.clone(), assets.form2_index)
-            .is_none(),
-        "duplicate unreferenced XAI asset path"
-    );
-    if let Some(asset) = &paths.gap_index {
-        ensure!(!assets.gap_index.is_empty(), "prepared XAG asset is empty");
+    if let (Some(asset), Some(data)) = (&paths.index, assets.index) {
         ensure!(
-            detected
-                .assets
-                .insert(asset.path.clone(), assets.gap_index)
-                .is_none(),
-            "duplicate unreferenced XAG asset path"
-        );
-    } else {
-        ensure!(
-            assets.gap_index.is_empty(),
-            "missing unreferenced XAG asset path"
+            detected.assets.insert(asset.path.clone(), data).is_none(),
+            "duplicate unreferenced I asset path"
         );
     }
     detected.items.push(FileLayoutItem::xa_extent(paths));
@@ -2559,8 +3499,12 @@ pub fn extract_with_options(
         detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_mode2_2336_file_lengths(content_end, &mut parsed_iso)?;
         detach_overlapping_xa_files(&sectors[..content_end], &mut parsed_iso)?;
-        indexed_assets_by_path =
-            prepare_xa_sidecars(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
+        indexed_assets_by_path = prepare_xa_sidecars(
+            &sectors[..content_end],
+            &mut parsed_iso,
+            &redump_ranges,
+            form2_edc,
+        )?;
         let indexed_paths = indexed_assets_by_path
             .keys()
             .cloned()
@@ -2646,26 +3590,17 @@ pub fn extract_with_options(
             for (path, data) in [
                 (paths.form1.path.clone(), assets.form1),
                 (paths.form2.path.clone(), assets.form2),
-                (paths.index.path.clone(), assets.form2_index),
             ] {
                 ensure!(
                     extracted_files.insert(path.clone(), data).is_none(),
                     "duplicate extraction asset path {path}"
                 );
             }
-            if let Some(asset) = &paths.gap_index {
-                ensure!(!assets.gap_index.is_empty(), "prepared XAG asset is empty");
+            if let (Some(asset), Some(data)) = (&paths.index, assets.index) {
                 ensure!(
-                    extracted_files
-                        .insert(asset.path.clone(), assets.gap_index)
-                        .is_none(),
+                    extracted_files.insert(asset.path.clone(), data).is_none(),
                     "duplicate extraction asset path {}",
                     asset.path
-                );
-            } else {
-                ensure!(
-                    assets.gap_index.is_empty(),
-                    "missing prepared XAG asset path"
                 );
             }
         } else {
@@ -3920,15 +4855,10 @@ pub fn build_with_options(
         let file = layout_file.path.as_str();
         let entry = entries_by_path[file];
         if let Some(xa_assets) = &layout_file.xa_assets {
-            let mut assets = Vec::new();
-            for (asset, label) in [
-                (&xa_assets.form1, "XA1"),
-                (&xa_assets.form2, "XA2"),
-                (&xa_assets.index, "XAI"),
-            ] {
-                let path = asset.path.as_str();
+            validate_xa_assets(xa_assets)?;
+            let mut read_asset = |path: &str, sha1: Option<&str>, label: &str| -> Result<Vec<u8>> {
                 ensure!(
-                    secondary_paths.insert(path),
+                    secondary_paths.insert(path.to_owned()),
                     "duplicate XA secondary asset path {path}"
                 );
                 ensure!(
@@ -3944,38 +4874,19 @@ pub fn build_with_options(
                     Sha1Target::Asset {
                         path: path.to_owned(),
                     },
-                    asset.sha1.as_deref(),
+                    sha1,
                     &data,
                 );
-                assets.push(data);
-            }
-            let gap_index = if let Some(asset) = &xa_assets.gap_index {
-                let path = asset.path.as_str();
-                ensure!(
-                    secondary_paths.insert(path),
-                    "duplicate XA secondary asset path {path}"
-                );
-                ensure!(
-                    path != system_area.path,
-                    "XA secondary asset path collides with the system asset: {path}"
-                );
-                let host_path = safe_join(data_dir, path)?;
-                validate_input_file(&host_path, "XAG")?;
-                let data = fs::read(&host_path)
-                    .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
-                record_sha1_mismatch(
-                    &mut sha1_mismatches,
-                    Sha1Target::Asset {
-                        path: path.to_owned(),
-                    },
-                    asset.sha1.as_deref(),
-                    &data,
-                );
-                data
-            } else {
-                Vec::new()
+                Ok(data)
             };
-            let sectors = multiplex_xa_extent(&assets[0], &assets[1], &assets[2], &gap_index)
+            let form1 = read_asset(&xa_assets.form1.path, xa_assets.form1.sha1.as_deref(), "F1")?;
+            let form2 = read_asset(&xa_assets.form2.path, xa_assets.form2.sha1.as_deref(), "F2")?;
+            let index = xa_assets
+                .index
+                .as_ref()
+                .map(|asset| read_asset(&asset.path, asset.sha1.as_deref(), "I"))
+                .transpose()?;
+            let sectors = multiplex_xa_extent(xa_assets, &form1, &form2, index.as_deref())
                 .with_context(|| format!("multiplexing {file}"))?;
             let logical_length = entry
                 .xa
@@ -4010,15 +4921,10 @@ pub fn build_with_options(
         }
     }
     for assets in iso.layout.iter().filter_map(FileLayoutItem::as_xa_extent) {
-        let mut data = Vec::new();
-        for (asset, label) in [
-            (&assets.form1, "XA1"),
-            (&assets.form2, "XA2"),
-            (&assets.index, "XAI"),
-        ] {
-            let path = asset.path.as_str();
+        validate_xa_assets(assets)?;
+        let mut read_asset = |path: &str, sha1: Option<&str>, label: &str| -> Result<Vec<u8>> {
             ensure!(
-                secondary_paths.insert(path),
+                secondary_paths.insert(path.to_owned()),
                 "duplicate XA secondary asset path {path}"
             );
             ensure!(
@@ -4034,58 +4940,36 @@ pub fn build_with_options(
                 Sha1Target::Asset {
                     path: path.to_owned(),
                 },
-                asset.sha1.as_deref(),
+                sha1,
                 &bytes,
             );
-            data.push(bytes);
-        }
-        let gap_index = if let Some(asset) = &assets.gap_index {
-            let path = asset.path.as_str();
-            ensure!(
-                secondary_paths.insert(path),
-                "duplicate XA secondary asset path {path}"
-            );
-            ensure!(
-                path != system_area.path,
-                "XA secondary asset path collides with the system asset: {path}"
-            );
-            let host_path = safe_join(data_dir, path)?;
-            validate_input_file(&host_path, "XAG")?;
-            let data = fs::read(&host_path)
-                .with_context(|| format!("reading XAG asset {}", host_path.display()))?;
-            record_sha1_mismatch(
-                &mut sha1_mismatches,
-                Sha1Target::Asset {
-                    path: path.to_owned(),
-                },
-                asset.sha1.as_deref(),
-                &data,
-            );
-            data
-        } else {
-            Vec::new()
+            Ok(bytes)
         };
-        let sectors =
-            multiplex_xa_extent(&data[0], &data[1], &data[2], &gap_index).with_context(|| {
-                format!("multiplexing unreferenced XA extent {}", assets.index.path)
-            })?;
+        let form1 = read_asset(&assets.form1.path, assets.form1.sha1.as_deref(), "F1")?;
+        let form2 = read_asset(&assets.form2.path, assets.form2.sha1.as_deref(), "F2")?;
+        let index = assets
+            .index
+            .as_ref()
+            .map(|asset| read_asset(&asset.path, asset.sha1.as_deref(), "I"))
+            .transpose()?;
+        let key = assets.form1.path.clone();
+        let sectors = multiplex_xa_extent(assets, &form1, &form2, index.as_deref())
+            .with_context(|| format!("multiplexing unreferenced XA extent {key}"))?;
         ensure!(!sectors.is_empty(), "unreferenced XA extent is empty");
         ensure!(
             file_lengths
                 .insert(
-                    assets.index.path.clone(),
+                    key.clone(),
                     u64::try_from(sectors.len())? * LOGICAL_BLOCK_SIZE as u64,
                 )
                 .is_none(),
             "duplicate layout data key {}",
-            assets.index.path
+            key
         );
         ensure!(
-            unreferenced_extents
-                .insert(assets.index.path.clone(), sectors)
-                .is_none(),
+            unreferenced_extents.insert(key.clone(), sectors).is_none(),
             "duplicate unreferenced XA extent {}",
-            assets.index.path
+            key
         );
     }
     let metadata_gap_kind = match manifest.track.mode {
@@ -4503,24 +5387,16 @@ fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
         match item {
             FileLayoutItem::Path(file) => {
                 if let Some(xa) = &file.xa_assets {
-                    paths.extend(
-                        [&xa.form1, &xa.form2, &xa.index]
-                            .into_iter()
-                            .chain(xa.gap_index.iter())
-                            .map(|asset| asset.path.clone()),
-                    );
+                    paths.extend([xa.form1.path.clone(), xa.form2.path.clone()]);
+                    paths.extend(xa.index.iter().map(|asset| asset.path.clone()));
                 } else {
                     paths.push(file.source.clone().unwrap_or_else(|| file.path.clone()));
                 }
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &item.xa_extent;
-                paths.extend(
-                    [&xa.form1, &xa.form2, &xa.index]
-                        .into_iter()
-                        .chain(xa.gap_index.iter())
-                        .map(|asset| asset.path.clone()),
-                );
+                paths.extend([xa.form1.path.clone(), xa.form2.path.clone()]);
+                paths.extend(xa.index.iter().map(|asset| asset.path.clone()));
             }
             FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
         }
@@ -4549,10 +5425,17 @@ fn numbered_asset_family(path: &str) -> Result<(String, String, u64)> {
 }
 
 fn numbered_asset_path(parent: &str, stem: &str, number: u64) -> String {
+    let numbered = [".F1S", ".F2S", ".F1", ".F2", ".I"]
+        .into_iter()
+        .find_map(|suffix| {
+            stem.strip_suffix(suffix)
+                .map(|base| format!("{base}.{number}{suffix}"))
+        })
+        .unwrap_or_else(|| format!("{stem}.{number}"));
     if parent.is_empty() {
-        format!("{stem}.{number}")
+        numbered
     } else {
-        format!("{parent}/{stem}.{number}")
+        format!("{parent}/{numbered}")
     }
 }
 
@@ -4744,9 +5627,9 @@ fn plan_extraction_outputs(
                         unreachable!("snapshot preserves file layout kind")
                     };
                     let xa = item.xa_assets.as_mut().expect("snapshot has XA assets");
-                    for asset in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
+                    for path in [&mut xa.form1.path, &mut xa.form2.path] {
                         resolve_mapped_extraction_asset(
-                            &mut asset.path,
+                            path,
                             assets,
                             data_dir,
                             overwrite,
@@ -4755,7 +5638,7 @@ fn plan_extraction_outputs(
                             &mut writes,
                         )?;
                     }
-                    if let Some(asset) = &mut xa.gap_index {
+                    if let Some(asset) = &mut xa.index {
                         resolve_mapped_extraction_asset(
                             &mut asset.path,
                             assets,
@@ -4789,9 +5672,9 @@ fn plan_extraction_outputs(
                     unreachable!("snapshot preserves file layout kind")
                 };
                 let xa = &mut item.xa_extent;
-                for asset in [&mut xa.form1, &mut xa.form2, &mut xa.index] {
+                for path in [&mut xa.form1.path, &mut xa.form2.path] {
                     resolve_mapped_extraction_asset(
-                        &mut asset.path,
+                        path,
                         assets,
                         data_dir,
                         overwrite,
@@ -4800,7 +5683,7 @@ fn plan_extraction_outputs(
                         &mut writes,
                     )?;
                 }
-                if let Some(asset) = &mut xa.gap_index {
+                if let Some(asset) = &mut xa.index {
                     resolve_mapped_extraction_asset(
                         &mut asset.path,
                         assets,
@@ -4952,15 +5835,10 @@ fn validate_optional_sha1(value: Option<&str>, label: &str) -> Result<()> {
 }
 
 fn validate_xa_asset_hashes(xa: &XaAssets, owner: &str) -> Result<()> {
-    for (asset, label) in [
-        (&xa.form1, "form1 sha1"),
-        (&xa.form2, "form2 sha1"),
-        (&xa.index, "index sha1"),
-    ] {
-        validate_optional_sha1(asset.sha1.as_deref(), &format!("{owner} {label}"))?;
-    }
-    if let Some(asset) = &xa.gap_index {
-        validate_optional_sha1(asset.sha1.as_deref(), &format!("{owner} gap_index sha1"))?;
+    validate_optional_sha1(xa.form1.sha1.as_deref(), &format!("{owner} form1 sha1"))?;
+    validate_optional_sha1(xa.form2.sha1.as_deref(), &format!("{owner} form2 sha1"))?;
+    if let Some(asset) = &xa.index {
+        validate_optional_sha1(asset.sha1.as_deref(), &format!("{owner} index sha1"))?;
     }
     Ok(())
 }
@@ -5046,13 +5924,10 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
         match item {
             FileLayoutItem::Path(file) => {
                 if let Some(xa) = &file.xa_assets {
-                    for (asset, label) in
-                        [(&xa.form1, "XA1"), (&xa.form2, "XA2"), (&xa.index, "XAI")]
-                    {
-                        register(&asset.path, &format!("{} {label}", file.path))?;
-                    }
-                    if let Some(asset) = &xa.gap_index {
-                        register(&asset.path, &format!("{} XAG", file.path))?;
+                    register(&xa.form1.path, &format!("{} F1", file.path))?;
+                    register(&xa.form2.path, &format!("{} F2", file.path))?;
+                    if let Some(asset) = &xa.index {
+                        register(&asset.path, &format!("{} I", file.path))?;
                     }
                 } else {
                     register(
@@ -5063,11 +5938,10 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &item.xa_extent;
-                for (asset, label) in [(&xa.form1, "XA1"), (&xa.form2, "XA2"), (&xa.index, "XAI")] {
-                    register(&asset.path, &format!("unreferenced {label}"))?;
-                }
-                if let Some(asset) = &xa.gap_index {
-                    register(&asset.path, "unreferenced XAG")?;
+                register(&xa.form1.path, "unreferenced F1")?;
+                register(&xa.form2.path, "unreferenced F2")?;
+                if let Some(asset) = &xa.index {
+                    register(&asset.path, "unreferenced I")?;
                 }
             }
             FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
@@ -5121,6 +5995,15 @@ fn set_host_asset_sha1(
     set_extracted_asset_sha1(&path, &mut asset.sha1, assets, hashed_paths)
 }
 
+fn set_xa_form_asset_sha1(
+    asset: &mut XaFormAsset,
+    assets: &HashMap<String, Vec<u8>>,
+    hashed_paths: &mut HashSet<String>,
+) -> Result<()> {
+    let path = asset.path.clone();
+    set_extracted_asset_sha1(&path, &mut asset.sha1, assets, hashed_paths)
+}
+
 fn add_extracted_hashes(
     manifest: &mut Manifest,
     source_sha1: &str,
@@ -5142,10 +6025,9 @@ fn add_extracted_hashes(
         match item {
             FileLayoutItem::Path(file) => {
                 if let Some(xa) = &mut file.xa_assets {
-                    set_host_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
-                    set_host_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
-                    set_host_asset_sha1(&mut xa.index, assets, &mut hashed_paths)?;
-                    if let Some(asset) = &mut xa.gap_index {
+                    set_xa_form_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
+                    set_xa_form_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
+                    if let Some(asset) = &mut xa.index {
                         set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
                     }
                 } else {
@@ -5155,10 +6037,9 @@ fn add_extracted_hashes(
             }
             FileLayoutItem::XaExtent(item) => {
                 let xa = &mut item.xa_extent;
-                set_host_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
-                set_host_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
-                set_host_asset_sha1(&mut xa.index, assets, &mut hashed_paths)?;
-                if let Some(asset) = &mut xa.gap_index {
+                set_xa_form_asset_sha1(&mut xa.form1, assets, &mut hashed_paths)?;
+                set_xa_form_asset_sha1(&mut xa.form2, assets, &mut hashed_paths)?;
+                if let Some(asset) = &mut xa.index {
                     set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
                 }
             }
@@ -5206,12 +6087,21 @@ mod tests {
         }
     }
 
-    fn xa_assets(form1: &str, form2: &str, index: &str, gap_index: Option<&str>) -> XaAssets {
+    fn xa_assets(form1: &str, form2: &str, index: &str) -> XaAssets {
         XaAssets {
-            form1: host_asset(form1),
-            form2: host_asset(form2),
-            index: host_asset(index),
-            gap_index: gap_index.map(host_asset),
+            form1: XaFormAsset {
+                path: form1.to_owned(),
+                sha1: None,
+                framing: None,
+            },
+            form2: XaFormAsset {
+                path: form2.to_owned(),
+                sha1: None,
+                framing: None,
+            },
+            index: Some(host_asset(index)),
+            interleave: None,
+            gap_overrides: Vec::new(),
         }
     }
 
@@ -5856,17 +6746,30 @@ mod tests {
                 .enumerate()
                 .filter_map(|(index, form2)| form2.then_some(u32::try_from(index).unwrap()))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                parse_xa_index(&assets.form2_index).unwrap(),
-                expected_indices
-            );
-            assert!(assets.gap_index.is_empty());
+            let manifest = name_xa_assets("FILE", &assets);
+            let actual_positions = if let Some(index) = &assets.index {
+                parse_xa_index(index).unwrap()
+            } else {
+                resolve_xa_positions(
+                    &manifest,
+                    None,
+                    sectors
+                        .iter()
+                        .filter(|sector| sector.kind == Kind::Form1)
+                        .count(),
+                    expected_indices.len(),
+                )
+                .unwrap()
+                .form2
+            };
+            assert_eq!(actual_positions, expected_indices);
+            assert!(assets.gap_overrides.is_empty());
 
             let reconstructed = multiplex_xa_extent(
+                &manifest,
                 &assets.form1,
                 &assets.form2,
-                &assets.form2_index,
-                &assets.gap_index,
+                assets.index.as_deref(),
             )
             .unwrap();
             for (expected, actual) in sectors.iter().zip(reconstructed) {
@@ -5912,15 +6815,20 @@ mod tests {
         let sectors = parse_image(&semantic).unwrap().1;
         let assets = demultiplex_xa_extent(&sectors, true).unwrap();
 
-        assert_eq!(parse_xa_index(&assets.form2_index).unwrap(), vec![0, 2]);
-        assert_eq!(assets.form1.len(), XA_FORM1_RECORD_SIZE);
-        assert!(assets.form1[8..].iter().all(|byte| *byte == 0));
+        let manifest = name_xa_assets("FILE", &assets);
+        let positions = resolve_xa_positions(&manifest, assets.index.as_deref(), 1, 2).unwrap();
+        assert_eq!(positions.form2, vec![0, 2]);
+        assert!(
+            assets.form1.len() == XA_FORM1_RECORD_SIZE || assets.form1.len() == LOGICAL_BLOCK_SIZE
+        );
+        let payload_offset = assets.form1.len() - LOGICAL_BLOCK_SIZE;
+        assert!(assets.form1[payload_offset..].iter().all(|byte| *byte == 0));
         assert_eq!(
             multiplex_xa_extent(
+                &manifest,
                 &assets.form1,
                 &assets.form2,
-                &assets.form2_index,
-                &assets.gap_index,
+                assets.index.as_deref(),
             )
             .unwrap()
             .len(),
@@ -5940,13 +6848,21 @@ mod tests {
         ];
 
         let assets = demultiplex_xa_extent(&sectors, true).unwrap();
-        assert_eq!(parse_xa_gap_index(&assets.gap_index).unwrap(), vec![1]);
+        assert_eq!(
+            assets.gap_overrides,
+            vec![XaPositionSpan {
+                start: 1,
+                stride: 1,
+                count: 1
+            }]
+        );
+        let manifest = name_xa_assets("FILE", &assets);
         assert_eq!(
             multiplex_xa_extent(
+                &manifest,
                 &assets.form1,
                 &assets.form2,
-                &assets.form2_index,
-                &assets.gap_index,
+                assets.index.as_deref(),
             )
             .unwrap(),
             vec![
@@ -5965,6 +6881,150 @@ mod tests {
         );
     }
 
+    fn clean_xa_sector(
+        form2: bool,
+        file: u8,
+        channel: u8,
+        marker: u8,
+    ) -> crate::raw_cd::ParsedSector {
+        let subheader = XaSubheader {
+            file_number: file,
+            channel,
+            submode: if form2 {
+                XaSubmode::FORM2
+            } else {
+                XaSubmode::DATA
+            },
+            coding_info: 0,
+        };
+        let mut writer = SectorWriter::new();
+        let raw = if form2 {
+            writer
+                .form2(150, subheader, &[marker; FORM2_PAYLOAD_SIZE], true)
+                .unwrap()
+        } else {
+            writer
+                .form1(150, subheader, &[marker; LOGICAL_BLOCK_SIZE])
+                .unwrap()
+        };
+        parse_image(&raw).unwrap().1.remove(0)
+    }
+
+    #[test]
+    fn clean_channel_padding_eliminates_the_gap_asset_structurally() {
+        let mut sectors = Vec::new();
+        for position in 0..64 {
+            sectors.push(if position % 8 == 0 && position < 32 {
+                clean_xa_sector(true, 1, 2, position as u8)
+            } else if position % 8 <= 1 && (position % 8 == 1 || position >= 32) {
+                parsed_xa_gap_sector()
+            } else {
+                clean_xa_sector(false, 0, 0, position as u8)
+            });
+        }
+
+        let assets = demultiplex_xa_extent(&sectors, true).unwrap();
+        assert!(assets.index.is_none());
+        assert!(assets.gap_overrides.is_empty());
+        assert!(matches!(
+            &assets.form2_framing,
+            Some(XaFraming::Detailed(XaFramingSettings {
+                policy: XaFramingPolicy::Phase,
+                ..
+            }))
+        ));
+        let interleave = assets.interleave.as_ref().unwrap();
+        assert_eq!((interleave.stride, interleave.cycles), (Some(8), Some(8)));
+        assert!(interleave.channels.iter().any(|channel| {
+            channel.file == Some(1)
+                && channel.channel == Some(2)
+                && channel.end_cycle == Some(4)
+                && channel.after_end == Some(XaPadding::XaGap)
+        }));
+        assert!(
+            interleave.channels.iter().any(|channel| {
+                channel.phase == Some(1) && channel.fill == Some(XaPadding::XaGap)
+            })
+        );
+
+        let manifest = name_xa_assets("CLEAN", &assets);
+        let rebuilt = multiplex_xa_extent(
+            &manifest,
+            &assets.form1,
+            &assets.form2,
+            assets.index.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.len(), sectors.len());
+    }
+
+    #[test]
+    fn form_copy_mismatches_select_stored_framing_independently() {
+        let cases = [(false, false), (false, true), (true, false), (true, true)];
+        for (form1_mismatch, form2_mismatch) in cases {
+            let mut form1 = clean_xa_sector(false, 0, 0, 1);
+            let mut form2 = clean_xa_sector(true, 1, 2, 2);
+            if form1_mismatch {
+                form1.subheader_copy.channel = 7;
+            }
+            if form2_mismatch {
+                form2.subheader_copy.channel = 7;
+            }
+            let assets = demultiplex_xa_extent(&[form1, form2], true).unwrap();
+            assert_eq!(assets.form1_framing.is_none(), form1_mismatch);
+            assert_eq!(assets.form2_framing.is_none(), form2_mismatch);
+            assert_eq!(
+                assets.form1.len(),
+                if form1_mismatch {
+                    XA_FORM1_RECORD_SIZE
+                } else {
+                    LOGICAL_BLOCK_SIZE
+                }
+            );
+            assert_eq!(
+                assets.form2.len(),
+                if form2_mismatch {
+                    XA_FORM2_RECORD_SIZE
+                } else {
+                    FORM2_PAYLOAD_SIZE
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn xa_asset_suffixes_and_position_sources_are_strict() {
+        let mut assets = XaAssets {
+            form1: XaFormAsset {
+                path: "FILE.F1".to_owned(),
+                sha1: None,
+                framing: Some(XaFraming::Named(XaFramingPolicy::ChannelOrGeneric)),
+            },
+            form2: XaFormAsset {
+                path: "FILE.F2S".to_owned(),
+                sha1: None,
+                framing: None,
+            },
+            index: Some(host_asset("FILE.I")),
+            interleave: None,
+            gap_overrides: Vec::new(),
+        };
+        validate_xa_assets(&assets).unwrap();
+        assets.form1.path = "FILE.XA1".to_owned();
+        assert!(validate_xa_assets(&assets).is_err());
+        assets.form1.path = "FILE.F1".to_owned();
+        assets.interleave = Some(XaInterleave {
+            stride: None,
+            cycles: None,
+            tail_slots: 0,
+            channels: Vec::new(),
+        });
+        assert!(validate_xa_assets(&assets).is_err());
+        assets.interleave = None;
+        assets.index.as_mut().unwrap().path = "FILE.XAI".to_owned();
+        assert!(validate_xa_assets(&assets).is_err());
+    }
+
     #[test]
     fn explicit_xa_assets_can_describe_an_extent_with_omitted_attributes() {
         let mut manifest = test_manifest();
@@ -5975,7 +7035,7 @@ mod tests {
         set_indexed_assets(
             &mut manifest,
             "FILE.BIN",
-            xa_assets("FILE.BIN.XA1", "FILE.BIN.XA2", "FILE.BIN.XAI", None),
+            xa_assets("FILE.BIN.F1S", "FILE.BIN.F2S", "FILE.BIN.I"),
         );
 
         iso9660::validate(manifest.iso9660.as_ref().unwrap()).unwrap();
@@ -5987,13 +7047,12 @@ mod tests {
         sectors[17] = parsed_xa_sector(true, 1);
         let mut parsed = parsed_iso();
 
-        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[], true).unwrap();
 
         let xa = &assets["FILE.BIN"];
-        assert_eq!(xa.form1.path, "FILE.BIN.XA1");
-        assert_eq!(xa.form2.path, "FILE.BIN.XA2");
-        assert_eq!(xa.index.path, "FILE.BIN.XAI");
-        assert_eq!(xa.gap_index, None);
+        assert!(xa.form1.path.ends_with(".F1") || xa.form1.path.ends_with(".F1S"));
+        assert!(xa.form2.path.ends_with(".F2") || xa.form2.path.ends_with(".F2S"));
+        assert!(xa.index.is_some() || xa.interleave.is_some());
     }
 
     #[test]
@@ -6004,12 +7063,11 @@ mod tests {
         let mut parsed = parsed_iso();
         parsed.files[0].length = 1;
 
-        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[], true).unwrap();
 
         let xa = &assets["FILE.BIN"];
-        assert_eq!(xa.form1.path, "FILE.BIN.XA1");
-        assert_eq!(xa.form2.path, "FILE.BIN.XA2");
-        assert_eq!(xa.index.path, "FILE.BIN.XAI");
+        assert_eq!(xa.form1.path, "FILE.BIN.F1S");
+        assert!(xa.form2.path.ends_with(".F2"));
         assert_eq!(
             parsed.manifest.entries[1]
                 .xa
@@ -6053,7 +7111,7 @@ mod tests {
 
         detect_mode2_2336_file_lengths(sectors.len(), &mut parsed).unwrap();
         detach_overlapping_xa_files(&sectors, &mut parsed).unwrap();
-        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[]).unwrap();
+        let assets = prepare_xa_sidecars(&sectors, &mut parsed, &[], true).unwrap();
 
         assert_eq!(
             parsed
@@ -6069,28 +7127,56 @@ mod tests {
         let xa = parsed.manifest.entries[1].xa.as_ref().unwrap();
         assert_eq!(xa.length_encoding, XaLengthEncoding::Mode2_2336);
         assert_eq!(xa.logical_length, None);
-        assert_eq!(assets["FILE.BIN"].index.path, "FILE.BIN.XAI");
+        assert!(assets["FILE.BIN"].index.is_some() || assets["FILE.BIN"].interleave.is_some());
     }
 
     #[test]
     fn indexed_xa_assets_reject_malformed_records_and_positions() {
-        assert!(parse_xa_form1_records(&[0; XA_FORM1_RECORD_SIZE - 1]).is_err());
-        assert!(parse_xa_form2_records(&[0; XA_FORM2_RECORD_SIZE - 1]).is_err());
+        let form1_asset = XaFormAsset {
+            path: "FILE.F1S".to_owned(),
+            sha1: None,
+            framing: None,
+        };
+        let form2_asset = XaFormAsset {
+            path: "FILE.F2S".to_owned(),
+            sha1: None,
+            framing: None,
+        };
+        let resolved = ResolvedXaPositions::default();
+        assert!(
+            parse_xa_form1_records(&[0; XA_FORM1_RECORD_SIZE - 1], &form1_asset, &[], &resolved)
+                .is_err()
+        );
+        assert!(
+            parse_xa_form2_records(&[0; XA_FORM2_RECORD_SIZE - 1], &form2_asset, &[], &resolved)
+                .is_err()
+        );
         assert!(parse_xa_index(&[0; 3]).is_err());
         assert!(parse_xa_index(&encode_xa_index(&[1, 1])).is_err());
         assert!(parse_xa_index(&encode_xa_index(&[2, 1])).is_err());
 
-        let form1 = encode_xa_form1_record(&parsed_xa_sector(false, 1)).unwrap();
-        let form2 = encode_xa_form2_record(&parsed_xa_sector(true, 2)).unwrap();
-        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[]), &[]).is_err());
-        assert!(multiplex_xa_extent(&form1, &form2, &encode_xa_index(&[2]), &[]).is_err());
+        let form1 = encode_xa_form1_record(&parsed_xa_sector(false, 1), true).unwrap();
+        let form2 = encode_xa_form2_record(&parsed_xa_sector(true, 2), true).unwrap();
+        let manifest = XaAssets {
+            form1: form1_asset.clone(),
+            form2: form2_asset.clone(),
+            index: Some(host_asset("FILE.I")),
+            interleave: None,
+            gap_overrides: Vec::new(),
+        };
+        assert!(
+            multiplex_xa_extent(&manifest, &form1, &form2, Some(&encode_xa_index(&[]))).is_err()
+        );
+        assert!(
+            multiplex_xa_extent(&manifest, &form1, &form2, Some(&encode_xa_index(&[2]))).is_err()
+        );
 
         let mut wrong_form1 = form1;
         wrong_form1[2] |= XaSubmode::FORM2.bits();
-        assert!(parse_xa_form1_records(&wrong_form1).is_err());
+        assert!(parse_xa_form1_records(&wrong_form1, &form1_asset, &[0], &resolved).is_err());
         let mut wrong_form2 = form2;
         wrong_form2[2] &= !XaSubmode::FORM2.bits();
-        assert!(parse_xa_form2_records(&wrong_form2).is_err());
+        assert!(parse_xa_form2_records(&wrong_form2, &form2_asset, &[0], &resolved).is_err());
     }
 
     #[test]
@@ -7268,7 +8354,7 @@ mod tests {
         set_indexed_assets(
             &mut manifest,
             "FILE.BIN",
-            xa_assets("FILE.BIN.XA1", "FILE.BIN.XA2", "FILE.BIN.XAI", None),
+            xa_assets("FILE.BIN.F1S", "FILE.BIN.F2S", "FILE.BIN.I"),
         );
         assert_eq!(
             validate_manifest_hashes(&manifest).unwrap_err().to_string(),
@@ -7284,10 +8370,9 @@ mod tests {
             .unwrap()
             .layout
             .push(FileLayoutItem::xa_extent(xa_assets(
-                "EXTRA.XA1",
-                "EXTRA.XA2",
-                "EXTRA.XAI",
-                None,
+                "EXTRA.F1S",
+                "EXTRA.F2S",
+                "EXTRA.I",
             )));
         let extra = manifest
             .iso9660
@@ -7318,12 +8403,7 @@ mod tests {
         set_indexed_assets(
             &mut manifest,
             "FILE.BIN",
-            xa_assets(
-                "FILE.BIN.XA1",
-                "FILE.BIN.XA2",
-                "FILE.BIN.XAI",
-                Some("FILE.BIN.XAG"),
-            ),
+            xa_assets("FILE.BIN.F1S", "FILE.BIN.F2S", "FILE.BIN.I"),
         );
         manifest
             .iso9660
@@ -7331,21 +8411,18 @@ mod tests {
             .unwrap()
             .layout
             .push(FileLayoutItem::xa_extent(xa_assets(
-                "EXTRA.XA1",
-                "EXTRA.XA2",
-                "EXTRA.XAI",
-                Some("EXTRA.XAG"),
+                "EXTRA.F1S",
+                "EXTRA.F2S",
+                "EXTRA.I",
             )));
         let assets = [
             ("ORDINARY.BIN", vec![1]),
-            ("FILE.BIN.XA1", Vec::new()),
-            ("FILE.BIN.XA2", vec![2]),
-            ("FILE.BIN.XAI", vec![3]),
-            ("FILE.BIN.XAG", vec![4]),
-            ("EXTRA.XA1", vec![5]),
-            ("EXTRA.XA2", vec![6]),
-            ("EXTRA.XAI", vec![7]),
-            ("EXTRA.XAG", vec![8]),
+            ("FILE.BIN.F1S", Vec::new()),
+            ("FILE.BIN.F2S", vec![2]),
+            ("FILE.BIN.I", vec![3]),
+            ("EXTRA.F1S", vec![5]),
+            ("EXTRA.F2S", vec![6]),
+            ("EXTRA.I", vec![7]),
         ]
         .into_iter()
         .map(|(path, bytes)| (path.to_owned(), bytes))
@@ -7369,8 +8446,7 @@ mod tests {
             Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
         );
         assert!(xa.form2.sha1.is_some());
-        assert!(xa.index.sha1.is_some());
-        assert!(xa.gap_index.as_ref().unwrap().sha1.is_some());
+        assert!(xa.index.as_ref().unwrap().sha1.is_some());
         if let FileLayoutItem::Path(file) = &manifest.iso9660.as_ref().unwrap().layout[1] {
             let expected = sha1_hex(&[1]);
             assert_eq!(file.sha1.as_deref(), Some(expected.as_str()));
@@ -7380,8 +8456,7 @@ mod tests {
         if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.as_ref().unwrap().layout[2] {
             assert!(item.xa_extent.form1.sha1.is_some());
             assert!(item.xa_extent.form2.sha1.is_some());
-            assert!(item.xa_extent.index.sha1.is_some());
-            assert!(item.xa_extent.gap_index.as_ref().unwrap().sha1.is_some());
+            assert!(item.xa_extent.index.as_ref().unwrap().sha1.is_some());
         } else {
             panic!("unreferenced asset is not an XA extent");
         }
@@ -7409,13 +8484,11 @@ mod tests {
             parsed_xa_sector(false, 3),
         ];
         let assets = demultiplex_xa_extent(&sectors, true).unwrap();
-        for (path, bytes) in [
-            ("FILE.XA1", &assets.form1),
-            ("FILE.XA2", &assets.form2),
-            ("FILE.XAI", &assets.form2_index),
-            ("FILE.XAG", &assets.gap_index),
-        ] {
-            fs::write(data_dir.join(path), bytes).unwrap();
+        let mut xa_manifest = name_xa_assets("FILE", &assets);
+        fs::write(data_dir.join(&xa_manifest.form1.path), &assets.form1).unwrap();
+        fs::write(data_dir.join(&xa_manifest.form2.path), &assets.form2).unwrap();
+        if let (Some(asset), Some(bytes)) = (&xa_manifest.index, &assets.index) {
+            fs::write(data_dir.join(&asset.path), bytes).unwrap();
         }
         let mut manifest = test_manifest();
         manifest.system_area.as_mut().unwrap().sha1 =
@@ -7427,28 +8500,14 @@ mod tests {
             )),
             ..crate::manifest::EntryXa::default()
         });
-        set_indexed_assets(
-            &mut manifest,
-            "FILE.BIN",
-            XaAssets {
-                form1: HostAsset {
-                    path: "FILE.XA1".to_owned(),
-                    sha1: Some(sha1_hex(&assets.form1)),
-                },
-                form2: HostAsset {
-                    path: "FILE.XA2".to_owned(),
-                    sha1: Some(sha1_hex(&assets.form2)),
-                },
-                index: HostAsset {
-                    path: "FILE.XAI".to_owned(),
-                    sha1: Some(sha1_hex(&assets.form2_index)),
-                },
-                gap_index: Some(HostAsset {
-                    path: "FILE.XAG".to_owned(),
-                    sha1: Some(sha1_hex(&assets.gap_index)),
-                }),
-            },
-        );
+        set_indexed_assets(&mut manifest, "FILE.BIN", {
+            xa_manifest.form1.sha1 = Some(sha1_hex(&assets.form1));
+            xa_manifest.form2.sha1 = Some(sha1_hex(&assets.form2));
+            if let (Some(asset), Some(bytes)) = (&mut xa_manifest.index, &assets.index) {
+                asset.sha1 = Some(sha1_hex(bytes));
+            }
+            xa_manifest
+        });
         let manifest_path = project.path().join("disc.yaml");
         fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
         let unchanged = build(
@@ -7531,12 +8590,36 @@ mod tests {
 
         let mut form1 = assets.form1.clone();
         form1[8] ^= 1;
-        fs::write(data_dir.join("FILE.XA1"), form1).unwrap();
+        fs::write(
+            data_dir.join(
+                &manifest.iso9660.as_ref().unwrap().layout[0]
+                    .as_path_item()
+                    .unwrap()
+                    .xa_assets
+                    .as_ref()
+                    .unwrap()
+                    .form1
+                    .path,
+            ),
+            form1,
+        )
+        .unwrap();
         let mut form2 = assets.form2.clone();
         form2[8] ^= 1;
-        fs::write(data_dir.join("FILE.XA2"), form2).unwrap();
-        fs::write(data_dir.join("FILE.XAI"), encode_xa_index(&[0])).unwrap();
-        fs::write(data_dir.join("FILE.XAG"), encode_xa_index(&[3])).unwrap();
+        fs::write(
+            data_dir.join(
+                &manifest.iso9660.as_ref().unwrap().layout[0]
+                    .as_path_item()
+                    .unwrap()
+                    .xa_assets
+                    .as_ref()
+                    .unwrap()
+                    .form2
+                    .path,
+            ),
+            form2,
+        )
+        .unwrap();
 
         let changed = build(
             &manifest_path,
@@ -7554,7 +8637,7 @@ mod tests {
                     Sha1Target::Track | Sha1Target::SystemArea { .. } => "unexpected",
                 })
                 .collect::<Vec<_>>(),
-            ["FILE.XA1", "FILE.XA2", "FILE.XAI", "FILE.XAG"]
+            ["FILE.F1S", "FILE.F2S"]
         );
     }
 
@@ -7949,7 +9032,7 @@ mod tests {
         set_indexed_assets(
             &mut manifest,
             "FILE.BIN",
-            xa_assets("FILE.XA1", "FILE.XA2", "FILE.XAI", Some("FILE.XAG")),
+            xa_assets("FILE.F1S", "FILE.F2S", "FILE.I"),
         );
         manifest
             .iso9660
@@ -7957,20 +9040,17 @@ mod tests {
             .unwrap()
             .layout
             .push(FileLayoutItem::xa_extent(xa_assets(
-                "EXTRA.XA1",
-                "EXTRA.XA2",
-                "EXTRA.XAI",
-                Some("EXTRA.XAG"),
+                "EXTRA.F1S",
+                "EXTRA.F2S",
+                "EXTRA.I",
             )));
         let mut assets = HashMap::from([
-            ("FILE.XA1".to_owned(), vec![1]),
-            ("FILE.XA2".to_owned(), vec![2]),
-            ("FILE.XAI".to_owned(), vec![3]),
-            ("FILE.XAG".to_owned(), Vec::new()),
-            ("EXTRA.XA1".to_owned(), vec![4]),
-            ("EXTRA.XA2".to_owned(), vec![5]),
-            ("EXTRA.XAI".to_owned(), vec![6]),
-            ("EXTRA.XAG".to_owned(), Vec::new()),
+            ("FILE.F1S".to_owned(), vec![1]),
+            ("FILE.F2S".to_owned(), vec![2]),
+            ("FILE.I".to_owned(), vec![3]),
+            ("EXTRA.F1S".to_owned(), vec![4]),
+            ("EXTRA.F2S".to_owned(), vec![5]),
+            ("EXTRA.I".to_owned(), vec![6]),
         ]);
         for path in extraction_asset_paths(&manifest).unwrap() {
             fs::write(project.path().join(path), b"different").unwrap();
@@ -7986,10 +9066,9 @@ mod tests {
             unreachable!()
         };
         let xa = file.xa_assets.as_ref().unwrap();
-        assert_eq!(xa.form1.path, "FILE.XA1.1");
-        assert_eq!(xa.form2.path, "FILE.XA2.1");
-        assert_eq!(xa.index.path, "FILE.XAI.1");
-        assert_eq!(xa.gap_index.as_ref().unwrap().path, "FILE.XAG.1");
+        assert_eq!(xa.form1.path, "FILE.1.F1S");
+        assert_eq!(xa.form2.path, "FILE.1.F2S");
+        assert_eq!(xa.index.as_ref().unwrap().path, "FILE.1.I");
         let extra = manifest
             .iso9660
             .as_ref()
@@ -7999,14 +9078,12 @@ mod tests {
             .unwrap()
             .as_xa_extent()
             .unwrap();
-        assert_eq!(extra.form1.path, "EXTRA.XA1.1");
-        assert_eq!(extra.form2.path, "EXTRA.XA2.1");
-        assert_eq!(extra.index.path, "EXTRA.XAI.1");
-        assert_eq!(extra.gap_index.as_ref().unwrap().path, "EXTRA.XAG.1");
+        assert_eq!(extra.form1.path, "EXTRA.1.F1S");
+        assert_eq!(extra.form2.path, "EXTRA.1.F2S");
+        assert_eq!(extra.index.as_ref().unwrap().path, "EXTRA.1.I");
         assert!(plan.system);
         assert_eq!(plan.assets.len(), assets.len());
-        assert!(assets.contains_key("FILE.XAG.1"));
-        assert!(assets["FILE.XAG.1"].is_empty());
+        assert!(assets.contains_key("FILE.1.F1S"));
     }
 
     #[test]
@@ -8132,7 +9209,7 @@ mod tests {
         set_indexed_assets(
             &mut manifest,
             "FILE.BIN",
-            xa_assets("FILE.XA1", "FILE.XA2", "FILE.XAI", None),
+            xa_assets("FILE.F1S", "FILE.F2S", "FILE.I"),
         );
         let FileLayoutItem::Path(file) = &mut manifest.iso9660.as_mut().unwrap().layout[0] else {
             panic!("expected path item")
