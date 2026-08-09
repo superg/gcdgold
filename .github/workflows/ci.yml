@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.97.1
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy --no-self-update
+
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all --check
+
+      - name: Run Clippy
+        run: cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.97.1 test --all-targets --all-features

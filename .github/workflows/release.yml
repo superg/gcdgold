@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.97.1
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+
+      - name: Validate tag and package version
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must have the form vX.Y.Z; got $tag" >&2
+            exit 1
+          fi
+
+          version="$(cargo +1.97.1 metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gcdgold") | .version')"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "Release tag $tag does not match Cargo package version $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            binary: target/x86_64-pc-windows-msvc/release/gcdgold.exe
+            pe_machine: "8664"
+          - target: i686-pc-windows-msvc
+            os: windows-2025
+            binary: target/i686-pc-windows-msvc/release/gcdgold.exe
+            pe_machine: "014c"
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            binary: target/x86_64-unknown-linux-musl/release/gcdgold
+            file_architecture: x86-64
+          - target: i686-unknown-linux-musl
+            os: ubuntu-24.04
+            binary: target/i686-unknown-linux-musl/release/gcdgold
+            file_architecture: Intel 80386
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            binary: target/x86_64-apple-darwin/release/gcdgold
+            file_architecture: x86_64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            binary: target/aarch64-apple-darwin/release/gcdgold
+            file_architecture: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.97.1
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install Linux cross-compilation toolchain
+        if: runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke-test and inspect Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="${{ matrix.binary }}"
+          "$binary" --version
+          file "$binary" | tee /dev/stderr | grep -F "${{ matrix.file_architecture }}"
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo "Linux release binary has a dynamic interpreter" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test and inspect macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          binary="${{ matrix.binary }}"
+          "$binary" --version
+          file "$binary" | tee /dev/stderr | grep -F "${{ matrix.file_architecture }}"
+
+      - name: Smoke-test and inspect Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "${{ matrix.binary }}"
+          & $binary --version
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expected = [System.Convert]::ToUInt16("${{ matrix.pe_machine }}", 16)
+          if ($machine -ne $expected) {
+            throw "Unexpected PE machine type 0x$($machine.ToString('x4')); expected 0x$($expected.ToString('x4'))"
+          }
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          zip -j "dist/gcdgold-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}.zip" "${{ matrix.binary }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -LiteralPath "${{ matrix.binary }}" -DestinationPath "dist/gcdgold-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}.zip"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release archives
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.zip)
+          if [[ ${#archives[@]} -ne 6 ]]; then
+            echo "Expected 6 release archives, found ${#archives[@]}" >&2
+            exit 1
+          fi
+
+          for archive in "${archives[@]}"; do
+            expected=gcdgold
+            if [[ "$archive" == *windows* ]]; then
+              expected=gcdgold.exe
+            fi
+            entries="$(unzip -Z1 "$archive")"
+            if [[ "$entries" != "$expected" ]]; then
+              echo "$archive must contain only $expected at its root; found: $entries" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.zip)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${archives[@]}" --clobber
+          else
+            gh release create "$TAG" "${archives[@]}" --verify-tag --generate-notes --title "gcdgold $VERSION"
+          fi
