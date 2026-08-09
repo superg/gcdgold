@@ -13,13 +13,14 @@ use crate::iso9660;
 use crate::manifest::{
     DirectorySlack, EntryReference, EntryReferenceKind, EntrySectorSubheader, FileGapItem,
     FileLayoutItem, Form1Asset, Form1LayoutItem, Form1Project, Form1Sectors, GCDGOLD_VERSION,
-    GapKind, GcdgoldMetadata, HostAsset, IsoMetadataSubheader, Manifest, MetadataSubheader,
-    MetadataVolume, PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS, SectorPatch,
-    SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing, SystemAreaSectorKind,
-    SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader, XaAssetSubheader, XaAssets,
-    XaAttributeFlag, XaChannelState, XaCycleSegment, XaEofPolicy, XaFormAsset, XaFraming,
-    XaFramingPolicy, XaFramingRun, XaFramingSettings, XaInterleave, XaInterleaveChannel,
-    XaLengthEncoding, XaPadding, XaPositionSpan, decode_sector_patch, serialize_manifest,
+    GapKind, GcdgoldMetadata, HostAsset, IsoMetadataSubheader, Manifest, MetadataPathTable,
+    MetadataSubheader, MetadataVolume, Mode1ReservedRun, PathTableSubheader, Redump0x55Run,
+    SYSTEM_AREA_SECTORS, SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
+    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
+    XaAssetSubheader, XaAssets, XaAttributeFlag, XaChannelState, XaCycleSegment, XaEofPolicy,
+    XaFormAsset, XaFraming, XaFramingPolicy, XaFramingRun, XaFramingSettings, XaInterleave,
+    XaInterleaveChannel, XaLengthEncoding, XaPadding, XaPositionSpan, decode_sector_patch,
+    serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorProtection,
@@ -188,6 +189,114 @@ fn detect_redump_0x55(raw: &[u8]) -> Vec<Redump0x55Run> {
         });
     }
     runs
+}
+
+fn detect_mode1_reserved(
+    sectors: &[crate::raw_cd::ParsedSector],
+    track_start_frame: u32,
+) -> Vec<Mode1ReservedRun> {
+    let track_start_lba = i64::from(track_start_frame) - 150;
+    let mut runs = Vec::new();
+    let mut run: Option<(usize, [u8; 8])> = None;
+    for (index, sector) in sectors.iter().enumerate() {
+        let reserved: [u8; 8] = sector.bytes[2068..2076]
+            .try_into()
+            .expect("fixed Mode 1 reserved field");
+        let value = matches!(sector.kind, Kind::Mode1 | Kind::Mode1Gap)
+            .then_some(reserved)
+            .filter(|bytes| bytes.iter().any(|byte| *byte != 0));
+        if run.as_ref().is_some_and(|(_, bytes)| Some(*bytes) != value) {
+            let (start, bytes) = run.take().expect("checked active run");
+            runs.push(Mode1ReservedRun {
+                lba: i32::try_from(track_start_lba + i64::try_from(start).expect("index fits i64"))
+                    .expect("CD LBA fits i32"),
+                sectors: u32::try_from(index - start).expect("run length fits u32"),
+                hex: hex::encode(bytes),
+            });
+        }
+        if run.is_none()
+            && let Some(bytes) = value
+        {
+            run = Some((index, bytes));
+        }
+    }
+    if let Some((start, bytes)) = run {
+        runs.push(Mode1ReservedRun {
+            lba: i32::try_from(track_start_lba + i64::try_from(start).expect("index fits i64"))
+                .expect("CD LBA fits i32"),
+            sectors: u32::try_from(sectors.len() - start).expect("run length fits u32"),
+            hex: hex::encode(bytes),
+        });
+    }
+    runs
+}
+
+fn validate_mode1_reserved_runs(
+    runs: &[Mode1ReservedRun],
+    mode: TrackMode,
+    redump_runs: &[Redump0x55Run],
+) -> Result<()> {
+    ensure!(
+        runs.is_empty() || mode == TrackMode::Mode1,
+        "mode1_reserved requires a Mode 1 track"
+    );
+    let mut previous_end = None;
+    for run in runs {
+        ensure!(run.sectors > 0, "Mode 1 reserved run must not be empty");
+        let bytes = hex::decode(&run.hex)
+            .with_context(|| format!("decoding Mode 1 reserved run at LBA {}", run.lba))?;
+        ensure!(
+            bytes.len() == 8 && bytes.iter().any(|byte| *byte != 0),
+            "Mode 1 reserved run at LBA {} must contain exactly 8 nonzero-authoritative bytes",
+            run.lba
+        );
+        let end = i64::from(run.lba) + i64::from(run.sectors);
+        if let Some(previous_end) = previous_end {
+            ensure!(
+                i64::from(run.lba) >= previous_end,
+                "Mode 1 reserved runs must be ordered and nonoverlapping"
+            );
+        }
+        ensure!(
+            !redump_runs.iter().any(|redump| {
+                i64::from(run.lba) < i64::from(redump.lba) + i64::from(redump.sectors)
+                    && i64::from(redump.lba) < end
+            }),
+            "Mode 1 reserved run at LBA {} overlaps a Redump 0x55 run",
+            run.lba
+        );
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+fn apply_mode1_reserved(
+    raw: &mut [u8],
+    track_start_frame: u32,
+    runs: &[Mode1ReservedRun],
+) -> Result<()> {
+    let track_start_lba = i64::from(track_start_frame) - 150;
+    for run in runs {
+        let bytes = hex::decode(&run.hex)?;
+        let start = i64::from(run.lba) - track_start_lba;
+        ensure!(start >= 0, "Mode 1 reserved run precedes the track");
+        let start = usize::try_from(start)?;
+        let end = start + usize::try_from(run.sectors)?;
+        ensure!(
+            end <= raw.len() / RAW_SECTOR_SIZE,
+            "Mode 1 reserved run at LBA {} extends outside the track",
+            run.lba
+        );
+        for index in start..end {
+            let sector = &mut raw[index * RAW_SECTOR_SIZE..(index + 1) * RAW_SECTOR_SIZE];
+            ensure!(
+                sector[15] == 1,
+                "Mode 1 reserved run names a non-Mode 1 sector"
+            );
+            sector[2068..2076].copy_from_slice(&bytes);
+        }
+    }
+    Ok(())
 }
 
 fn resolve_redump_0x55_ranges(
@@ -579,6 +688,7 @@ fn known_recovery_source(source_sha1: &str) -> bool {
             | "0ec8e3b093291ac7ce3af2bb62beda5228f09435"
             | "6bbfe335bc7be562f9f712f6a5ebfdf0e0b6d28b"
             | "b4d0f2628dc070a56f9651f22663efe07e854e6f"
+            | "0c48a60a88644dee7a4c706655eff99028ffbda3"
     )
 }
 
@@ -589,6 +699,42 @@ fn recover_known_corruption<'a>(source_sha1: &str, source: &'a [u8]) -> Result<R
     let start_frame = raw_track_start_frame(source)?;
     let mut semantic = source.to_vec();
     let mut affected = BTreeSet::new();
+
+    if source_sha1 == "0c48a60a88644dee7a4c706655eff99028ffbda3" {
+        let indices = source
+            .chunks_exact(RAW_SECTOR_SIZE)
+            .enumerate()
+            .filter(|(_, sector)| sector[2068..2076] == [0xff; 8])
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        ensure!(
+            indices.len() == 52,
+            "approved Mode 1 protection recovery found an unexpected sector count"
+        );
+        let mut writer = SectorWriter::new();
+        for index in indices {
+            let source_sector = sector_bytes(source, index)?;
+            ensure!(
+                source_sector[..12] == SYNC && source_sector[15] == 1,
+                "approved Mode 1 protection recovery found invalid framing at sector {index}"
+            );
+            let replacement = writer.mode1(
+                start_frame + u32::try_from(index)?,
+                &source_sector[16..2064],
+            )?;
+            install_sector(&mut semantic, index, &replacement)?;
+            affected.insert(index);
+        }
+        return finish_recovery(
+            source,
+            semantic,
+            start_frame,
+            affected,
+            RecoveryCategory::InternalRawDamage,
+            None,
+            "normalized 52 sectors with a consistent invalid Mode 1 protection pattern while retaining every logical payload byte",
+        );
+    }
 
     let missing_prefix = match source_sha1 {
         "aad68c8551ef04f30ea7f4c7f495fb78d0f378c5"
@@ -2388,7 +2534,7 @@ fn detach_record_only_files(
     for file in &parsed_iso.files {
         let range = placement_range(file.extent, file.length)?;
         let lacks_full_backing = file.extent == 0 || range.end > sector_count;
-        if file.length == 0 || !lacks_full_backing {
+        if file.length != 0 && !lacks_full_backing {
             continue;
         }
         let entry = &mut parsed_iso.manifest.entries[entry_indices[file.path.as_str()]];
@@ -2418,19 +2564,29 @@ fn detach_remaining_overlapping_files(parsed_iso: &mut iso9660::ParsedIso) -> Re
         .chain(&parsed_iso.supplementary_directories)
         .map(|directory| placement_range(directory.extent, directory.length))
         .collect::<Result<Vec<_>>>()?;
-    let detached_paths = parsed_iso
-        .files
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            directory_ranges
-                .iter()
-                .any(|directory| ranges_overlap(&file_ranges[*index], directory))
-                || file_ranges.iter().enumerate().any(|(other, range)| {
-                    *index != other && ranges_overlap(&file_ranges[*index], range)
-                })
-        })
-        .map(|(_, file)| file.path.clone())
+    let mut detached = HashSet::new();
+    for (index, range) in file_ranges.iter().enumerate() {
+        if directory_ranges
+            .iter()
+            .any(|directory| ranges_overlap(range, directory))
+        {
+            detached.insert(index);
+        }
+        for (other, other_range) in file_ranges.iter().enumerate().skip(index + 1) {
+            if !ranges_overlap(range, other_range) {
+                continue;
+            }
+            if range == other_range {
+                detached.insert(other);
+            } else {
+                detached.insert(index);
+                detached.insert(other);
+            }
+        }
+    }
+    let detached_paths = detached
+        .into_iter()
+        .map(|index| parsed_iso.files[index].path.clone())
         .collect::<HashSet<_>>();
     for file in parsed_iso
         .files
@@ -2752,48 +2908,373 @@ fn detect_metadata_subheader(
     }
 }
 
-#[derive(Clone, Copy)]
-enum SourcePlacement<'a> {
-    File(&'a iso9660::ParsedFile),
-    PrimaryDirectory(&'a iso9660::ParsedDirectory),
-    JolietDirectory(&'a iso9660::ParsedDirectory),
+fn detect_joliet_metadata_subheader(
+    sectors: &[crate::raw_cd::ParsedSector],
+    parsed: &mut iso9660::ParsedIso,
+) -> Result<()> {
+    let Some(volume) = parsed.manifest.supplementary_volumes.first_mut() else {
+        return Ok(());
+    };
+    for directory in &parsed.supplementary_directories {
+        let start = usize::try_from(directory.extent)?;
+        let blocks = usize::try_from(directory.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+        let range = sectors
+            .get(start..start + blocks)
+            .context("Joliet directory is outside image")?;
+        ensure!(
+            range
+                .iter()
+                .all(|sector| sector.kind == Kind::Form1
+                    && sector.subheader == sector.subheader_copy),
+            "Joliet directory has unsupported sector framing: {}",
+            directory.path
+        );
+        let policy = if range
+            .iter()
+            .all(|sector| sector.subheader == FORM1_DATA_SUBHEADER)
+        {
+            EntrySectorSubheader::Data
+        } else if range
+            .iter()
+            .all(|sector| sector.subheader == ISO_METADATA_SUBHEADER)
+        {
+            EntrySectorSubheader::Canonical
+        } else if range
+            .last()
+            .is_some_and(|sector| sector.subheader == ISO_METADATA_SUBHEADER)
+            && range[..range.len() - 1]
+                .iter()
+                .all(|sector| sector.subheader == FORM1_DATA_SUBHEADER)
+        {
+            EntrySectorSubheader::DataUntilFinal
+        } else if range
+            .last()
+            .is_some_and(|sector| sector.subheader == SYSTEM_END_OF_FILE_SUBHEADER)
+            && range[..range.len() - 1]
+                .iter()
+                .all(|sector| sector.subheader == FORM1_DATA_SUBHEADER)
+        {
+            EntrySectorSubheader::EndOfFileData
+        } else {
+            anyhow::bail!(
+                "Joliet directory uses unsupported subheaders: {}",
+                directory.path
+            )
+        };
+        volume
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == directory.path)
+            .context("missing Joliet directory entry")?
+            .sector_subheader = policy;
+    }
+    Ok(())
 }
 
-impl<'a> SourcePlacement<'a> {
-    const fn extent(self) -> u32 {
-        match self {
-            Self::File(file) => file.extent,
-            Self::PrimaryDirectory(directory) | Self::JolietDirectory(directory) => {
-                directory.extent
-            }
+struct SourcePlacement {
+    extent: u32,
+    length: u32,
+    label: String,
+    item: FileLayoutItem,
+    asset: Option<(String, Vec<u8>)>,
+}
+
+impl SourcePlacement {
+    fn file(file: &iso9660::ParsedFile) -> Self {
+        Self {
+            extent: file.extent,
+            length: file.length,
+            label: file.path.clone(),
+            item: FileLayoutItem::path(&file.path),
+            asset: None,
         }
     }
 
-    const fn length(self) -> u32 {
-        match self {
-            Self::File(file) => file.length,
-            Self::PrimaryDirectory(directory) | Self::JolietDirectory(directory) => {
-                directory.length
-            }
+    fn directory(directory: &iso9660::ParsedDirectory, volume: MetadataVolume) -> Self {
+        Self {
+            extent: directory.extent,
+            length: directory.length,
+            label: directory.path.clone(),
+            item: if volume == MetadataVolume::Primary {
+                FileLayoutItem::directory(&directory.path)
+            } else {
+                FileLayoutItem::volume_directory(volume, &directory.path)
+            },
+            asset: None,
         }
     }
 
-    fn path(self) -> &'a str {
-        match self {
-            Self::File(file) => &file.path,
-            Self::PrimaryDirectory(directory) | Self::JolietDirectory(directory) => &directory.path,
+    fn path_table(kind: MetadataPathTable, extent: u32, blocks: u32) -> Self {
+        Self {
+            extent,
+            length: blocks * LOGICAL_BLOCK_SIZE as u32,
+            label: format!("{kind:?} path table"),
+            item: FileLayoutItem::path_table(kind),
+            asset: None,
+        }
+    }
+}
+
+fn be_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    Ok(u16::from_be_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .context("truncated big-endian u16")?
+            .try_into()?,
+    ))
+}
+
+fn be_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    Ok(u32::from_be_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .context("truncated big-endian u32")?
+            .try_into()?,
+    ))
+}
+
+fn apple_hfs_partition(system: &[u8], image_blocks: usize) -> Result<Option<(u32, u32)>> {
+    if system.get(..2) != Some(b"ER") {
+        return Ok(None);
+    }
+    ensure!(
+        be_u16(system, 2)? == 512,
+        "Apple driver descriptor block size is not 512"
+    );
+    ensure!(
+        system.get(512..514) == Some(b"PM"),
+        "invalid Apple partition map signature"
+    );
+    let map_entries = usize::try_from(be_u32(system, 516)?)?;
+    ensure!(
+        map_entries > 0 && map_entries <= 63,
+        "invalid Apple partition-map entry count"
+    );
+    ensure!(
+        system.len() >= (map_entries + 1) * 512,
+        "Apple partition map exceeds system-area asset"
+    );
+    let mut hfs = None;
+    for index in 0..map_entries {
+        let offset = (index + 1) * 512;
+        ensure!(
+            system.get(offset..offset + 2) == Some(b"PM"),
+            "invalid Apple partition-map entry signature"
+        );
+        let start = be_u32(system, offset + 8)?;
+        let count = be_u32(system, offset + 12)?;
+        let kind = system
+            .get(offset + 48..offset + 80)
+            .context("truncated Apple partition type")?;
+        let kind = &kind[..kind
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(kind.len())];
+        if kind == b"Apple_HFS" {
+            ensure!(
+                hfs.replace((start, count)).is_none(),
+                "multiple Apple_HFS partitions are unsupported"
+            );
+        }
+    }
+    let Some((start, count)) = hfs else {
+        anyhow::bail!("Apple partition map does not contain exactly one Apple_HFS partition")
+    };
+    ensure!(count > 0, "Apple_HFS partition is empty");
+    let end = start
+        .checked_add(count)
+        .context("Apple_HFS partition overflow")?;
+    ensure!(
+        usize::try_from(end)? <= image_blocks * 4,
+        "Apple_HFS partition exceeds image"
+    );
+    Ok(Some((start, count)))
+}
+
+fn logical_byte_range(
+    sectors: &[crate::raw_cd::ParsedSector],
+    start: usize,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let mut result = Vec::with_capacity(length);
+    let mut offset = start;
+    while result.len() < length {
+        let sector = sectors
+            .get(offset / LOGICAL_BLOCK_SIZE)
+            .context("logical byte range exceeds image")?;
+        let within = offset % LOGICAL_BLOCK_SIZE;
+        let take = (length - result.len()).min(LOGICAL_BLOCK_SIZE - within);
+        result.extend_from_slice(&sector.payload()[within..within + take]);
+        offset += take;
+    }
+    Ok(result)
+}
+
+fn cequadrat_links_block(
+    directories: &[iso9660::ParsedDirectory],
+    supplementary: &[iso9660::ParsedDirectory],
+) -> Result<[u8; LOGICAL_BLOCK_SIZE]> {
+    let pairs = directories
+        .iter()
+        .filter_map(|primary| {
+            supplementary
+                .iter()
+                .find(|directory| directory.path == primary.path)
+                .map(|joliet| (joliet.extent, primary.extent))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        48 + pairs.len() * 8 <= LOGICAL_BLOCK_SIZE,
+        "CeQuadrat link table is too large"
+    );
+    let mut block = [0_u8; LOGICAL_BLOCK_SIZE];
+    let magic = b"CeQuadrat Joliet directory link table";
+    block[..magic.len()].copy_from_slice(magic);
+    block[44..48].copy_from_slice(&u32::try_from(pairs.len())?.to_le_bytes());
+    for (index, (joliet, primary)) in pairs.into_iter().enumerate() {
+        let offset = 48 + index * 8;
+        block[offset..offset + 4].copy_from_slice(&joliet.to_le_bytes());
+        block[offset + 4..offset + 8].copy_from_slice(&primary.to_le_bytes());
+    }
+    Ok(block)
+}
+
+fn detect_special_placements(
+    sectors: &[crate::raw_cd::ParsedSector],
+    files: &[iso9660::ParsedFile],
+    directories: &[iso9660::ParsedDirectory],
+    supplementary: &[iso9660::ParsedDirectory],
+    system: &[u8],
+    manifest_stem: &str,
+) -> Result<Vec<SourcePlacement>> {
+    let mut result = Vec::new();
+    if let Some((start_block, block_count)) = apple_hfs_partition(system, sectors.len())? {
+        let byte_start = usize::try_from(start_block)? * 512;
+        let byte_length = usize::try_from(block_count)?
+            .checked_mul(512)
+            .context("Apple_HFS byte length overflow")?;
+        let bytes = logical_byte_range(sectors, byte_start, byte_length)?;
+        ensure!(
+            bytes.get(1024..1026) == Some(b"BD"),
+            "Apple_HFS partition lacks a primary HFS MDB"
+        );
+        let sector_start = usize::try_from(start_block / 4)?;
+        let byte_offset = usize::try_from(start_block % 4)? * 512;
+        let sectors_used = (byte_offset + byte_length).div_ceil(LOGICAL_BLOCK_SIZE);
+        let prefix = logical_byte_range(sectors, sector_start * LOGICAL_BLOCK_SIZE, byte_offset)?;
+        ensure!(
+            prefix.iter().all(|byte| *byte == 0),
+            "Apple_HFS boundary-sector prefix is nonzero"
+        );
+        let suffix_len = sectors_used * LOGICAL_BLOCK_SIZE - byte_offset - byte_length;
+        let suffix = logical_byte_range(sectors, byte_start + byte_length, suffix_len)?;
+        ensure!(
+            suffix.iter().all(|byte| *byte == 0),
+            "Apple_HFS boundary-sector suffix is nonzero"
+        );
+        let path = format!("{manifest_stem}.hfs");
+        result.push(SourcePlacement {
+            extent: start_block / 4,
+            length: u32::try_from(sectors_used * LOGICAL_BLOCK_SIZE)?,
+            label: "Apple_HFS partition".to_owned(),
+            item: FileLayoutItem::apple_hfs(
+                HostAsset {
+                    path: path.clone(),
+                    sha1: None,
+                },
+                start_block,
+                block_count,
+            ),
+            asset: Some((path, bytes)),
+        });
+    }
+
+    let expected_links = (!supplementary.is_empty())
+        .then(|| cequadrat_links_block(directories, supplementary))
+        .transpose()?;
+    let formatter_magic = b"CeQuadrat ISO 9660 formatter information block";
+    for (lba, sector) in sectors.iter().enumerate() {
+        let payload = sector.payload();
+        if expected_links
+            .as_ref()
+            .is_some_and(|expected| payload == expected)
+        {
+            result.push(SourcePlacement {
+                extent: u32::try_from(lba)?,
+                length: LOGICAL_BLOCK_SIZE as u32,
+                label: "CeQuadrat Joliet directory link table".to_owned(),
+                item: FileLayoutItem::cequadrat_joliet_links(),
+                asset: None,
+            });
+        } else if payload.starts_with(formatter_magic) {
+            let path = format!("{manifest_stem}.cequadrat");
+            result.push(SourcePlacement {
+                extent: u32::try_from(lba)?,
+                length: LOGICAL_BLOCK_SIZE as u32,
+                label: "CeQuadrat formatter information block".to_owned(),
+                item: FileLayoutItem::cequadrat_formatter(HostAsset {
+                    path: path.clone(),
+                    sha1: None,
+                }),
+                asset: Some((path, payload.to_vec())),
+            });
         }
     }
 
-    fn manifest_item(self) -> FileLayoutItem {
-        match self {
-            Self::File(file) => FileLayoutItem::path(&file.path),
-            Self::PrimaryDirectory(directory) => FileLayoutItem::directory(&directory.path),
-            Self::JolietDirectory(directory) => {
-                FileLayoutItem::volume_directory(MetadataVolume::Joliet, &directory.path)
+    let mut occupied = vec![false; sectors.len()];
+    for (extent, length) in files
+        .iter()
+        .map(|item| (item.extent, item.length))
+        .chain(directories.iter().map(|item| (item.extent, item.length)))
+        .chain(supplementary.iter().map(|item| (item.extent, item.length)))
+    {
+        let start = usize::try_from(extent)?;
+        let blocks = usize::try_from(length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+        for value in occupied.iter_mut().skip(start).take(blocks) {
+            *value = true;
+        }
+    }
+    for placement in &result {
+        if matches!(placement.item, FileLayoutItem::AppleHfs(_)) {
+            let start = usize::try_from(placement.extent)?;
+            let blocks = usize::try_from(placement.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
+            for value in occupied.iter_mut().skip(start).take(blocks) {
+                *value = true;
             }
         }
     }
+    let mut source_blocks: HashMap<[u8; LOGICAL_BLOCK_SIZE], Option<(String, u32)>> =
+        HashMap::new();
+    for file in files {
+        for block in 0..file.length.div_ceil(LOGICAL_BLOCK_SIZE as u32) {
+            let payload: [u8; LOGICAL_BLOCK_SIZE] = sectors[usize::try_from(file.extent + block)?]
+                .logical_block()
+                .try_into()?;
+            source_blocks
+                .entry(payload)
+                .and_modify(|value| *value = None)
+                .or_insert_with(|| Some((file.path.clone(), block)));
+        }
+    }
+    for (lba, sector) in sectors.iter().enumerate() {
+        if occupied[lba]
+            || sector.kind != Kind::Mode1
+            || sector.payload().iter().all(|byte| *byte == 0)
+        {
+            continue;
+        }
+        let payload: [u8; LOGICAL_BLOCK_SIZE] = sector.logical_block().try_into()?;
+        if let Some(Some((path, block))) = source_blocks.get(&payload) {
+            result.push(SourcePlacement {
+                extent: u32::try_from(lba)?,
+                length: LOGICAL_BLOCK_SIZE as u32,
+                label: format!("duplicate block {block} of {path}"),
+                item: FileLayoutItem::duplicate_block(path, *block),
+                asset: None,
+            });
+        }
+    }
+    Ok(result)
 }
 
 fn detect_gap_items(
@@ -2803,20 +3284,17 @@ fn detect_gap_items(
     if sectors.is_empty() {
         return Ok(None);
     }
-    if sectors.iter().all(is_mode1_gap_sector) {
-        return Ok(Some(vec![FileLayoutItem::mode1_gap(u32::try_from(
-            sectors.len(),
-        )?)]));
-    }
-    if sectors
-        .iter()
-        .any(|sector| matches!(sector.kind, Kind::Mode1 | Kind::Mode1Gap))
-    {
-        return Ok(None);
-    }
     let mut items = Vec::new();
     let mut start = 0;
     while start < sectors.len() {
+        if is_mode1_gap_sector(&sectors[start]) {
+            let end = (start + 1..sectors.len())
+                .find(|index| !is_mode1_gap_sector(&sectors[*index]))
+                .unwrap_or(sectors.len());
+            items.push(FileLayoutItem::mode1_gap(u32::try_from(end - start)?));
+            start = end;
+            continue;
+        }
         if is_structured_form1_gap_sector(&sectors[start]) {
             let subheader = sectors[start].subheader;
             let end = (start + 1..sectors.len())
@@ -2893,6 +3371,34 @@ fn append_detected_gap(
         detected.items.extend(items);
         return Ok(());
     }
+    if sectors[start..end]
+        .iter()
+        .any(|sector| sector.kind == Kind::Mode1Gap)
+    {
+        let mut cursor = start;
+        while cursor < end {
+            if sectors[cursor].kind == Kind::Mode1Gap {
+                let run_end = (cursor + 1..end)
+                    .find(|index| sectors[*index].kind != Kind::Mode1Gap)
+                    .unwrap_or(end);
+                ensure!(
+                    sectors[cursor..run_end].iter().all(is_mode1_gap_sector),
+                    "unreferenced Mode 1 gap contains nonzero data"
+                );
+                detected
+                    .items
+                    .push(FileLayoutItem::mode1_gap(u32::try_from(run_end - cursor)?));
+                cursor = run_end;
+            } else {
+                let run_end = (cursor + 1..end)
+                    .find(|index| sectors[*index].kind == Kind::Mode1Gap)
+                    .unwrap_or(end);
+                append_detected_gap(detected, sectors, cursor, run_end, form2_edc, manifest_stem)?;
+                cursor = run_end;
+            }
+        }
+        return Ok(());
+    }
     ensure!(
         sectors[start..end]
             .iter()
@@ -2930,97 +3436,94 @@ fn append_detected_gap(
     Ok(())
 }
 
-fn detect_file_layout(
-    sectors: &[crate::raw_cd::ParsedSector],
-    files: &[iso9660::ParsedFile],
-    directories: &[iso9660::ParsedDirectory],
-    supplementary_directories: &[iso9660::ParsedDirectory],
+struct CompleteIsoLayoutInput<'a> {
+    sectors: &'a [crate::raw_cd::ParsedSector],
+    files: &'a [iso9660::ParsedFile],
+    directories: &'a [iso9660::ParsedDirectory],
+    supplementary_directories: &'a [iso9660::ParsedDirectory],
+    primary_path_tables: Option<&'a iso9660::ParsedPathTables>,
+    supplementary_path_tables: Option<&'a iso9660::ParsedPathTables>,
+    content_start: u32,
     form2_edc: bool,
-    manifest_stem: &str,
-) -> Result<DetectedFileLayout> {
-    let has_joliet = !supplementary_directories.is_empty();
-    let grouped_directories = has_joliet
-        && [directories, supplementary_directories]
-            .into_iter()
-            .all(|volume_directories| {
-                let mut physical = volume_directories
-                    .iter()
-                    .filter(|directory| directory.length != 0);
-                let Some(mut previous) = physical.next() else {
-                    return false;
-                };
-                physical.all(|directory| {
-                    let contiguous = previous
-                        .extent
-                        .checked_add(previous.length.div_ceil(LOGICAL_BLOCK_SIZE as u32))
-                        == Some(directory.extent);
-                    previous = directory;
-                    contiguous
-                })
-            });
-    let mut placements = files.iter().map(SourcePlacement::File).collect::<Vec<_>>();
-    if has_joliet {
-        if !grouped_directories {
-            placements.extend(
-                directories
-                    .iter()
-                    .filter(|directory| directory.length != 0)
-                    .map(SourcePlacement::PrimaryDirectory)
-                    .chain(
-                        supplementary_directories
-                            .iter()
-                            .filter(|directory| directory.length != 0)
-                            .map(SourcePlacement::JolietDirectory),
-                    ),
-            );
-        }
-    } else {
-        placements.extend(
-            directories
-                .iter()
-                .filter(|directory| directory.path != iso9660::ROOT_PATH && directory.length != 0)
-                .map(SourcePlacement::PrimaryDirectory),
-        );
-    }
-    placements.sort_by_key(|placement| placement.extent());
-    let mut previous_end = if has_joliet && !grouped_directories {
-        usize::try_from(
-            placements
-                .first()
-                .context("interleaved directory layout is empty")?
-                .extent(),
-        )?
-    } else {
+    manifest_stem: &'a str,
+    system_bytes: &'a [u8],
+}
+
+fn detect_complete_iso_layout(input: CompleteIsoLayoutInput<'_>) -> Result<DetectedFileLayout> {
+    let CompleteIsoLayoutInput {
+        sectors,
+        files,
+        directories,
+        supplementary_directories,
+        primary_path_tables,
+        supplementary_path_tables,
+        content_start,
+        form2_edc,
+        manifest_stem,
+        system_bytes,
+    } = input;
+    let mut placements = files.iter().map(SourcePlacement::file).collect::<Vec<_>>();
+    placements.extend(
         directories
             .iter()
-            .chain(supplementary_directories)
-            .filter(|directory| {
-                directory.length != 0 && (has_joliet || directory.path == iso9660::ROOT_PATH)
-            })
-            .map(|directory| -> Result<usize> {
-                Ok(usize::try_from(directory.extent)?
-                    + usize::try_from(directory.length)?.div_ceil(LOGICAL_BLOCK_SIZE))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(0)
-    };
+            .filter(|directory| directory.length != 0)
+            .map(|directory| SourcePlacement::directory(directory, MetadataVolume::Primary))
+            .chain(
+                supplementary_directories
+                    .iter()
+                    .filter(|directory| directory.length != 0)
+                    .map(|directory| SourcePlacement::directory(directory, MetadataVolume::Joliet)),
+            ),
+    );
+    let mut seen_path_table_extents = HashSet::new();
+    if let Some(tables) = primary_path_tables {
+        for (extent, kind) in tables.extents.into_iter().zip([
+            MetadataPathTable::PrimaryLittle,
+            MetadataPathTable::PrimaryLittleCopy,
+            MetadataPathTable::PrimaryBig,
+            MetadataPathTable::PrimaryBigCopy,
+        ]) {
+            if extent != 0 && seen_path_table_extents.insert(extent) {
+                placements.push(SourcePlacement::path_table(kind, extent, tables.blocks));
+            }
+        }
+    }
+    if let Some(tables) = supplementary_path_tables {
+        for (extent, kind) in [
+            (tables.extents[0], MetadataPathTable::JolietLittle),
+            (tables.extents[2], MetadataPathTable::JolietBig),
+        ] {
+            if extent != 0 && seen_path_table_extents.insert(extent) {
+                placements.push(SourcePlacement::path_table(kind, extent, tables.blocks));
+            }
+        }
+    }
+    placements.extend(detect_special_placements(
+        sectors,
+        files,
+        directories,
+        supplementary_directories,
+        system_bytes,
+        manifest_stem,
+    )?);
+    placements.sort_by_key(|placement| placement.extent);
+    let mut previous_end = usize::try_from(content_start)?;
     let mut detected = DetectedFileLayout {
         items: Vec::new(),
         assets: HashMap::new(),
         xa_extent_ranges: Vec::new(),
     };
     for placement in placements {
-        let extent = usize::try_from(placement.extent())?;
+        let extent = usize::try_from(placement.extent)?;
         ensure!(
             extent >= previous_end,
-            "overlapping physical placement for {}",
-            placement.path()
+            "overlapping physical placement for {} at LBA {extent}; previous placement ends at LBA {previous_end}",
+            placement.label,
         );
         ensure!(
             extent <= sectors.len(),
-            "physical placement is outside image"
+            "physical placement is outside image for {} at LBA {extent}",
+            placement.label
         );
         if extent > previous_end {
             append_detected_gap(
@@ -3031,10 +3534,16 @@ fn detect_file_layout(
                 form2_edc,
                 manifest_stem,
             )
-            .with_context(|| format!("preserving sectors before {}", placement.path()))?;
+            .with_context(|| format!("preserving sectors before {}", placement.label))?;
         }
-        detected.items.push(placement.manifest_item());
-        previous_end = extent + usize::try_from(placement.length())?.div_ceil(LOGICAL_BLOCK_SIZE);
+        detected.items.push(placement.item);
+        if let Some((path, bytes)) = placement.asset {
+            ensure!(
+                detected.assets.insert(path.clone(), bytes).is_none(),
+                "duplicate special asset path {path}"
+            );
+        }
+        previous_end = extent + usize::try_from(placement.length)?.div_ceil(LOGICAL_BLOCK_SIZE);
     }
     if previous_end < sectors.len() {
         append_detected_gap(
@@ -3048,6 +3557,36 @@ fn detect_file_layout(
         .context("preserving unreferenced sectors at the end of ISO content")?;
     }
     Ok(detected)
+}
+
+#[cfg(test)]
+fn detect_file_layout(
+    sectors: &[crate::raw_cd::ParsedSector],
+    files: &[iso9660::ParsedFile],
+    directories: &[iso9660::ParsedDirectory],
+    supplementary_directories: &[iso9660::ParsedDirectory],
+    form2_edc: bool,
+    manifest_stem: &str,
+) -> Result<DetectedFileLayout> {
+    let content_start = directories
+        .iter()
+        .chain(supplementary_directories)
+        .filter(|directory| directory.length != 0)
+        .map(|directory| directory.extent)
+        .min()
+        .unwrap_or(0);
+    detect_complete_iso_layout(CompleteIsoLayoutInput {
+        sectors,
+        files,
+        directories,
+        supplementary_directories,
+        primary_path_tables: None,
+        supplementary_path_tables: None,
+        content_start,
+        form2_edc,
+        manifest_stem,
+        system_bytes: &[],
+    })
 }
 
 pub fn extract(
@@ -3305,6 +3844,7 @@ fn extract_form1_project(
             form2_edc,
             noncompliant_trailing_ecc,
             redump_0x55: metadata.redump_0x55,
+            mode1_reserved: Vec::new(),
             patches: metadata.patches,
         },
         system_area: None,
@@ -3400,6 +3940,7 @@ pub fn extract_with_options(
         Kind::Form1 | Kind::Form2 | Kind::XaGap => TrackMode::Mode2Xa,
         Kind::RawZero => unreachable!("searched for a framed sector"),
     };
+    let mode1_reserved = detect_mode1_reserved(&sectors, start_frame);
     let sector_count = u32::try_from(sectors.len())?;
     let noncompliant_trailing_ecc = sectors.last().is_some_and(|sector| sector.noncompliant_ecc);
     ensure!(
@@ -3489,6 +4030,10 @@ pub fn extract_with_options(
         }
     }
     let content_end = sectors.len() - trailing_physical_gap;
+    detach_record_only_files(content_end, &mut parsed_iso)?;
+    if track_mode == TrackMode::Mode1 {
+        detach_remaining_overlapping_files(&mut parsed_iso)?;
+    }
     let mut indexed_assets_by_path = HashMap::new();
     if track_mode == TrackMode::Mode2Xa {
         detect_metadata_subheader(
@@ -3496,6 +4041,7 @@ pub fn extract_with_options(
             &mut parsed_iso.manifest,
             &redump_ranges,
         );
+        detect_joliet_metadata_subheader(&sectors[..content_end], &mut parsed_iso)?;
         detect_path_table_subheader(&sectors[..content_end], &mut parsed_iso, &redump_ranges)?;
         detect_mode2_2336_file_lengths(content_end, &mut parsed_iso)?;
         detach_overlapping_xa_files(&sectors[..content_end], &mut parsed_iso)?;
@@ -3516,14 +4062,24 @@ pub fn extract_with_options(
             &indexed_paths,
         )?;
     }
-    let mut detected_layout = detect_file_layout(
-        &sectors[..content_end],
-        &parsed_iso.files,
-        &parsed_iso.directories,
-        &parsed_iso.supplementary_directories,
+    let content_start = 17_u32
+        .checked_add(u32::from(parsed_iso.manifest.primary_volume_copies))
+        .and_then(|value| {
+            value.checked_add(u32::try_from(parsed_iso.manifest.supplementary_volumes.len()).ok()?)
+        })
+        .context("ISO descriptor placement overflow")?;
+    let mut detected_layout = detect_complete_iso_layout(CompleteIsoLayoutInput {
+        sectors: &sectors[..content_end],
+        files: &parsed_iso.files,
+        directories: &parsed_iso.directories,
+        supplementary_directories: &parsed_iso.supplementary_directories,
+        primary_path_tables: parsed_iso.path_tables.as_ref(),
+        supplementary_path_tables: parsed_iso.supplementary_path_tables.as_ref(),
+        content_start,
         form2_edc,
         manifest_stem,
-    )?;
+        system_bytes: &system_bytes,
+    })?;
     for item in &mut detected_layout.items {
         let FileLayoutItem::Path(file) = item else {
             continue;
@@ -3623,6 +4179,7 @@ pub fn extract_with_options(
             form2_edc,
             noncompliant_trailing_ecc,
             redump_0x55,
+            mode1_reserved,
             patches: recovery.patches,
         },
         system_area: Some(SystemArea {
@@ -3941,6 +4498,11 @@ fn validate_track_structure(
     system_sector_layout: &[SystemAreaSectorKind],
 ) -> Result<()> {
     validate_redump_0x55_runs(&manifest.track.redump_0x55, &manifest.track.patches)?;
+    validate_mode1_reserved_runs(
+        &manifest.track.mode1_reserved,
+        manifest.track.mode,
+        &manifest.track.redump_0x55,
+    )?;
     let system_area = manifest
         .system_area
         .as_ref()
@@ -4007,12 +4569,7 @@ fn validate_track_structure(
                 "Mode 1 tracks may contain only Mode 1 or terminal raw-zero gaps"
             );
         }
-        TrackMode::Mode2Xa => {
-            ensure!(
-                file_gap_kinds.all(|kind| kind != GapKind::Mode1),
-                "Mode 1 gaps require a Mode 1 track"
-            );
-        }
+        TrackMode::Mode2Xa => {}
         TrackMode::Mode2 => anyhow::bail!("unsupported track mode 2"),
     }
     Ok(())
@@ -4064,9 +4621,26 @@ fn detect_path_table_subheader(
     parsed_iso: &mut iso9660::ParsedIso,
     redump_ranges: &[Range<usize>],
 ) -> Result<()> {
-    let Some(path_tables) = &parsed_iso.path_tables else {
-        return Ok(());
-    };
+    if let Some(path_tables) = &parsed_iso.path_tables {
+        parsed_iso.manifest.path_table_subheader =
+            detect_path_table_policy(sectors, path_tables, redump_ranges)?;
+    }
+    if let Some(path_tables) = &parsed_iso.supplementary_path_tables {
+        parsed_iso
+            .manifest
+            .supplementary_volumes
+            .first_mut()
+            .context("Joliet path tables lack a supplementary volume")?
+            .path_table_subheader = detect_path_table_policy(sectors, path_tables, redump_ranges)?;
+    }
+    Ok(())
+}
+
+fn detect_path_table_policy(
+    sectors: &[crate::raw_cd::ParsedSector],
+    path_tables: &iso9660::ParsedPathTables,
+    redump_ranges: &[Range<usize>],
+) -> Result<PathTableSubheader> {
     for policy in [
         EntrySectorSubheader::Canonical,
         EntrySectorSubheader::Data,
@@ -4097,8 +4671,7 @@ fn detect_path_table_subheader(
                 })
             });
         if matches {
-            parsed_iso.manifest.path_table_subheader = PathTableSubheader::Named(policy);
-            return Ok(());
+            return Ok(PathTableSubheader::Named(policy));
         }
     }
     let mut custom = None;
@@ -4129,9 +4702,9 @@ fn detect_path_table_subheader(
             })
         });
     if matches_custom {
-        parsed_iso.manifest.path_table_subheader =
-            PathTableSubheader::Explicit(custom.expect("custom path-table match has a sector"));
-        return Ok(());
+        return Ok(PathTableSubheader::Explicit(
+            custom.expect("custom path-table match has a sector"),
+        ));
     }
     anyhow::bail!("path-table sectors use an unsupported XA subheader policy")
 }
@@ -4376,10 +4949,11 @@ fn validate_iso_subheaders_with_xa_extents(
     let mut path_table_sector_info = HashMap::new();
     let mut path_table_padding_sectors = HashSet::new();
     if let Some(path_tables) = &parsed_iso.path_tables {
+        let mut seen_extents = HashSet::new();
         for extent in path_tables
             .extents
             .into_iter()
-            .filter(|extent| *extent != 0)
+            .filter(|extent| *extent != 0 && seen_extents.insert(*extent))
         {
             for block_index in 0..path_tables.blocks {
                 let lba = usize::try_from(extent + block_index)?;
@@ -4413,26 +4987,70 @@ fn validate_iso_subheaders_with_xa_extents(
     let mut supplementary_metadata_sectors = HashSet::new();
     for directory in &parsed_iso.supplementary_directories {
         let blocks = directory.length.div_ceil(LOGICAL_BLOCK_SIZE as u32);
+        let entry = parsed_iso
+            .manifest
+            .supplementary_volumes
+            .first()
+            .and_then(|volume| {
+                volume
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == directory.path)
+            })
+            .context("parsed Joliet directory has no manifest entry")?;
         for lba in directory.extent..directory.extent + blocks {
             ensure!(
                 usize::try_from(lba).is_ok_and(|lba| lba < content_end),
                 "Joliet directory extent reaches outside ISO content"
             );
             supplementary_metadata_sectors.insert(usize::try_from(lba)?);
+            let block_index = lba - directory.extent;
+            let expected = match entry.sector_subheader {
+                EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
+                EntrySectorSubheader::EndOfFileData if block_index + 1 == blocks => {
+                    SYSTEM_END_OF_FILE_SUBHEADER
+                }
+                EntrySectorSubheader::DataUntilFinal if block_index + 1 < blocks => {
+                    FORM1_DATA_SUBHEADER
+                }
+                EntrySectorSubheader::Canonical
+                | EntrySectorSubheader::IsoMetadata
+                | EntrySectorSubheader::DataUntilFinal => ISO_METADATA_SUBHEADER,
+                EntrySectorSubheader::EndOfFileData => FORM1_DATA_SUBHEADER,
+            };
+            directory_sector_info.insert(usize::try_from(lba)?, expected);
         }
     }
     if let Some(path_tables) = &parsed_iso.supplementary_path_tables {
+        let mut seen_extents = HashSet::new();
         for extent in path_tables
             .extents
             .into_iter()
-            .filter(|extent| *extent != 0)
+            .filter(|extent| *extent != 0 && seen_extents.insert(*extent))
         {
-            for lba in extent..extent + path_tables.blocks {
+            for (block_index, lba) in (extent..extent + path_tables.blocks).enumerate() {
                 ensure!(
                     usize::try_from(lba).is_ok_and(|lba| lba < content_end),
                     "Joliet path-table extent reaches outside ISO content"
                 );
-                supplementary_metadata_sectors.insert(usize::try_from(lba)?);
+                let lba = usize::try_from(lba)?;
+                supplementary_metadata_sectors.insert(lba);
+                let expected = path_table_subheader(
+                    parsed_iso
+                        .manifest
+                        .supplementary_volumes
+                        .first()
+                        .context("Joliet path tables lack a supplementary volume")?
+                        .path_table_subheader,
+                    u32::try_from(block_index)?,
+                    path_tables.blocks,
+                );
+                if let Some(previous) = path_table_sector_info.insert(lba, expected) {
+                    ensure!(
+                        previous == expected,
+                        "aliased path tables require identical framing"
+                    );
+                }
             }
         }
     }
@@ -4532,6 +5150,13 @@ fn validate_iso_subheaders_with_xa_extents(
         if !is_file_sector && !is_directory_sector && is_structured_form1_gap_sector(sector) {
             continue;
         }
+        if !is_file_sector
+            && !is_directory_sector
+            && !is_path_table_sector
+            && is_mode1_gap_sector(sector)
+        {
+            continue;
+        }
         ensure!(
             sector.kind == Kind::Form1,
             "ISO sector at LBA {lba} is not Mode 2 XA Form 1"
@@ -4600,6 +5225,11 @@ fn validate_form1_gap(gap: &crate::manifest::FileGapItem, index: usize, last: us
 }
 
 fn validate_manifest_content(manifest: &Manifest) -> Result<()> {
+    validate_mode1_reserved_runs(
+        &manifest.track.mode1_reserved,
+        manifest.track.mode,
+        &manifest.track.redump_0x55,
+    )?;
     match (&manifest.system_area, &manifest.iso9660, &manifest.form1) {
         (Some(_), Some(_), None) => Ok(()),
         (None, None, Some(form1)) => {
@@ -4845,6 +5475,7 @@ pub fn build_with_options(
     let mut file_lengths = HashMap::new();
     let mut mixed_extents = HashMap::new();
     let mut unreferenced_extents = HashMap::new();
+    let mut auxiliary_data = HashMap::new();
     let entries_by_path: HashMap<_, _> = iso
         .entries
         .iter()
@@ -4972,6 +5603,54 @@ pub fn build_with_options(
             key
         );
     }
+    for item in &iso.layout {
+        let asset = match item {
+            FileLayoutItem::AppleHfs(item) => Some((&item.apple_hfs, "Apple HFS")),
+            FileLayoutItem::CeQuadratFormatter(item) => {
+                Some((&item.cequadrat_formatter, "CeQuadrat formatter"))
+            }
+            _ => None,
+        };
+        let Some((asset, label)) = asset else {
+            continue;
+        };
+        let path = safe_join(data_dir, &asset.path)?;
+        validate_input_file(&path, label)?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading {label} asset {}", path.display()))?;
+        record_sha1_mismatch(
+            &mut sha1_mismatches,
+            Sha1Target::Asset {
+                path: asset.path.clone(),
+            },
+            asset.sha1.as_deref(),
+            &bytes,
+        );
+        ensure!(
+            auxiliary_data.insert(asset.path.clone(), bytes).is_none(),
+            "duplicate auxiliary asset path {}",
+            asset.path
+        );
+    }
+    if let Some((map_start, map_count)) = apple_hfs_partition(&system, usize::MAX / 4)? {
+        let hfs = iso.layout.iter().find_map(|item| match item {
+            FileLayoutItem::AppleHfs(item) => Some(item),
+            _ => None,
+        });
+        let hfs =
+            hfs.context("system-area Apple partition map requires an apple_hfs layout item")?;
+        ensure!(
+            (hfs.start_block, hfs.block_count) == (map_start, map_count),
+            "apple_hfs placement does not match the system-area partition map"
+        );
+    } else {
+        ensure!(
+            !iso.layout
+                .iter()
+                .any(|item| matches!(item, FileLayoutItem::AppleHfs(_))),
+            "apple_hfs layout requires an Apple partition map in the system area"
+        );
+    }
     let metadata_gap_kind = match manifest.track.mode {
         TrackMode::Mode1 => GapKind::Mode1,
         TrackMode::Mode2 | TrackMode::Mode2Xa => GapKind::Xa,
@@ -4989,6 +5668,68 @@ pub fn build_with_options(
                 let target = &mut layout.blocks[usize::try_from(placement.extent)? + block_index];
                 target[..source_end - source_start]
                     .copy_from_slice(&data[source_start..source_end]);
+            }
+        }
+    }
+    for placement in &layout.auxiliaries {
+        ensure!(
+            placement.sectors > 0,
+            "auxiliary placement must not be empty"
+        );
+        match &placement.kind {
+            iso9660::AuxiliaryKind::AppleHfs {
+                asset,
+                byte_offset,
+                byte_length,
+                start_block,
+                block_count,
+            } => {
+                let data = &auxiliary_data[asset];
+                ensure!(
+                    data.len() == *byte_length,
+                    "Apple HFS asset length does not match block_count"
+                );
+                ensure!(
+                    data.get(1024..1026) == Some(b"BD"),
+                    "Apple HFS asset lacks a primary HFS MDB"
+                );
+                ensure!(
+                    usize::try_from(*start_block)? / 4 == usize::try_from(placement.start)?
+                        && usize::try_from(*block_count)? * 512 == *byte_length,
+                    "Apple HFS physical placement is inconsistent"
+                );
+                let start = usize::try_from(placement.start)? * LOGICAL_BLOCK_SIZE + byte_offset;
+                for (index, byte) in data.iter().copied().enumerate() {
+                    let absolute = start + index;
+                    layout.blocks[absolute / LOGICAL_BLOCK_SIZE][absolute % LOGICAL_BLOCK_SIZE] =
+                        byte;
+                }
+            }
+            iso9660::AuxiliaryKind::DuplicateBlock { path, block } => {
+                let data = file_data.get(path).with_context(|| {
+                    format!("duplicate_block source is not an ordinary file: {path}")
+                })?;
+                let start = usize::try_from(*block)? * LOGICAL_BLOCK_SIZE;
+                ensure!(
+                    start < data.len(),
+                    "duplicate_block source was shortened below block {block}: {path}"
+                );
+                let end = (start + LOGICAL_BLOCK_SIZE).min(data.len());
+                layout.blocks[usize::try_from(placement.start)?][..end - start]
+                    .copy_from_slice(&data[start..end]);
+            }
+            iso9660::AuxiliaryKind::CeQuadratJolietLinks => {}
+            iso9660::AuxiliaryKind::CeQuadratFormatter { asset } => {
+                let data = &auxiliary_data[asset];
+                ensure!(
+                    data.len() == LOGICAL_BLOCK_SIZE,
+                    "CeQuadrat formatter asset must be exactly 2048 bytes"
+                );
+                ensure!(
+                    data.starts_with(b"CeQuadrat ISO 9660 formatter information block"),
+                    "CeQuadrat formatter asset has invalid magic"
+                );
+                layout.blocks[usize::try_from(placement.start)?].copy_from_slice(data);
             }
         }
     }
@@ -5279,6 +6020,9 @@ pub fn build_with_options(
         append_sector_draft(&mut raw, &mut protections, sector, protection);
     }
 
+    apply_mode1_reserved(&mut raw, start_frame, &manifest.track.mode1_reserved)
+        .context("applying Mode 1 reserved-byte runs")?;
+
     finalize_track_protection(&mut raw, &protections)?;
 
     apply_redump_0x55(&mut raw, start_frame, &manifest.track.redump_0x55)
@@ -5398,7 +6142,15 @@ fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
                 paths.extend([xa.form1.path.clone(), xa.form2.path.clone()]);
                 paths.extend(xa.index.iter().map(|asset| asset.path.clone()));
             }
-            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+            FileLayoutItem::AppleHfs(item) => paths.push(item.apple_hfs.path.clone()),
+            FileLayoutItem::CeQuadratFormatter(item) => {
+                paths.push(item.cequadrat_formatter.path.clone())
+            }
+            FileLayoutItem::Directory(_)
+            | FileLayoutItem::PathTable(_)
+            | FileLayoutItem::DuplicateBlock(_)
+            | FileLayoutItem::CeQuadratJolietLinks(_)
+            | FileLayoutItem::Gap(_) => {}
         }
     }
     Ok(paths)
@@ -5695,7 +6447,27 @@ fn plan_extraction_outputs(
                     )?;
                 }
             }
-            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+            FileLayoutItem::AppleHfs(_) | FileLayoutItem::CeQuadratFormatter(_) => {
+                let asset = match &mut iso.layout[item_index] {
+                    FileLayoutItem::AppleHfs(item) => &mut item.apple_hfs,
+                    FileLayoutItem::CeQuadratFormatter(item) => &mut item.cequadrat_formatter,
+                    _ => unreachable!("snapshot preserves auxiliary asset kind"),
+                };
+                resolve_mapped_extraction_asset(
+                    &mut asset.path,
+                    assets,
+                    data_dir,
+                    overwrite,
+                    &reserved,
+                    &mut selected,
+                    &mut writes,
+                )?;
+            }
+            FileLayoutItem::Directory(_)
+            | FileLayoutItem::PathTable(_)
+            | FileLayoutItem::DuplicateBlock(_)
+            | FileLayoutItem::CeQuadratJolietLinks(_)
+            | FileLayoutItem::Gap(_) => {}
         }
     }
     validate_manifest_asset_paths(manifest)?;
@@ -5886,7 +6658,22 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
             FileLayoutItem::XaExtent(item) => {
                 validate_xa_asset_hashes(&item.xa_extent, "unreferenced XA extent")?;
             }
-            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+            FileLayoutItem::AppleHfs(item) => validate_optional_sha1(
+                item.apple_hfs.sha1.as_deref(),
+                &format!("Apple HFS asset {} sha1", item.apple_hfs.path),
+            )?,
+            FileLayoutItem::CeQuadratFormatter(item) => validate_optional_sha1(
+                item.cequadrat_formatter.sha1.as_deref(),
+                &format!(
+                    "CeQuadrat formatter asset {} sha1",
+                    item.cequadrat_formatter.path
+                ),
+            )?,
+            FileLayoutItem::Directory(_)
+            | FileLayoutItem::PathTable(_)
+            | FileLayoutItem::DuplicateBlock(_)
+            | FileLayoutItem::CeQuadratJolietLinks(_)
+            | FileLayoutItem::Gap(_) => {}
         }
     }
     Ok(())
@@ -5944,7 +6731,15 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
                     register(&asset.path, "unreferenced I")?;
                 }
             }
-            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+            FileLayoutItem::AppleHfs(item) => register(&item.apple_hfs.path, "Apple HFS")?,
+            FileLayoutItem::CeQuadratFormatter(item) => {
+                register(&item.cequadrat_formatter.path, "CeQuadrat formatter")?
+            }
+            FileLayoutItem::Directory(_)
+            | FileLayoutItem::PathTable(_)
+            | FileLayoutItem::DuplicateBlock(_)
+            | FileLayoutItem::CeQuadratJolietLinks(_)
+            | FileLayoutItem::Gap(_) => {}
         }
     }
     Ok(())
@@ -6043,7 +6838,17 @@ fn add_extracted_hashes(
                     set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
                 }
             }
-            FileLayoutItem::Directory(_) | FileLayoutItem::Gap(_) => {}
+            FileLayoutItem::AppleHfs(item) => {
+                set_host_asset_sha1(&mut item.apple_hfs, assets, &mut hashed_paths)?
+            }
+            FileLayoutItem::CeQuadratFormatter(item) => {
+                set_host_asset_sha1(&mut item.cequadrat_formatter, assets, &mut hashed_paths)?
+            }
+            FileLayoutItem::Directory(_)
+            | FileLayoutItem::PathTable(_)
+            | FileLayoutItem::DuplicateBlock(_)
+            | FileLayoutItem::CeQuadratJolietLinks(_)
+            | FileLayoutItem::Gap(_) => {}
         }
     }
     ensure!(
@@ -6075,7 +6880,12 @@ mod tests {
              \x20 - path: FILE.BIN\n\
              \x20   recording_time: 1998-03-19T11:58:36+09:00\n\
              \x20 layout:\n\
-             \x20 - path: FILE.BIN\n"
+             \x20 - path: FILE.BIN\n\
+             \x20 - path_table: primary_little\n\
+             \x20 - path_table: primary_little_copy\n\
+             \x20 - path_table: primary_big\n\
+             \x20 - path_table: primary_big_copy\n\
+             \x20 - directory: .\n"
         ))
         .unwrap()
     }
@@ -6103,6 +6913,97 @@ mod tests {
             interleave: None,
             gap_overrides: Vec::new(),
         }
+    }
+
+    fn put_be_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn apple_partition_map_requires_one_bounded_hfs_partition() {
+        let mut system = vec![0_u8; 3 * 512];
+        system[..2].copy_from_slice(b"ER");
+        system[2..4].copy_from_slice(&512_u16.to_be_bytes());
+        for index in 0..2 {
+            let offset = (index + 1) * 512;
+            system[offset..offset + 2].copy_from_slice(b"PM");
+            put_be_u32(&mut system, offset + 4, 2);
+        }
+        put_be_u32(&mut system, 512 + 8, 1);
+        put_be_u32(&mut system, 512 + 12, 2);
+        system[512 + 48..512 + 67].copy_from_slice(b"Apple_partition_map");
+        put_be_u32(&mut system, 1024 + 8, 7);
+        put_be_u32(&mut system, 1024 + 12, 9);
+        system[1024 + 48..1024 + 57].copy_from_slice(b"Apple_HFS");
+
+        assert_eq!(apple_hfs_partition(&system, 4).unwrap(), Some((7, 9)));
+        assert!(apple_hfs_partition(&system, 3).is_err());
+        system[512 + 48..512 + 80].fill(0);
+        system[512 + 48..512 + 57].copy_from_slice(b"Apple_HFS");
+        assert!(apple_hfs_partition(&system, 4).is_err());
+    }
+
+    #[test]
+    fn cequadrat_link_table_is_generated_from_directory_extent_pairs() {
+        let primary = vec![
+            iso9660::ParsedDirectory {
+                path: iso9660::ROOT_PATH.to_owned(),
+                extent: 26,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+            iso9660::ParsedDirectory {
+                path: "DATA".to_owned(),
+                extent: 27,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+        ];
+        let joliet = vec![
+            iso9660::ParsedDirectory {
+                path: iso9660::ROOT_PATH.to_owned(),
+                extent: 24,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+            iso9660::ParsedDirectory {
+                path: "DATA".to_owned(),
+                extent: 25,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+        ];
+        let block = cequadrat_links_block(&primary, &joliet).unwrap();
+        assert!(block.starts_with(b"CeQuadrat Joliet directory link table"));
+        assert_eq!(u32::from_le_bytes(block[44..48].try_into().unwrap()), 2);
+        assert_eq!(
+            &block[48..64],
+            &[24, 0, 0, 0, 26, 0, 0, 0, 25, 0, 0, 0, 27, 0, 0, 0]
+        );
+        assert!(block[64..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn duplicate_block_rejects_a_shortened_source() {
+        let project = tempfile::tempdir().unwrap();
+        let data = project.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("sample.system"), []).unwrap();
+        fs::write(data.join("FILE.BIN"), vec![0_u8; LOGICAL_BLOCK_SIZE]).unwrap();
+        let mut manifest = test_manifest();
+        manifest
+            .iso9660
+            .as_mut()
+            .unwrap()
+            .layout
+            .push(FileLayoutItem::duplicate_block("FILE.BIN", 1));
+        let manifest_path = project.path().join("disc.yaml");
+        fs::write(&manifest_path, serialize_manifest(&manifest).unwrap()).unwrap();
+        let error = build(
+            &manifest_path,
+            &project.path().join("disc.bin"),
+            &data,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("shortened below block 1"));
     }
 
     fn set_indexed_assets(manifest: &mut Manifest, path: &str, assets: XaAssets) {
@@ -6245,6 +7146,12 @@ mod tests {
             supplementary_path_tables: None,
             metadata_gaps: Vec::new(),
         }
+    }
+
+    fn test_primary_entry(path: &str) -> Entry {
+        let mut entry = test_manifest().iso9660.unwrap().entries.remove(1);
+        entry.path = path.to_owned();
+        entry
     }
 
     fn parsed_form1_sequence(subheaders: &[XaSubheader]) -> Vec<crate::raw_cd::ParsedSector> {
@@ -7097,6 +8004,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "NEXT.BIN".to_owned(),
@@ -7300,11 +8208,11 @@ mod tests {
             },
         ];
 
-        assert!(
+        assert_eq!(
             detect_file_layout(&sectors, &[], &directories, &[], true, "test")
                 .unwrap()
-                .items
-                .is_empty()
+                .items,
+            vec![FileLayoutItem::directory(iso9660::ROOT_PATH)]
         );
     }
 
@@ -7438,6 +8346,7 @@ mod tests {
                     attributes: Some(crate::manifest::XaAttributes::INTERLEAVED),
                     ..crate::manifest::EntryXa::default()
                 }),
+                ..test_primary_entry("UNUSED")
             });
             parsed.manifest.entries.push(Entry {
                 path: "NEXT.BIN".to_owned(),
@@ -7452,6 +8361,7 @@ mod tests {
                 directory_parent_xa: None,
                 sector_subheader: EntrySectorSubheader::Canonical,
                 xa: None,
+                ..test_primary_entry("UNUSED")
             });
             parsed.files = vec![
                 iso9660::ParsedFile {
@@ -7511,8 +8421,12 @@ mod tests {
                 "test",
             )
             .unwrap();
-            assert!(layout.items[0].as_xa_extent().is_some());
-            assert_eq!(layout.items[1], FileLayoutItem::path("NEXT.BIN"));
+            let xa_index = layout
+                .items
+                .iter()
+                .position(|item| item.as_xa_extent().is_some())
+                .unwrap();
+            assert_eq!(layout.items[xa_index + 1], FileLayoutItem::path("NEXT.BIN"));
         }
     }
 
@@ -7535,6 +8449,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "OUTSIDE.BIN".to_owned(),
@@ -7554,6 +8469,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "PARTIAL.BIN".to_owned(),
@@ -7576,6 +8492,50 @@ mod tests {
 
         parsed.manifest.layout.clear();
         assert!(iso9660::layout(&parsed.manifest, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn zero_length_file_records_do_not_claim_physical_placement() {
+        let mut parsed = parsed_iso();
+        parsed.files[0].extent = 17;
+        parsed.files[0].length = 0;
+
+        detach_record_only_files(18, &mut parsed).unwrap();
+
+        assert!(parsed.files.is_empty());
+        assert_eq!(
+            parsed.manifest.entries[1].reference,
+            Some(EntryReference {
+                kind: EntryReferenceKind::RecordOnly,
+                extent: 17,
+                length: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_ordinary_extents_keep_one_physical_owner() {
+        let mut parsed = parsed_iso();
+        parsed.files[0].extent = 1;
+        parsed.files[0].length = 2 * LOGICAL_BLOCK_SIZE as u32;
+        parsed
+            .manifest
+            .entries
+            .push(test_primary_entry("SECOND.BIN"));
+        parsed.files.push(iso9660::ParsedFile {
+            path: "SECOND.BIN".to_owned(),
+            extent: 1,
+            length: 2 * LOGICAL_BLOCK_SIZE as u32,
+        });
+
+        detach_remaining_overlapping_files(&mut parsed).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].path, "FILE.BIN");
+        assert_eq!(
+            parsed.manifest.entries[2].reference.unwrap().kind,
+            EntryReferenceKind::RecordOnly
+        );
     }
 
     #[test]
@@ -7626,6 +8586,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -7787,6 +8748,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -7943,6 +8905,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.files.push(iso9660::ParsedFile {
             path: "SECOND.BIN".to_owned(),
@@ -7998,6 +8961,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         directory_iso.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -8044,6 +9008,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -8087,6 +9052,7 @@ mod tests {
             directory_parent_xa: None,
             sector_subheader: EntrySectorSubheader::Canonical,
             xa: None,
+            ..test_primary_entry("UNUSED")
         });
         parsed.directories.push(iso9660::ParsedDirectory {
             path: "DIR".to_owned(),
@@ -8447,19 +9413,33 @@ mod tests {
         );
         assert!(xa.form2.sha1.is_some());
         assert!(xa.index.as_ref().unwrap().sha1.is_some());
-        if let FileLayoutItem::Path(file) = &manifest.iso9660.as_ref().unwrap().layout[1] {
-            let expected = sha1_hex(&[1]);
-            assert_eq!(file.sha1.as_deref(), Some(expected.as_str()));
-        } else {
-            panic!("ordinary asset is not a path item");
-        }
-        if let FileLayoutItem::XaExtent(item) = &manifest.iso9660.as_ref().unwrap().layout[2] {
-            assert!(item.xa_extent.form1.sha1.is_some());
-            assert!(item.xa_extent.form2.sha1.is_some());
-            assert!(item.xa_extent.index.as_ref().unwrap().sha1.is_some());
-        } else {
-            panic!("unreferenced asset is not an XA extent");
-        }
+        let ordinary = manifest
+            .iso9660
+            .as_ref()
+            .unwrap()
+            .layout
+            .iter()
+            .find_map(|item| match item {
+                FileLayoutItem::Path(file) if file.path == "ORDINARY.BIN" => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        let expected = sha1_hex(&[1]);
+        assert_eq!(ordinary.sha1.as_deref(), Some(expected.as_str()));
+        let extra = manifest
+            .iso9660
+            .as_ref()
+            .unwrap()
+            .layout
+            .iter()
+            .find_map(|item| match item {
+                FileLayoutItem::XaExtent(item) => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        assert!(extra.xa_extent.form1.sha1.is_some());
+        assert!(extra.xa_extent.form2.sha1.is_some());
+        assert!(extra.xa_extent.index.as_ref().unwrap().sha1.is_some());
         let yaml = serialize_manifest(&manifest).unwrap();
         assert!(yaml.contains(&format!("sha1: {track_sha1}")));
         assert!(yaml.contains("sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709"));

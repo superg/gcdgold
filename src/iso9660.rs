@@ -5,13 +5,13 @@ use anyhow::{Context, Result, ensure};
 use crate::manifest::{
     DEFAULT_XA_PERMISSIONS, DirectoryLengthPolicy, DirectoryParentRecordingTime,
     DirectoryRecordPacking, DirectorySlack, Entry, EntryReference, EntryReferenceKind,
-    EntrySectorSubheader, EntryXa, FileLayoutItem, GapKind, Iso9660, JolietEntry, JolietLevel,
-    JolietVolume, MetadataLayoutItem, MetadataPathTable, MetadataSubheader, MetadataVolume,
+    EntrySectorSubheader, EntryXa, FileLayoutItem, GapKind, Iso9660, IsoMetadataSubheader,
+    JolietEntry, JolietLevel, JolietVolume, MetadataPathTable, MetadataSubheader, MetadataVolume,
     PathTableCopies, PathTableOrder, PathTableSubheader, PrimaryVolume,
     PrimaryVolumeApplicationUse, PvdU16Encoding, RootDirectoryIdentifier,
     VolumeTerminatorSubheader, XaAssets, XaAttributes, XaLengthEncoding,
 };
-use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader};
+use crate::raw_cd::{LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, XaSubheader, XaSubmode};
 
 const VOLUME_SET_SIZE: u16 = 1;
 const VOLUME_SEQUENCE_NUMBER: u16 = 1;
@@ -23,6 +23,14 @@ const DIRECTORY_FLAG: u8 = 2;
 const ASSOCIATED_FLAG: u8 = 4;
 const XA_SYSTEM_USE_SIZE: usize = 14;
 const XA_ATTRIBUTE_MASK: u16 = 0xf800;
+const FORM1_DATA_SUBHEADER: XaSubheader = XaSubheader::with_submode(XaSubmode::DATA);
+const SYSTEM_END_OF_FILE_SUBHEADER: XaSubheader =
+    XaSubheader::with_submode(XaSubmode::DATA.union(XaSubmode::END_OF_FILE));
+const ISO_METADATA_SUBHEADER: XaSubheader = XaSubheader::with_submode(
+    XaSubmode::END_OF_RECORD
+        .union(XaSubmode::DATA)
+        .union(XaSubmode::END_OF_FILE),
+);
 const APPLICATION_USE_START: usize = 883;
 const APPLICATION_USE_END: usize = 1395;
 const CD_XA_SIGNATURE_OFFSET: usize = 1024 - APPLICATION_USE_START;
@@ -69,6 +77,7 @@ struct Record {
     interleave_gap_size: u8,
     volume_sequence_number: u16,
     name: Vec<u8>,
+    identifier_padding: u8,
     system_use: Vec<u8>,
     trailing_system_use_padding: bool,
 }
@@ -124,6 +133,9 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     );
     let path_table_copies = match (path_table_extents[1], path_table_extents[3]) {
         (0, 0) => PathTableCopies::Single,
+        (little, big) if little == path_table_extents[0] && big == path_table_extents[2] => {
+            PathTableCopies::Aliased
+        }
         (little, big) if little != 0 && big != 0 => PathTableCopies::Duplicate,
         _ => anyhow::bail!("optional path-table copies must both be present or absent"),
     };
@@ -162,6 +174,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         .filter(|extent| *extent != 0)
         .collect::<Vec<_>>();
     ordered_path_tables.sort_unstable();
+    ordered_path_tables.dedup();
     let path_table_stride = ordered_path_tables[1] - ordered_path_tables[0];
     let path_table_padding = if supplementary.is_none()
         && path_table_stride >= path_table_blocks
@@ -196,25 +209,41 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             .context("reading root directory")?;
     ensure!(root_records.len() >= 2, "root directory lacks dot records");
     let dot = &root_records[0];
-    let xa_system_use = !dot.system_use.is_empty();
+    let xa_system_use = has_xa_system_use(&dot.system_use);
     let root_recording_time = parse_recording_time(dot.recording_time)?;
     let pvd_root_recording_time = parse_recording_time(root_record.recording_time)?;
     pvd.root_directory_recording_time =
         (pvd_root_recording_time != root_recording_time).then_some(pvd_root_recording_time);
-    let root = Entry {
+    let mut root = Entry {
         path: ROOT_PATH.to_owned(),
+        omit_version: false,
         recording_time: root_recording_time,
         hidden: root_record.flags & 1 != 0,
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
         reference: None,
         xa_system_use: None,
         directory_slack: None,
+        directory_length_policy: None,
         allocation_padding_hex: None,
         directory_self_xa: None,
         directory_parent_xa: None,
+        system_use_hex: None,
+        identifier_padding: None,
+        directory_self_system_use_hex: system_use_prefix_hex(&root_records[0], xa_system_use),
+        directory_parent_system_use_hex: system_use_prefix_hex(&root_records[1], xa_system_use),
+        directory_self_recording_time: None,
+        directory_parent_recording_time: None,
+        directory_self_length: None,
+        directory_parent_length: None,
+        directory_self_hidden: None,
+        directory_parent_hidden: None,
         sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, xa_system_use)?,
     };
+    let root_parent_time = parse_recording_time(root_records[1].recording_time)?;
+    if root_parent_time != root.recording_time {
+        root.directory_parent_recording_time = Some(root_parent_time);
+    }
 
     let mut entries = vec![root];
     let mut files = Vec::new();
@@ -247,20 +276,55 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         ensure!(records.len() >= 2, "directory lacks dot records");
         let dot_xa = entry_xa(&records[0], true, xa_system_use)?;
         let parent_xa = entry_xa(&records[1], true, xa_system_use)?;
-        let expected_dot_system_use =
-            serialize_directory_record_system_use(&entries[directory_index], true, xa_system_use)?;
+        let expected_dot_system_use = if xa_system_use {
+            serialize_xa_system_use(&entries[directory_index], true)?
+        } else {
+            Vec::new()
+        };
         let parent_directory_path = parent_path(directory_path);
         let parent_index = entries
             .iter()
             .position(|entry| entry.path == parent_directory_path)
             .context("parent directory entry is missing")?;
-        let expected_parent_system_use =
-            serialize_directory_record_system_use(&entries[parent_index], true, xa_system_use)?;
-        if expected_dot_system_use != records[0].system_use {
+        let expected_parent_system_use = if xa_system_use {
+            serialize_xa_system_use(&entries[parent_index], true)?
+        } else {
+            Vec::new()
+        };
+        let dot_suffix = xa_system_use_suffix(&records[0].system_use, xa_system_use);
+        let parent_suffix = xa_system_use_suffix(&records[1].system_use, xa_system_use);
+        if expected_dot_system_use != dot_suffix {
             entries[directory_index].directory_self_xa = Some(dot_xa.unwrap_or_default());
         }
-        if expected_parent_system_use != records[1].system_use {
+        if expected_parent_system_use != parent_suffix {
             entries[directory_index].directory_parent_xa = Some(parent_xa.unwrap_or_default());
+        }
+        entries[directory_index].directory_self_system_use_hex =
+            system_use_prefix_hex(&records[0], xa_system_use);
+        entries[directory_index].directory_parent_system_use_hex =
+            system_use_prefix_hex(&records[1], xa_system_use);
+        if records[0].length != length {
+            entries[directory_index].directory_self_length = Some(records[0].length);
+        }
+        let expected_parent_length = directories
+            .iter()
+            .find(|directory| directory.path == parent_directory_path)
+            .context("parent directory placement is missing")?
+            .length;
+        if records[1].length != expected_parent_length {
+            entries[directory_index].directory_parent_length = Some(records[1].length);
+        }
+        let dot_hidden = records[0].flags & HIDDEN_FLAG != 0;
+        if dot_hidden != entries[directory_index].hidden {
+            entries[directory_index].directory_self_hidden = Some(dot_hidden);
+        }
+        let parent_hidden = records[1].flags & HIDDEN_FLAG != 0;
+        if parent_hidden != entries[parent_index].hidden {
+            entries[directory_index].directory_parent_hidden = Some(parent_hidden);
+        }
+        let dot_time = parse_recording_time(records[0].recording_time)?;
+        if dot_time != entries[directory_index].recording_time {
+            entries[directory_index].directory_self_recording_time = Some(dot_time);
         }
         if directory_path != ROOT_PATH {
             let current_time = &entries
@@ -275,26 +339,30 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                 .context("parent directory entry is missing")?
                 .recording_time;
             let recorded_time = parse_recording_time(records[1].recording_time)?;
-            if current_time != parent_time {
-                let observed = if recorded_time == parent_time.as_str() {
-                    DirectoryParentRecordingTime::Parent
-                } else if recorded_time == current_time.as_str() {
-                    DirectoryParentRecordingTime::Current
-                } else {
-                    anyhow::bail!(
-                        "directory parent record has an unsupported recording time: {directory_path} at LBA {extent}"
-                    )
-                };
+            let observed = if current_time != parent_time && recorded_time == parent_time.as_str() {
+                Some(DirectoryParentRecordingTime::Parent)
+            } else if current_time != parent_time && recorded_time == current_time.as_str() {
+                Some(DirectoryParentRecordingTime::Current)
+            } else {
+                None
+            };
+            if let Some(observed) = observed {
                 ensure!(
                     directory_parent_recording_time.is_none_or(|value| value == observed),
                     "directories use inconsistent parent-record recording times"
                 );
                 directory_parent_recording_time = Some(observed);
+            } else if recorded_time != parent_time.as_str() {
+                entries[directory_index].directory_parent_recording_time = Some(recorded_time);
             }
         }
         for (record_index, record) in records.iter().enumerate() {
             let directory = record.flags & DIRECTORY_FLAG != 0;
-            let record_uses_xa = xa_system_use && !record.system_use.is_empty();
+            let record_uses_xa = xa_system_use && has_xa_system_use(&record.system_use);
+            ensure!(
+                record.volume_sequence_number == root_record.volume_sequence_number,
+                "inconsistent directory-record volume sequence number"
+            );
             ensure!(
                 !xa_system_use || record_uses_xa || (record_index >= 2 && !directory),
                 "XA system-use omission is supported only for file records"
@@ -305,17 +373,16 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             let raw_name =
                 String::from_utf8(record.name.clone()).context("non-ASCII ISO identifier")?;
             let is_dir = record.flags & DIRECTORY_FLAG != 0;
-            let name = if is_dir {
-                raw_name
-            } else {
-                let (name, version) = raw_name
-                    .rsplit_once(';')
-                    .context("file identifier has no version")?;
+            let (name, omit_version) = if is_dir {
+                (raw_name, false)
+            } else if let Some((name, version)) = raw_name.rsplit_once(';') {
                 ensure!(
                     version.parse::<u8>().context("invalid file version")? == FILE_VERSION,
                     "unsupported file version"
                 );
-                name.to_owned()
+                (name.to_owned(), false)
+            } else {
+                (raw_name, true)
             };
             let path = if parent.is_empty() {
                 name
@@ -329,7 +396,7 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
                     "unsupported non-ASCII ISO identifier: {component}"
                 );
             }
-            let record_uses_xa = xa_system_use && !record.system_use.is_empty();
+            let record_uses_xa = xa_system_use && has_xa_system_use(&record.system_use);
             let xa = entry_xa(&record, is_dir, record_uses_xa)?;
             let external_cdda = !is_dir && xa.as_ref().is_some_and(entry_xa_is_cdda);
             let reference = if is_dir && record.length == 0 {
@@ -349,17 +416,30 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
             };
             let entry = Entry {
                 path: path.clone(),
+                omit_version,
                 recording_time: parse_recording_time(record.recording_time)?,
                 hidden: record.flags & 1 != 0,
                 associated: record.flags & ASSOCIATED_FLAG != 0,
                 reference,
                 xa_system_use: (xa_system_use && !record_uses_xa).then_some(false),
                 directory_slack: None,
+                directory_length_policy: None,
                 allocation_padding_hex: (!is_dir && !external_cdda)
                     .then(|| file_allocation_padding_hex(blocks, &record))
                     .flatten(),
                 directory_self_xa: None,
                 directory_parent_xa: None,
+                system_use_hex: system_use_prefix_hex(&record, record_uses_xa),
+                identifier_padding: (record.identifier_padding != 0)
+                    .then_some(record.identifier_padding),
+                directory_self_system_use_hex: None,
+                directory_parent_system_use_hex: None,
+                directory_self_recording_time: None,
+                directory_parent_recording_time: None,
+                directory_self_length: None,
+                directory_parent_length: None,
+                directory_self_hidden: None,
+                directory_parent_hidden: None,
                 sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                 xa,
             };
@@ -491,7 +571,6 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         primary_volume: pvd,
         primary_volume_copies: u8::try_from(primary_volume_copies)?,
         supplementary_volumes: Vec::new(),
-        metadata_layout: Vec::new(),
         xa_system_use,
         metadata_subheader: MetadataSubheader::default(),
         volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
@@ -502,6 +581,9 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         },
         directory_parent_recording_time: directory_parent_recording_time.unwrap_or_default(),
         directory_length_policy: DirectoryLengthPolicy::Allocated,
+        directory_record_volume_sequence_number: (root_record.volume_sequence_number
+            != VOLUME_SEQUENCE_NUMBER)
+            .then_some(root_record.volume_sequence_number),
         path_table_size: (path_table_size != generated_path_table_size).then_some(path_table_size),
         path_table_padding,
         path_table_little_hex,
@@ -514,29 +596,22 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
     };
     let mut supplementary_directories = Vec::new();
     let mut supplementary_path_tables = None;
-    let mut metadata_gaps = Vec::new();
     if let Some((_, block)) = supplementary {
-        ensure!(
-            manifest.path_table_copies == PathTableCopies::Single,
-            "Joliet support requires single primary path-table copies"
-        );
         let parsed = parse_joliet(blocks, block, &files)?;
         manifest.supplementary_volumes.push(parsed.volume);
-        let (metadata_layout, gaps) = derive_metadata_layout(
-            blocks,
-            u32::try_from(terminator_lba + 1)?,
-            &primary_path_tables,
-            &directories,
-            &parsed.path_tables,
-            &parsed.directories,
-        )?;
-        manifest.metadata_layout = metadata_layout;
-        metadata_gaps = gaps;
         supplementary_directories = parsed.directories;
         supplementary_path_tables = Some(parsed.path_tables);
-        manifest.directory_length_policy =
-            infer_directory_length_policy(&manifest, &directories, &supplementary_directories)?;
     }
+    manifest.layout = complete_logical_layout(
+        &files,
+        &directories,
+        &supplementary_directories,
+        &primary_path_tables,
+        supplementary_path_tables.as_ref(),
+        17 + u32::from(manifest.primary_volume_copies)
+            + u32::try_from(manifest.supplementary_volumes.len())?,
+    )?;
+    infer_directory_length_policy(&mut manifest, &directories, &supplementary_directories)?;
     Ok(ParsedIso {
         manifest,
         files,
@@ -544,160 +619,178 @@ pub fn parse(blocks: &[[u8; LOGICAL_BLOCK_SIZE]]) -> Result<ParsedIso> {
         path_tables: Some(primary_path_tables),
         supplementary_directories,
         supplementary_path_tables,
-        metadata_gaps,
+        metadata_gaps: Vec::new(),
     })
 }
 
-#[derive(Debug)]
-struct MetadataObject {
-    start: u32,
-    end: u32,
-    item: MetadataLayoutItem,
-}
-
-fn derive_metadata_layout(
-    blocks: &[[u8; LOGICAL_BLOCK_SIZE]],
-    start: u32,
-    primary_tables: &ParsedPathTables,
-    primary_directories: &[ParsedDirectory],
-    joliet_tables: &ParsedPathTables,
+fn complete_logical_layout(
+    files: &[ParsedFile],
+    directories: &[ParsedDirectory],
     joliet_directories: &[ParsedDirectory],
-) -> Result<(Vec<MetadataLayoutItem>, Vec<GapPlacement>)> {
-    let mut objects = Vec::new();
-    for (extent, path_table) in [
-        (primary_tables.extents[0], MetadataPathTable::PrimaryLittle),
-        (primary_tables.extents[2], MetadataPathTable::PrimaryBig),
-        (joliet_tables.extents[0], MetadataPathTable::JolietLittle),
-        (joliet_tables.extents[2], MetadataPathTable::JolietBig),
-    ] {
-        objects.push(MetadataObject {
-            start: extent,
-            end: extent
-                .checked_add(
-                    if matches!(
-                        path_table,
-                        MetadataPathTable::PrimaryLittle | MetadataPathTable::PrimaryBig
-                    ) {
-                        primary_tables.blocks
-                    } else {
-                        joliet_tables.blocks
-                    },
-                )
-                .context("metadata path-table extent overflow")?,
-            item: MetadataLayoutItem::path_table(path_table),
-        });
+    primary_tables: &ParsedPathTables,
+    joliet_tables: Option<&ParsedPathTables>,
+    content_start: u32,
+) -> Result<Vec<FileLayoutItem>> {
+    let mut objects = files
+        .iter()
+        .map(|file| {
+            (
+                file.extent,
+                file.length.div_ceil(LOGICAL_BLOCK_SIZE as u32),
+                FileLayoutItem::path(&file.path),
+            )
+        })
+        .chain(
+            directories
+                .iter()
+                .filter(|directory| directory.length != 0)
+                .map(|directory| {
+                    (
+                        directory.extent,
+                        directory.length.div_ceil(LOGICAL_BLOCK_SIZE as u32),
+                        FileLayoutItem::directory(&directory.path),
+                    )
+                }),
+        )
+        .chain(
+            joliet_directories
+                .iter()
+                .filter(|directory| directory.length != 0)
+                .map(|directory| {
+                    (
+                        directory.extent,
+                        directory.length.div_ceil(LOGICAL_BLOCK_SIZE as u32),
+                        FileLayoutItem::volume_directory(MetadataVolume::Joliet, &directory.path),
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    for (extent, kind) in primary_tables.extents.into_iter().zip([
+        MetadataPathTable::PrimaryLittle,
+        MetadataPathTable::PrimaryLittleCopy,
+        MetadataPathTable::PrimaryBig,
+        MetadataPathTable::PrimaryBigCopy,
+    ]) {
+        if extent != 0 && seen.insert(extent) {
+            objects.push((
+                extent,
+                primary_tables.blocks,
+                FileLayoutItem::path_table(kind),
+            ));
+        }
     }
-    let grouped_directories =
-        [primary_directories, joliet_directories]
-            .into_iter()
-            .all(|directories| {
-                !directories.is_empty()
-                    && directories.windows(2).all(|pair| {
-                        pair[0]
-                            .extent
-                            .checked_add(pair[0].length.div_ceil(LOGICAL_BLOCK_SIZE as u32))
-                            == Some(pair[1].extent)
-                    })
-            });
-    if grouped_directories {
-        for (directories, volume) in [
-            (primary_directories, MetadataVolume::Primary),
-            (joliet_directories, MetadataVolume::Joliet),
+    if let Some(tables) = joliet_tables {
+        for (extent, kind) in [
+            (tables.extents[0], MetadataPathTable::JolietLittle),
+            (tables.extents[2], MetadataPathTable::JolietBig),
         ] {
-            let first = directories
-                .first()
-                .context("metadata directory set is empty")?;
-            let mut end = first.extent;
-            for directory in directories {
-                ensure!(
-                    directory.extent == end,
-                    "metadata directory set is not physically contiguous"
-                );
-                end = end
-                    .checked_add(directory.length.div_ceil(LOGICAL_BLOCK_SIZE as u32))
-                    .context("metadata directory extent overflow")?;
+            if extent != 0 && seen.insert(extent) {
+                objects.push((extent, tables.blocks, FileLayoutItem::path_table(kind)));
             }
-            objects.push(MetadataObject {
-                start: first.extent,
-                end,
-                item: MetadataLayoutItem::directories(volume),
-            });
         }
     }
-    objects.sort_by_key(|object| object.start);
-    let mut cursor = start;
+    objects.sort_by_key(|object| object.0);
+    let mut cursor = content_start;
     let mut layout = Vec::new();
-    let mut gaps = Vec::new();
-    for object in objects {
-        ensure!(object.start >= cursor, "overlapping ISO metadata extents");
-        if object.start > cursor {
-            ensure!(
-                blocks[usize::try_from(cursor)?..usize::try_from(object.start)?]
-                    .iter()
-                    .all(|block| block.iter().all(|byte| *byte == 0)),
-                "unsupported nonzero sectors between ISO metadata extents"
-            );
-            let sectors = object.start - cursor;
-            layout.push(MetadataLayoutItem::gap(sectors));
-            gaps.push(GapPlacement {
-                start: cursor,
-                sectors,
-                kind: GapKind::Xa,
-                subheader: None,
-                form2_edc: None,
-            });
+    for (extent, blocks, item) in objects {
+        if extent < cursor {
+            continue;
         }
-        layout.push(object.item);
-        cursor = object.end;
+        if extent > cursor {
+            layout.push(FileLayoutItem::gap(extent - cursor));
+        }
+        layout.push(item);
+        cursor = extent
+            .checked_add(blocks)
+            .context("ISO object extent overflow")?;
     }
-    Ok((layout, gaps))
+    Ok(layout)
 }
 
 fn infer_directory_length_policy(
-    iso: &Iso9660,
+    iso: &mut Iso9660,
     primary: &[ParsedDirectory],
     joliet: &[ParsedDirectory],
-) -> Result<DirectoryLengthPolicy> {
+) -> Result<()> {
     let primary_files = iso
         .layout
         .iter()
         .filter_map(FileLayoutItem::as_path)
         .collect::<HashSet<_>>();
-    let primary_records = primary.iter().map(|directory| {
-        let lengths = directory_record_lengths(&directory.path, iso, &primary_files);
-        (
-            directory.length,
-            packed_length(&lengths, iso.directory_record_packing),
-        )
-    });
-    let volume = iso
+    let primary_records = primary
+        .iter()
+        .map(|directory| {
+            let lengths = directory_record_lengths(&directory.path, iso, &primary_files);
+            (
+                directory.path.clone(),
+                directory.length,
+                packed_length(&lengths, iso.directory_record_packing),
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(primary_files);
+    let joliet_records = iso
         .supplementary_volumes
         .first()
-        .context("missing Joliet volume")?;
-    let joliet_records = joliet.iter().map(|directory| {
-        let lengths = joliet_directory_record_lengths(&directory.path, volume)?;
-        Ok((
-            directory.length,
-            packed_length(&lengths, iso.directory_record_packing),
-        ))
-    });
-    let values = primary_records
-        .map(Ok)
-        .chain(joliet_records)
-        .collect::<Result<Vec<(u32, usize)>>>()?;
-    if values
+        .into_iter()
+        .flat_map(|volume| joliet.iter().map(move |directory| (volume, directory)))
+        .map(|(volume, directory)| {
+            let lengths = joliet_directory_record_lengths(&directory.path, volume)?;
+            Ok((
+                directory.length,
+                packed_length(&lengths, iso.directory_record_packing),
+            ))
+        });
+    let joliet_values = joliet_records.collect::<Result<Vec<(u32, usize)>>>()?;
+    let joliet_allocated = joliet_values
         .iter()
-        .all(|(length, _)| length.is_multiple_of(LOGICAL_BLOCK_SIZE as u32))
-    {
-        Ok(DirectoryLengthPolicy::Allocated)
-    } else if values
+        .all(|(length, _)| length.is_multiple_of(LOGICAL_BLOCK_SIZE as u32));
+    let joliet_records = joliet_values
         .iter()
-        .all(|(length, records)| usize::try_from(*length) == Ok(*records))
-    {
-        Ok(DirectoryLengthPolicy::Records)
+        .all(|(length, records)| usize::try_from(*length) == Ok(*records));
+    ensure!(
+        joliet_values.is_empty() || joliet_allocated || joliet_records,
+        "Joliet directories use inconsistent recorded lengths"
+    );
+
+    let primary_all_records = primary_records
+        .iter()
+        .all(|(_, length, records)| usize::try_from(*length) == Ok(*records));
+    let use_records_globally = primary_all_records && (joliet_values.is_empty() || joliet_records);
+    iso.directory_length_policy = if use_records_globally {
+        DirectoryLengthPolicy::Records
     } else {
-        anyhow::bail!("primary and Joliet directories use inconsistent recorded lengths")
+        DirectoryLengthPolicy::Allocated
+    };
+    if !use_records_globally {
+        for (path, length, records) in primary_records {
+            if !length.is_multiple_of(LOGICAL_BLOCK_SIZE as u32) {
+                ensure!(
+                    usize::try_from(length) == Ok(records),
+                    "primary directory {path} has an unsupported recorded length"
+                );
+                iso.entries
+                    .iter_mut()
+                    .find(|entry| entry.path == path)
+                    .expect("parsed directory entry")
+                    .directory_length_policy = Some(DirectoryLengthPolicy::Records);
+            }
+        }
+    } else {
+        ensure!(
+            primary_all_records,
+            "primary directory length inference failed"
+        );
     }
+    ensure!(
+        joliet_values.is_empty()
+            || (iso.directory_length_policy == DirectoryLengthPolicy::Allocated
+                && joliet_allocated)
+            || (iso.directory_length_policy == DirectoryLengthPolicy::Records && joliet_records),
+        "primary and Joliet directory length policies differ"
+    );
+    Ok(())
 }
 
 fn file_allocation_padding_hex(
@@ -721,14 +814,8 @@ fn file_allocation_padding_hex(
 fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
     ensure!(read_both_u32(block, 80)? > 0, "invalid volume size");
     let u16_encoding = pvd_u16_encoding(block)?;
-    ensure!(
-        u16::from_le_bytes(block[120..122].try_into()?) == VOLUME_SET_SIZE,
-        "unsupported volume set size"
-    );
-    ensure!(
-        u16::from_le_bytes(block[124..126].try_into()?) == VOLUME_SEQUENCE_NUMBER,
-        "unsupported volume sequence number"
-    );
+    let volume_set_size = u16::from_le_bytes(block[120..122].try_into()?);
+    let volume_sequence_number = u16::from_le_bytes(block[124..126].try_into()?);
     ensure!(
         u16::from_le_bytes(block[128..130].try_into()?) == ISO_LOGICAL_BLOCK_SIZE,
         "unsupported logical block size"
@@ -750,6 +837,9 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
     });
     Ok(PrimaryVolume {
         volume_space_size: None,
+        volume_set_size: (volume_set_size != VOLUME_SET_SIZE).then_some(volume_set_size),
+        volume_sequence_number: (volume_sequence_number != VOLUME_SEQUENCE_NUMBER)
+            .then_some(volume_sequence_number),
         file_structure_version,
         u16_encoding,
         application_use: application_use.unwrap_or_default(),
@@ -758,10 +848,11 @@ fn parse_pvd(block: &[u8; LOGICAL_BLOCK_SIZE]) -> Result<PrimaryVolume> {
             .then(|| hex::encode(&block[APPLICATION_USE_START..APPLICATION_USE_END])),
         root_directory_record_length: None,
         root_directory_recording_time: None,
-        root_directory_identifier: match block[189] {
-            0 => RootDirectoryIdentifier::Current,
-            1 => RootDirectoryIdentifier::Parent,
-            value => anyhow::bail!("unsupported PVD root directory identifier {value}"),
+        root_directory_identifier: match (block[188], block[189]) {
+            (_, 1) => RootDirectoryIdentifier::Parent,
+            (0, _) => RootDirectoryIdentifier::Empty,
+            (_, 0) => RootDirectoryIdentifier::Current,
+            (_, value) => anyhow::bail!("unsupported PVD root directory identifier {value}"),
         },
         escape_sequence: parse_optional_joliet_level(&block[88..120])?,
         system_identifier: read_fixed(block, 8, 32)?,
@@ -808,8 +899,13 @@ fn parse_joliet(
         u32::from_be_bytes(block[148..152].try_into()?),
         u32::from_be_bytes(block[152..156].try_into()?),
     ];
+    let aliased_path_table_pointers = pointers[0] != 0
+        && pointers[1] == pointers[0]
+        && pointers[2] != 0
+        && pointers[3] == pointers[2];
     ensure!(
-        pointers[0] != 0 && pointers[1] == 0 && pointers[2] != 0 && pointers[3] == 0,
+        (pointers[0] != 0 && pointers[1] == 0 && pointers[2] != 0 && pointers[3] == 0)
+            || aliased_path_table_pointers,
         "Joliet volume requires one little- and one big-endian path table"
     );
     for extent in [pointers[0], pointers[2]] {
@@ -855,6 +951,17 @@ fn parse_joliet(
         recording_time: parse_recording_time(dot.recording_time)?,
         hidden: root_record.flags & HIDDEN_FLAG != 0,
         associated: root_record.flags & ASSOCIATED_FLAG != 0,
+        system_use_hex: None,
+        identifier_padding: None,
+        directory_self_system_use_hex: system_use_prefix_hex(&root_records[0], xa_system_use),
+        directory_parent_system_use_hex: system_use_prefix_hex(&root_records[1], xa_system_use),
+        directory_self_recording_time: None,
+        directory_parent_recording_time: None,
+        directory_self_length: None,
+        directory_parent_length: None,
+        directory_self_hidden: None,
+        directory_parent_hidden: None,
+        sector_subheader: EntrySectorSubheader::Canonical,
         xa: entry_xa(dot, true, xa_system_use)?,
         directory_self_xa: None,
         directory_parent_xa: None,
@@ -896,34 +1003,69 @@ fn parse_joliet(
             .position(|entry| entry.path == directory_path)
             .context("Joliet directory entry is missing")?;
         let parent_xa = entry_xa(&records[1], true, xa_system_use)?;
-        let expected_dot_system_use = if xa_system_use {
-            serialize_xa_system_use_parts(
+        let mut expected_dot_system_use = entries[directory_index]
+            .directory_self_system_use_hex
+            .as_deref()
+            .map(hex::decode)
+            .transpose()?
+            .unwrap_or_default();
+        if xa_system_use {
+            expected_dot_system_use.extend_from_slice(&serialize_xa_system_use_parts(
                 directory_path,
                 entries[directory_index].xa.as_ref(),
                 true,
-            )?
-        } else {
-            Vec::new()
-        };
+            )?);
+        }
         let parent_directory_path = parent_path(directory_path);
         let parent_index = entries
             .iter()
             .position(|entry| entry.path == parent_directory_path)
             .context("Joliet parent directory entry is missing")?;
-        let expected_parent_system_use = if xa_system_use {
-            serialize_xa_system_use_parts(
+        let mut expected_parent_system_use = entries[directory_index]
+            .directory_parent_system_use_hex
+            .as_deref()
+            .map(hex::decode)
+            .transpose()?
+            .unwrap_or_default();
+        if xa_system_use {
+            expected_parent_system_use.extend_from_slice(&serialize_xa_system_use_parts(
                 &parent_directory_path,
                 entries[parent_index].xa.as_ref(),
                 true,
-            )?
-        } else {
-            Vec::new()
-        };
+            )?);
+        }
         if expected_dot_system_use != records[0].system_use {
             entries[directory_index].directory_self_xa = Some(dot_xa.unwrap_or_default());
         }
         if expected_parent_system_use != records[1].system_use {
             entries[directory_index].directory_parent_xa = Some(parent_xa.unwrap_or_default());
+        }
+        let dot_time = parse_recording_time(records[0].recording_time)?;
+        if dot_time != entries[directory_index].recording_time {
+            entries[directory_index].directory_self_recording_time = Some(dot_time);
+        }
+        let parent_time = parse_recording_time(records[1].recording_time)?;
+        if parent_time != entries[parent_index].recording_time {
+            entries[directory_index].directory_parent_recording_time = Some(parent_time);
+        }
+        if records[0].length != length {
+            entries[directory_index].directory_self_length = Some(records[0].length);
+        }
+        let expected_parent_length = directories
+            .iter()
+            .find(|directory| directory.path == parent_directory_path)
+            .context("Joliet parent directory placement is missing")?
+            .length;
+        if records[1].length != expected_parent_length {
+            entries[directory_index].directory_parent_length = Some(records[1].length);
+        }
+        let dot_hidden = records[0].flags & HIDDEN_FLAG != 0;
+        if dot_hidden != entries[directory_index].hidden {
+            entries[directory_index].directory_self_hidden = Some(dot_hidden);
+        }
+        let parent_hidden = records[1].flags & HIDDEN_FLAG != 0;
+        if parent_hidden != entries[parent_index].hidden {
+            entries[directory_index].directory_parent_hidden = Some(parent_hidden);
         }
         for record in &records {
             let directory = record.flags & DIRECTORY_FLAG != 0;
@@ -964,6 +1106,18 @@ fn parse_joliet(
                 recording_time: parse_recording_time(record.recording_time)?,
                 hidden: record.flags & HIDDEN_FLAG != 0,
                 associated: record.flags & ASSOCIATED_FLAG != 0,
+                system_use_hex: system_use_prefix_hex(&record, xa_system_use),
+                identifier_padding: (record.identifier_padding != 0)
+                    .then_some(record.identifier_padding),
+                directory_self_system_use_hex: None,
+                directory_parent_system_use_hex: None,
+                directory_self_recording_time: None,
+                directory_parent_recording_time: None,
+                directory_self_length: None,
+                directory_parent_length: None,
+                directory_self_hidden: None,
+                directory_parent_hidden: None,
+                sector_subheader: EntrySectorSubheader::Canonical,
                 xa: entry_xa(&record, is_dir, xa_system_use)?,
                 directory_self_xa: None,
                 directory_parent_xa: None,
@@ -991,8 +1145,13 @@ fn parse_joliet(
     let noncanonical =
         path_table_size != generated_size || little != canonical_little || big != canonical_big;
     let odd_bytes = [block[738], block[775], block[812]];
-    let (zero_fill_empty_strings, zero_pad_strings, volume_set_identifier_raw_hex) =
-        joliet_string_padding(block, &descriptor)?;
+    let (
+        zero_fill_empty_strings,
+        zero_pad_strings,
+        nul_terminated_space_padded_strings,
+        volume_identifier_nul_terminated,
+        volume_set_identifier_raw_hex,
+    ) = joliet_string_padding(block, &descriptor)?;
     descriptor.volume_space_size = None;
     Ok(ParsedJoliet {
         volume: JolietVolume {
@@ -1000,12 +1159,17 @@ fn parse_joliet(
             flags: block[7],
             zero_fill_empty_strings,
             zero_pad_strings,
+            nul_terminated_space_padded_strings,
+            volume_identifier_nul_terminated,
+            space_pad_escape_sequence: block[91..120].iter().all(|byte| *byte == b' '),
+            aliased_path_table_pointers,
             volume_set_identifier_raw_hex,
             descriptor,
             xa_system_use,
             path_table_size: (path_table_size != generated_size).then_some(path_table_size),
             path_table_little_hex: noncanonical.then(|| hex::encode(little)),
             path_table_big_hex: noncanonical.then(|| hex::encode(big)),
+            path_table_subheader: PathTableSubheader::default(),
             file_identifier_odd_bytes_hex: (odd_bytes != [0; 3]).then(|| hex::encode(odd_bytes)),
             entries,
         },
@@ -1020,7 +1184,7 @@ fn parse_joliet(
 fn joliet_string_padding(
     block: &[u8; LOGICAL_BLOCK_SIZE],
     descriptor: &PrimaryVolume,
-) -> Result<(bool, bool, Option<String>)> {
+) -> Result<(bool, bool, bool, bool, Option<String>)> {
     let fields = [
         (8, 32, descriptor.system_identifier.as_str()),
         (40, 32, descriptor.volume_identifier.as_str()),
@@ -1032,6 +1196,8 @@ fn joliet_string_padding(
     let mut empty_fill = None;
     let mut nonempty_padding = None;
     let mut volume_set_identifier_raw_hex = None;
+    let mut nul_terminated_space_padded = true;
+    let mut volume_identifier_nul_terminated = false;
     for (offset, length, value) in fields {
         let encoded = if value.is_empty() {
             Vec::new()
@@ -1044,11 +1210,30 @@ fn joliet_string_padding(
         }
         let zero = padding.iter().all(|byte| *byte == 0);
         let spaces = padding.chunks_exact(2).all(|pair| pair == [0, b' ']);
+        let leading_nul = !value.is_empty() && padding.len() >= 4 && padding[..2] == [0, 0];
+        let middle_start = usize::from(leading_nul) * 2;
+        let nul_space = padding.len() >= middle_start + 2
+            && padding[padding.len() - 2..] == [0, 0]
+            && padding[middle_start..padding.len() - 2]
+                .chunks_exact(2)
+                .all(|pair| pair == [0, b' ']);
+        nul_terminated_space_padded &= nul_space;
+        if nul_space {
+            ensure!(
+                !leading_nul || offset == 40,
+                "unsupported leading NUL in Joliet descriptor field at offset {offset}"
+            );
+            volume_identifier_nul_terminated |= leading_nul;
+            continue;
+        }
         if !zero && !spaces && offset == 190 && value.is_empty() {
             volume_set_identifier_raw_hex = Some(hex::encode(&block[offset..offset + length]));
             continue;
         }
-        ensure!(zero || spaces, "unsupported Joliet string padding");
+        ensure!(
+            zero || spaces,
+            "unsupported Joliet string padding at descriptor offset {offset}"
+        );
         let detected = if value.is_empty() {
             &mut empty_fill
         } else {
@@ -1063,6 +1248,8 @@ fn joliet_string_padding(
     Ok((
         empty_fill.unwrap_or(false),
         nonempty_padding.unwrap_or(false),
+        nul_terminated_space_padded,
+        volume_identifier_nul_terminated,
         volume_set_identifier_raw_hex,
     ))
 }
@@ -1111,14 +1298,8 @@ fn parse_pvd_fields(
 ) -> Result<PrimaryVolume> {
     ensure!(read_both_u32(block, 80)? > 0, "invalid volume size");
     let u16_encoding = pvd_u16_encoding(block)?;
-    ensure!(
-        u16::from_le_bytes(block[120..122].try_into()?) == VOLUME_SET_SIZE,
-        "unsupported volume set size"
-    );
-    ensure!(
-        u16::from_le_bytes(block[124..126].try_into()?) == VOLUME_SEQUENCE_NUMBER,
-        "unsupported volume sequence number"
-    );
+    let volume_set_size = u16::from_le_bytes(block[120..122].try_into()?);
+    let volume_sequence_number = u16::from_le_bytes(block[124..126].try_into()?);
     ensure!(
         u16::from_le_bytes(block[128..130].try_into()?) == ISO_LOGICAL_BLOCK_SIZE,
         "unsupported logical block size"
@@ -1140,6 +1321,9 @@ fn parse_pvd_fields(
     });
     Ok(PrimaryVolume {
         volume_space_size: None,
+        volume_set_size: (volume_set_size != VOLUME_SET_SIZE).then_some(volume_set_size),
+        volume_sequence_number: (volume_sequence_number != VOLUME_SEQUENCE_NUMBER)
+            .then_some(volume_sequence_number),
         file_structure_version,
         u16_encoding,
         application_use: application_use.unwrap_or_default(),
@@ -1148,10 +1332,11 @@ fn parse_pvd_fields(
             .then(|| hex::encode(&block[APPLICATION_USE_START..APPLICATION_USE_END])),
         root_directory_record_length: None,
         root_directory_recording_time: None,
-        root_directory_identifier: match block[189] {
-            0 => RootDirectoryIdentifier::Current,
-            1 => RootDirectoryIdentifier::Parent,
-            value => anyhow::bail!("unsupported PVD root directory identifier {value}"),
+        root_directory_identifier: match (block[188], block[189]) {
+            (_, 1) => RootDirectoryIdentifier::Parent,
+            (0, _) => RootDirectoryIdentifier::Empty,
+            (_, 0) => RootDirectoryIdentifier::Current,
+            (_, value) => anyhow::bail!("unsupported PVD root directory identifier {value}"),
         },
         escape_sequence: None,
         system_identifier: read_string(block, 8, 32)?,
@@ -1187,7 +1372,9 @@ fn parse_optional_joliet_level(bytes: &[u8]) -> Result<Option<JolietLevel>> {
 
 fn parse_joliet_level(bytes: &[u8]) -> Result<JolietLevel> {
     ensure!(
-        bytes.len() == 32 && bytes[3..].iter().all(|byte| *byte == 0),
+        bytes.len() == 32
+            && (bytes[3..].iter().all(|byte| *byte == 0)
+                || bytes[3..].iter().all(|byte| *byte == b' ')),
         "unsupported volume-descriptor escape sequence"
     );
     match &bytes[..3] {
@@ -1370,6 +1557,11 @@ fn parse_record(bytes: &[u8]) -> Result<Record> {
         interleave_gap_size: bytes[27],
         volume_sequence_number: read_both_u16(bytes, 28)?,
         name: bytes[33..33 + name_length].to_vec(),
+        identifier_padding: if name_length.is_multiple_of(2) && !trailing_system_use_padding {
+            bytes[unpadded_system_use_start]
+        } else {
+            0
+        },
         system_use: system_use.to_vec(),
         trailing_system_use_padding,
     })
@@ -1377,6 +1569,25 @@ fn parse_record(bytes: &[u8]) -> Result<Record> {
 
 fn is_xa_system_use(bytes: &[u8]) -> bool {
     bytes.len() == XA_SYSTEM_USE_SIZE && bytes[6..8] == *b"XA" && bytes[9..14] == [0; 5]
+}
+
+fn has_xa_system_use(bytes: &[u8]) -> bool {
+    bytes
+        .get(bytes.len().saturating_sub(XA_SYSTEM_USE_SIZE)..)
+        .is_some_and(is_xa_system_use)
+}
+
+fn xa_system_use_suffix(bytes: &[u8], uses_xa_system_use: bool) -> &[u8] {
+    if uses_xa_system_use {
+        &bytes[bytes.len() - XA_SYSTEM_USE_SIZE..]
+    } else {
+        &[]
+    }
+}
+
+fn system_use_prefix_hex(record: &Record, uses_xa_system_use: bool) -> Option<String> {
+    let end = record.system_use.len() - usize::from(uses_xa_system_use) * XA_SYSTEM_USE_SIZE;
+    (end != 0).then(|| hex::encode(&record.system_use[..end]))
 }
 
 fn validate_standard_record_fields(
@@ -1404,27 +1615,19 @@ fn validate_record_fields(record: &Record, directory: bool) -> Result<()> {
         record.interleave_gap_size == 0,
         "unsupported directory-record interleave gap size"
     );
-    ensure!(
-        record.volume_sequence_number == VOLUME_SEQUENCE_NUMBER,
-        "unsupported directory-record volume sequence number"
-    );
     Ok(())
 }
 
 fn entry_xa(record: &Record, directory: bool, uses_xa_system_use: bool) -> Result<Option<EntryXa>> {
     if !uses_xa_system_use {
-        ensure!(
-            record.system_use.is_empty(),
-            "unsupported PVD root directory-record system-use data"
-        );
         return Ok(None);
     }
 
     ensure!(
-        record.system_use.len() == XA_SYSTEM_USE_SIZE,
+        record.system_use.len() >= XA_SYSTEM_USE_SIZE,
         "unsupported directory-record XA system-use data"
     );
-    let bytes = &record.system_use;
+    let bytes = &record.system_use[record.system_use.len() - XA_SYSTEM_USE_SIZE..];
     ensure!(
         is_xa_system_use(bytes),
         "unsupported directory-record XA system-use data"
@@ -1509,11 +1712,17 @@ fn serialize_directory_record_system_use(
     directory: bool,
     xa_system_use: bool,
 ) -> Result<Vec<u8>> {
+    let mut result = entry
+        .system_use_hex
+        .as_deref()
+        .map(hex::decode)
+        .transpose()
+        .with_context(|| format!("decoding system_use_hex for {}", entry.path))?
+        .unwrap_or_default();
     if xa_system_use {
-        serialize_xa_system_use(entry, directory)
-    } else {
-        Ok(Vec::new())
+        result.extend_from_slice(&serialize_xa_system_use(entry, directory)?);
     }
+    Ok(result)
 }
 
 #[derive(Debug, Clone)]
@@ -1528,6 +1737,7 @@ pub struct FilePlacement {
 pub struct Layout {
     pub blocks: Vec<[u8; LOGICAL_BLOCK_SIZE]>,
     pub files: Vec<FilePlacement>,
+    pub auxiliaries: Vec<AuxiliaryPlacement>,
     pub xa_extents: Vec<XaExtentPlacement>,
     pub gaps: Vec<GapPlacement>,
     pub data_subheader_sectors: HashSet<u32>,
@@ -1537,6 +1747,32 @@ pub struct Layout {
     pub framing_subheader_sectors: HashMap<u32, XaSubheader>,
     pub sector_file_numbers: HashMap<u32, u8>,
     pub volume_blocks: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuxiliaryPlacement {
+    pub start: u32,
+    pub sectors: u32,
+    pub kind: AuxiliaryKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AuxiliaryKind {
+    AppleHfs {
+        asset: String,
+        byte_offset: usize,
+        byte_length: usize,
+        start_block: u32,
+        block_count: u32,
+    },
+    DuplicateBlock {
+        path: String,
+        block: u32,
+    },
+    CeQuadratJolietLinks,
+    CeQuadratFormatter {
+        asset: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1578,9 +1814,175 @@ struct JolietLayout<'a> {
     path_table_size: u32,
 }
 
+fn mark_metadata_framing(
+    policy: MetadataSubheader,
+    start: u32,
+    blocks: u32,
+    data: &mut HashSet<u32>,
+    end_of_file_data: &mut HashSet<u32>,
+    metadata: &mut HashSet<u32>,
+    explicit: &mut HashMap<u32, XaSubheader>,
+) {
+    match policy {
+        MetadataSubheader::Named(
+            IsoMetadataSubheader::Canonical | IsoMetadataSubheader::IsoMetadata,
+        ) => {
+            metadata.extend(start..start + blocks);
+        }
+        MetadataSubheader::Named(IsoMetadataSubheader::Data) => {
+            data.extend(start..start + blocks);
+        }
+        MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData) => {
+            data.extend(start..start + blocks.saturating_sub(1));
+            if blocks != 0 {
+                end_of_file_data.insert(start + blocks - 1);
+            }
+        }
+        MetadataSubheader::Explicit(subheader) => {
+            data.extend(start..start + blocks);
+            explicit.extend((start..start + blocks).map(|lba| (lba, subheader)));
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn layout(iso: &Iso9660, file_lengths: &HashMap<String, u64>) -> Result<Layout> {
-    layout_with_metadata_gap_kind(iso, file_lengths, GapKind::Xa)
+    let mut iso = iso.clone();
+    complete_test_layout(&mut iso)?;
+    layout_with_metadata_gap_kind(&iso, file_lengths, GapKind::Xa)
+}
+
+#[cfg(test)]
+fn complete_test_layout(iso: &mut Iso9660) -> Result<()> {
+    let mut body = iso
+        .layout
+        .drain(..)
+        .filter(|item| item.as_path_table().is_none())
+        .collect::<Vec<_>>();
+    let primary_tables = match (iso.path_table_copies, iso.path_table_order) {
+        (PathTableCopies::Duplicate, PathTableOrder::LittleEndianFirst) => vec![
+            MetadataPathTable::PrimaryLittle,
+            MetadataPathTable::PrimaryLittleCopy,
+            MetadataPathTable::PrimaryBig,
+            MetadataPathTable::PrimaryBigCopy,
+        ],
+        (PathTableCopies::Duplicate, PathTableOrder::BigEndianFirst) => vec![
+            MetadataPathTable::PrimaryBig,
+            MetadataPathTable::PrimaryBigCopy,
+            MetadataPathTable::PrimaryLittle,
+            MetadataPathTable::PrimaryLittleCopy,
+        ],
+        (PathTableCopies::Single | PathTableCopies::Aliased, PathTableOrder::LittleEndianFirst) => {
+            vec![
+                MetadataPathTable::PrimaryLittle,
+                MetadataPathTable::PrimaryBig,
+            ]
+        }
+        (PathTableCopies::Single | PathTableCopies::Aliased, PathTableOrder::BigEndianFirst) => {
+            vec![
+                MetadataPathTable::PrimaryBig,
+                MetadataPathTable::PrimaryLittle,
+            ]
+        }
+    };
+    let mut layout = primary_tables
+        .into_iter()
+        .map(FileLayoutItem::path_table)
+        .collect::<Vec<_>>();
+    if !iso.supplementary_volumes.is_empty() {
+        layout.extend([
+            FileLayoutItem::path_table(MetadataPathTable::JolietLittle),
+            FileLayoutItem::path_table(MetadataPathTable::JolietBig),
+        ]);
+    }
+    let file_paths = iso
+        .entries
+        .iter()
+        .filter(|entry| {
+            body.iter()
+                .any(|item| item.as_path() == Some(entry.path.as_str()))
+                || entry
+                    .reference
+                    .is_some_and(|reference| reference.kind != EntryReferenceKind::Directory)
+        })
+        .map(|entry| entry.path.as_str())
+        .collect::<HashSet<_>>();
+    let mut placed = body
+        .iter()
+        .filter_map(FileLayoutItem::as_directory_placement)
+        .map(|(volume, path)| (volume, path.to_owned()))
+        .collect::<HashSet<_>>();
+    if !file_paths.contains(ROOT_PATH)
+        && !placed.contains(&(MetadataVolume::Primary, ROOT_PATH.to_owned()))
+    {
+        layout.push(FileLayoutItem::directory(ROOT_PATH));
+        placed.insert((MetadataVolume::Primary, ROOT_PATH.to_owned()));
+    }
+    for entry in &iso.entries {
+        if entry.reference.is_none() {
+            continue;
+        }
+        let mut ancestors = Vec::new();
+        let mut parent = parent_path(&entry.path);
+        while parent != ROOT_PATH {
+            ancestors.push(parent.clone());
+            parent = parent_path(&parent);
+        }
+        for ancestor in ancestors.into_iter().rev() {
+            if !placed.contains(&(MetadataVolume::Primary, ancestor.clone())) {
+                layout.push(FileLayoutItem::directory(&ancestor));
+                placed.insert((MetadataVolume::Primary, ancestor));
+            }
+        }
+    }
+    for item in body.drain(..) {
+        if let Some(path) = item.as_path() {
+            let mut ancestors = Vec::new();
+            let mut parent = parent_path(path);
+            while parent != ROOT_PATH {
+                ancestors.push(parent.clone());
+                parent = parent_path(&parent);
+            }
+            for ancestor in ancestors.into_iter().rev() {
+                if !placed.contains(&(MetadataVolume::Primary, ancestor.clone())) {
+                    layout.push(FileLayoutItem::directory(&ancestor));
+                    placed.insert((MetadataVolume::Primary, ancestor));
+                }
+            }
+        }
+        layout.push(item);
+    }
+    for entry in &iso.entries {
+        if !file_paths.contains(entry.path.as_str())
+            && !entry
+                .reference
+                .is_some_and(|reference| reference.kind == EntryReferenceKind::Directory)
+            && !layout.iter().any(|item| {
+                item.as_directory_placement()
+                    == Some((MetadataVolume::Primary, entry.path.as_str()))
+            })
+        {
+            layout.push(FileLayoutItem::directory(&entry.path));
+        }
+    }
+    if let Some(volume) = iso.supplementary_volumes.first() {
+        for entry in &volume.entries {
+            if entry.source.is_none()
+                && !layout.iter().any(|item| {
+                    item.as_directory_placement()
+                        == Some((MetadataVolume::Joliet, entry.path.as_str()))
+                })
+            {
+                layout.push(FileLayoutItem::volume_directory(
+                    MetadataVolume::Joliet,
+                    &entry.path,
+                ));
+            }
+        }
+    }
+    iso.path_table_padding = 0;
+    iso.layout = layout;
+    Ok(())
 }
 
 pub(crate) fn layout_with_metadata_gap_kind(
@@ -1593,6 +1995,7 @@ pub(crate) fn layout_with_metadata_gap_kind(
         "metadata gap kind must match a supported track mode"
     );
     let file_paths = validate_entries(iso)?;
+    let unified_layout = iso.layout.iter().any(|item| item.as_path_table().is_some());
     let directories = directory_order(&iso.entries, &file_paths)?;
     let path_table_size: usize = directories
         .iter()
@@ -1610,7 +2013,13 @@ pub(crate) fn layout_with_metadata_gap_kind(
     let path_table_stride = path_blocks
         .checked_add(iso.path_table_padding)
         .context("path-table allocation stride overflow")?;
-    let (mut path_table_pointers, mut next_extent) =
+    let (mut path_table_pointers, mut next_extent) = if unified_layout {
+        (
+            [0; 4],
+            17 + u32::from(iso.primary_volume_copies)
+                + u32::try_from(iso.supplementary_volumes.len())?,
+        )
+    } else {
         match (iso.path_table_copies, iso.path_table_order) {
             (PathTableCopies::Duplicate, PathTableOrder::LittleEndianFirst) => (
                 [
@@ -1638,7 +2047,26 @@ pub(crate) fn layout_with_metadata_gap_kind(
                 [path_table_start + path_table_stride, 0, path_table_start, 0],
                 path_table_start + path_table_stride * 2,
             ),
-        };
+            (PathTableCopies::Aliased, PathTableOrder::LittleEndianFirst) => (
+                [
+                    path_table_start,
+                    path_table_start,
+                    path_table_start + path_table_stride,
+                    path_table_start + path_table_stride,
+                ],
+                path_table_start + path_table_stride * 2,
+            ),
+            (PathTableCopies::Aliased, PathTableOrder::BigEndianFirst) => (
+                [
+                    path_table_start + path_table_stride,
+                    path_table_start + path_table_stride,
+                    path_table_start,
+                    path_table_start,
+                ],
+                path_table_start + path_table_stride * 2,
+            ),
+        }
+    };
     let mut path_table_padding_gaps = path_table_pointers
         .iter()
         .copied()
@@ -1682,7 +2110,10 @@ pub(crate) fn layout_with_metadata_gap_kind(
                     records_length
                 };
                 let blocks = allocated_length.div_ceil(LOGICAL_BLOCK_SIZE).max(1) as u32;
-                let length = match iso.directory_length_policy {
+                let length = match entry
+                    .directory_length_policy
+                    .unwrap_or(iso.directory_length_policy)
+                {
                     DirectoryLengthPolicy::Allocated => blocks * LOGICAL_BLOCK_SIZE as u32,
                     DirectoryLengthPolicy::Records => u32::try_from(records_length)?,
                 };
@@ -1754,68 +2185,7 @@ pub(crate) fn layout_with_metadata_gap_kind(
             .map(|(index, directory)| (directory.path.clone(), index))
             .collect();
         placed_joliet_directories = vec![false; joliet_placements.len()];
-        path_table_pointers = [0; 4];
-        next_extent = 17
-            + u32::from(iso.primary_volume_copies)
-            + u32::try_from(iso.supplementary_volumes.len())?;
-        path_table_padding_gaps.clear();
-        let mut joliet_pointers = [0; 4];
-        for item in &iso.metadata_layout {
-            match item {
-                MetadataLayoutItem::PathTable(item) => {
-                    let (pointer, blocks) = match item.path_table {
-                        MetadataPathTable::PrimaryLittle => {
-                            (&mut path_table_pointers[0], path_blocks)
-                        }
-                        MetadataPathTable::PrimaryBig => (&mut path_table_pointers[2], path_blocks),
-                        MetadataPathTable::JolietLittle => {
-                            (&mut joliet_pointers[0], joliet_path_blocks)
-                        }
-                        MetadataPathTable::JolietBig => {
-                            (&mut joliet_pointers[2], joliet_path_blocks)
-                        }
-                    };
-                    *pointer = next_extent;
-                    next_extent = next_extent
-                        .checked_add(blocks)
-                        .context("metadata path-table placement overflow")?;
-                }
-                MetadataLayoutItem::Directories(item) => match item.directories {
-                    MetadataVolume::Primary => {
-                        for (index, directory) in placements.iter_mut().enumerate() {
-                            if !placed_directories[index] {
-                                directory.extent = next_extent;
-                                next_extent = next_extent
-                                    .checked_add(directory.blocks)
-                                    .context("metadata directory placement overflow")?;
-                                placed_directories[index] = true;
-                            }
-                        }
-                    }
-                    MetadataVolume::Joliet => {
-                        for directory in &mut joliet_placements {
-                            directory.extent = next_extent;
-                            next_extent = next_extent
-                                .checked_add(directory.blocks)
-                                .context("metadata directory placement overflow")?;
-                        }
-                        placed_joliet_directories.fill(true);
-                    }
-                },
-                MetadataLayoutItem::Gap(item) => {
-                    path_table_padding_gaps.push(GapPlacement {
-                        start: next_extent,
-                        sectors: item.gap,
-                        form2_edc: None,
-                        kind: metadata_gap_kind,
-                        subheader: None,
-                    });
-                    next_extent = next_extent
-                        .checked_add(item.gap)
-                        .context("metadata gap placement overflow")?;
-                }
-            }
-        }
+        let joliet_pointers = [0; 4];
         joliet_layout = Some(JolietLayout {
             volume,
             placements: joliet_placements,
@@ -1823,7 +2193,7 @@ pub(crate) fn layout_with_metadata_gap_kind(
             path_blocks: joliet_path_blocks,
             path_table_size: joliet_path_table_size,
         });
-    } else {
+    } else if !unified_layout {
         placements[0].extent = next_extent;
         next_extent += placements[0].blocks;
         placed_directories[0] = true;
@@ -1860,11 +2230,50 @@ pub(crate) fn layout_with_metadata_gap_kind(
     }
 
     let mut files = Vec::with_capacity(file_paths.len());
+    let mut auxiliaries = Vec::new();
     let mut xa_extents = Vec::new();
     let mut gaps = path_table_padding_gaps;
     let mut pending_gaps = Vec::new();
     let mut trailing_gap = None;
     for item in &iso.layout {
+        if let Some(path_table) = item.as_path_table() {
+            for (sectors, kind, subheader, form2_edc) in pending_gaps.drain(..) {
+                gaps.push(GapPlacement {
+                    start: next_extent,
+                    sectors,
+                    kind,
+                    subheader,
+                    form2_edc,
+                });
+                next_extent = next_extent
+                    .checked_add(sectors)
+                    .context("gap placement overflow")?;
+            }
+            let (pointer, blocks) = match path_table {
+                MetadataPathTable::PrimaryLittle => (&mut path_table_pointers[0], path_blocks),
+                MetadataPathTable::PrimaryLittleCopy => (&mut path_table_pointers[1], path_blocks),
+                MetadataPathTable::PrimaryBig => (&mut path_table_pointers[2], path_blocks),
+                MetadataPathTable::PrimaryBigCopy => (&mut path_table_pointers[3], path_blocks),
+                MetadataPathTable::JolietLittle => {
+                    let joliet = joliet_layout
+                        .as_mut()
+                        .context("Joliet path-table placement requires a supplementary volume")?;
+                    (&mut joliet.pointers[0], joliet.path_blocks)
+                }
+                MetadataPathTable::JolietBig => {
+                    let joliet = joliet_layout
+                        .as_mut()
+                        .context("Joliet path-table placement requires a supplementary volume")?;
+                    (&mut joliet.pointers[2], joliet.path_blocks)
+                }
+            };
+            ensure!(*pointer == 0, "path table was already placed");
+            *pointer = next_extent;
+            next_extent = next_extent
+                .checked_add(blocks)
+                .context("path-table placement overflow")?;
+            continue;
+        }
         if let Some((volume, path)) = item.as_directory_placement() {
             match volume {
                 MetadataVolume::Primary => {
@@ -1982,6 +2391,92 @@ pub(crate) fn layout_with_metadata_gap_kind(
                 .context("unreferenced XA extent placement overflow")?;
             continue;
         }
+        let auxiliary = match item {
+            FileLayoutItem::AppleHfs(item) => {
+                ensure!(
+                    item.block_count > 0,
+                    "Apple HFS partition must not be empty"
+                );
+                let expected_extent = item.start_block / 4;
+                let pending_sectors = pending_gaps.iter().try_fold(0_u32, |sum, item| {
+                    sum.checked_add(item.0)
+                        .context("pending gap placement overflow")
+                })?;
+                ensure!(
+                    expected_extent == next_extent + pending_sectors,
+                    "Apple HFS start_block does not match its physical layout position"
+                );
+                let byte_offset = usize::try_from(item.start_block % 4)? * 512;
+                let byte_length = usize::try_from(item.block_count)?
+                    .checked_mul(512)
+                    .context("Apple HFS partition byte length overflow")?;
+                let sectors = u32::try_from(
+                    byte_offset
+                        .checked_add(byte_length)
+                        .context("Apple HFS placement overflow")?
+                        .div_ceil(LOGICAL_BLOCK_SIZE),
+                )?;
+                Some((
+                    sectors,
+                    AuxiliaryKind::AppleHfs {
+                        asset: item.apple_hfs.path.clone(),
+                        byte_offset,
+                        byte_length,
+                        start_block: item.start_block,
+                        block_count: item.block_count,
+                    },
+                ))
+            }
+            FileLayoutItem::DuplicateBlock(item) => Some((
+                1,
+                AuxiliaryKind::DuplicateBlock {
+                    path: item.duplicate_block.path.clone(),
+                    block: item.duplicate_block.block,
+                },
+            )),
+            FileLayoutItem::CeQuadratJolietLinks(item) => {
+                ensure!(
+                    item.cequadrat_joliet_links,
+                    "cequadrat_joliet_links must be true"
+                );
+                Some((1, AuxiliaryKind::CeQuadratJolietLinks))
+            }
+            FileLayoutItem::CeQuadratFormatter(_) => Some((
+                1,
+                AuxiliaryKind::CeQuadratFormatter {
+                    asset: match item {
+                        FileLayoutItem::CeQuadratFormatter(item) => {
+                            item.cequadrat_formatter.path.clone()
+                        }
+                        _ => unreachable!(),
+                    },
+                },
+            )),
+            _ => None,
+        };
+        if let Some((sectors, kind)) = auxiliary {
+            for (sectors, kind, subheader, form2_edc) in pending_gaps.drain(..) {
+                gaps.push(GapPlacement {
+                    start: next_extent,
+                    sectors,
+                    kind,
+                    subheader,
+                    form2_edc,
+                });
+                next_extent = next_extent
+                    .checked_add(sectors)
+                    .context("gap placement overflow")?;
+            }
+            auxiliaries.push(AuxiliaryPlacement {
+                start: next_extent,
+                sectors,
+                kind,
+            });
+            next_extent = next_extent
+                .checked_add(sectors)
+                .context("auxiliary placement overflow")?;
+            continue;
+        }
         let Some(path) = item.as_path() else {
             let sectors = item.gap_sectors().expect("file layout item kind");
             let kind = item.gap_kind().expect("file layout item kind");
@@ -2036,7 +2531,17 @@ pub(crate) fn layout_with_metadata_gap_kind(
         });
         next_extent += blocks;
     }
-    if joliet_layout.is_some() {
+    if unified_layout {
+        if iso.path_table_copies == PathTableCopies::Aliased {
+            path_table_pointers[1] = path_table_pointers[0];
+            path_table_pointers[3] = path_table_pointers[2];
+        }
+        ensure!(
+            placed_directories.iter().all(|placed| *placed)
+                && placed_joliet_directories.iter().all(|placed| *placed),
+            "layout must place every primary and Joliet directory exactly once"
+        );
+    } else if joliet_layout.is_some() {
         ensure!(
             placed_directories.iter().all(|placed| *placed)
                 && placed_joliet_directories.iter().all(|placed| *placed),
@@ -2163,25 +2668,80 @@ pub(crate) fn layout_with_metadata_gap_kind(
         }
     }
     if let Some(joliet) = &joliet_layout {
-        for pointer in joliet
-            .pointers
-            .into_iter()
-            .chain(path_table_pointers)
-            .filter(|pointer| *pointer != 0)
-        {
-            metadata_subheader_sectors.extend(
-                pointer
-                    ..pointer
-                        + if joliet.pointers.contains(&pointer) {
-                            joliet.path_blocks
-                        } else {
-                            path_blocks
-                        },
-            );
+        let (joliet_path_table_policy, joliet_explicit_path_table_subheader) =
+            match joliet.volume.path_table_subheader {
+                PathTableSubheader::Named(policy) => (policy, None),
+                PathTableSubheader::Explicit(subheader) => {
+                    (EntrySectorSubheader::Data, Some(subheader))
+                }
+            };
+        for pointer in joliet.pointers.into_iter().filter(|pointer| *pointer != 0) {
+            for block_index in 0..joliet.path_blocks {
+                let lba = pointer + block_index;
+                let subheader = joliet_explicit_path_table_subheader.unwrap_or_else(|| {
+                    match joliet_path_table_policy {
+                        EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => {
+                            ISO_METADATA_SUBHEADER
+                        }
+                        EntrySectorSubheader::Data => FORM1_DATA_SUBHEADER,
+                        EntrySectorSubheader::EndOfFileData
+                            if block_index + 1 == joliet.path_blocks =>
+                        {
+                            SYSTEM_END_OF_FILE_SUBHEADER
+                        }
+                        EntrySectorSubheader::DataUntilFinal
+                            if block_index + 1 == joliet.path_blocks =>
+                        {
+                            ISO_METADATA_SUBHEADER
+                        }
+                        EntrySectorSubheader::EndOfFileData
+                        | EntrySectorSubheader::DataUntilFinal => FORM1_DATA_SUBHEADER,
+                    }
+                });
+                if subheader == FORM1_DATA_SUBHEADER {
+                    data_subheader_sectors.insert(lba);
+                    if let PathTableSubheader::Explicit(value) = joliet.volume.path_table_subheader
+                    {
+                        framing_subheader_sectors.insert(lba, value);
+                    }
+                } else if subheader == SYSTEM_END_OF_FILE_SUBHEADER {
+                    end_of_file_data_subheader_sectors.insert(lba);
+                } else {
+                    metadata_subheader_sectors.insert(lba);
+                }
+            }
         }
         for directory in &joliet.placements {
-            metadata_subheader_sectors
-                .extend(directory.extent..directory.extent + directory.blocks);
+            let entry = joliet
+                .volume
+                .entries
+                .iter()
+                .find(|entry| entry.path == directory.path)
+                .expect("validated Joliet directory");
+            let policy = match entry.sector_subheader {
+                EntrySectorSubheader::Canonical | EntrySectorSubheader::IsoMetadata => {
+                    MetadataSubheader::Named(IsoMetadataSubheader::IsoMetadata)
+                }
+                EntrySectorSubheader::Data => MetadataSubheader::Named(IsoMetadataSubheader::Data),
+                EntrySectorSubheader::EndOfFileData => {
+                    MetadataSubheader::Named(IsoMetadataSubheader::EndOfFileData)
+                }
+                EntrySectorSubheader::DataUntilFinal => {
+                    data_subheader_sectors
+                        .extend(directory.extent..directory.extent + directory.blocks - 1);
+                    metadata_subheader_sectors.insert(directory.extent + directory.blocks - 1);
+                    continue;
+                }
+            };
+            mark_metadata_framing(
+                policy,
+                directory.extent,
+                directory.blocks,
+                &mut data_subheader_sectors,
+                &mut end_of_file_data_subheader_sectors,
+                &mut metadata_subheader_sectors,
+                &mut framing_subheader_sectors,
+            );
         }
     }
     for entry in &iso.entries {
@@ -2252,6 +2812,37 @@ pub(crate) fn layout_with_metadata_gap_kind(
     }
 
     let mut blocks = vec![[0_u8; LOGICAL_BLOCK_SIZE]; usize::try_from(next_extent)?];
+    for auxiliary in &auxiliaries {
+        if !matches!(auxiliary.kind, AuxiliaryKind::CeQuadratJolietLinks) {
+            continue;
+        }
+        let joliet = joliet_layout
+            .as_ref()
+            .context("CeQuadrat Joliet links require a supplementary volume")?;
+        let pairs = placements
+            .iter()
+            .filter_map(|primary| {
+                joliet
+                    .placements
+                    .iter()
+                    .find(|directory| directory.path == primary.path)
+                    .map(|supplementary| (supplementary.extent, primary.extent))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            48 + pairs.len() * 8 <= LOGICAL_BLOCK_SIZE,
+            "CeQuadrat Joliet directory link table is too large"
+        );
+        let block = &mut blocks[usize::try_from(auxiliary.start)?];
+        let magic = b"CeQuadrat Joliet directory link table";
+        block[..magic.len()].copy_from_slice(magic);
+        block[44..48].copy_from_slice(&u32::try_from(pairs.len())?.to_le_bytes());
+        for (index, (joliet_extent, primary_extent)) in pairs.into_iter().enumerate() {
+            let offset = 48 + index * 8;
+            block[offset..offset + 4].copy_from_slice(&joliet_extent.to_le_bytes());
+            block[offset + 4..offset + 8].copy_from_slice(&primary_extent.to_le_bytes());
+        }
+    }
     let pvd = serialize_pvd(
         iso,
         logical_volume_blocks,
@@ -2358,6 +2949,7 @@ pub(crate) fn layout_with_metadata_gap_kind(
     Ok(Layout {
         blocks,
         files,
+        auxiliaries,
         xa_extents,
         gaps,
         data_subheader_sectors,
@@ -2388,47 +2980,43 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
         "primary_volume_copies must be between 1 and 3"
     );
     ensure!(
+        iso.path_table_copies != PathTableCopies::Aliased || iso.path_table_padding == 0,
+        "aliased primary path-table pointers do not support path-table padding"
+    );
+    ensure!(
         iso.supplementary_volumes.len() <= 1,
         "at most one Joliet supplementary volume is supported"
     );
-    let mut metadata_directory_groups = HashSet::new();
-    if iso.supplementary_volumes.is_empty() {
-        ensure!(
-            iso.metadata_layout.is_empty(),
-            "metadata_layout requires a Joliet supplementary volume"
-        );
-    } else {
-        ensure!(
-            iso.path_table_copies == PathTableCopies::Single && iso.path_table_padding == 0,
-            "Joliet metadata layout requires one primary path table of each endian"
-        );
-        let mut tables = HashSet::new();
-        for item in &iso.metadata_layout {
-            match item {
-                MetadataLayoutItem::PathTable(item) => ensure!(
-                    tables.insert(item.path_table),
-                    "duplicate metadata path-table placement"
-                ),
-                MetadataLayoutItem::Directories(item) => ensure!(
-                    metadata_directory_groups.insert(item.directories),
-                    "duplicate metadata directory placement"
-                ),
-                MetadataLayoutItem::Gap(item) => {
-                    ensure!(item.gap > 0, "Joliet metadata gaps must be nonempty")
-                }
-            }
-        }
-        ensure!(
-            tables
-                == HashSet::from([
-                    MetadataPathTable::PrimaryLittle,
-                    MetadataPathTable::PrimaryBig,
-                    MetadataPathTable::JolietLittle,
-                    MetadataPathTable::JolietBig,
-                ]),
-            "metadata_layout must place every primary and Joliet path table exactly once"
-        );
+    let unified_layout = iso.layout.iter().any(|item| item.as_path_table().is_some());
+    ensure!(
+        unified_layout,
+        "layout must explicitly place every path table and directory"
+    );
+    ensure!(
+        iso.path_table_padding == 0,
+        "complete layout expresses path-table gaps directly"
+    );
+    let tables = iso
+        .layout
+        .iter()
+        .filter_map(FileLayoutItem::as_path_table)
+        .collect::<HashSet<_>>();
+    let mut expected_tables = HashSet::from([
+        MetadataPathTable::PrimaryLittle,
+        MetadataPathTable::PrimaryBig,
+    ]);
+    if iso.path_table_copies == PathTableCopies::Duplicate {
+        expected_tables.insert(MetadataPathTable::PrimaryLittleCopy);
+        expected_tables.insert(MetadataPathTable::PrimaryBigCopy);
     }
+    if !iso.supplementary_volumes.is_empty() {
+        expected_tables.insert(MetadataPathTable::JolietLittle);
+        expected_tables.insert(MetadataPathTable::JolietBig);
+    }
+    ensure!(
+        tables == expected_tables,
+        "layout must place every physical primary and Joliet path table exactly once"
+    );
     if let MetadataSubheader::Explicit(subheader) = iso.metadata_subheader {
         ensure!(
             !subheader
@@ -2444,6 +3032,16 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 .contains(crate::raw_cd::XaSubmodeFlag::Form2),
             "explicit path_table_subheader must be Form 1"
         );
+    }
+    for volume in &iso.supplementary_volumes {
+        if let PathTableSubheader::Explicit(subheader) = volume.path_table_subheader {
+            ensure!(
+                !subheader
+                    .submode
+                    .contains(crate::raw_cd::XaSubmodeFlag::Form2),
+                "explicit Joliet path_table_subheader must be Form 1"
+            );
+        }
     }
     let root = iso
         .entries
@@ -2500,8 +3098,15 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
     let mut indexed_file_paths = HashSet::new();
     let mut explicit_directories = HashSet::new();
     let mut xa_extent_asset_paths = HashSet::new();
+    let mut apple_hfs_count = 0_u8;
+    let mut cequadrat_links_count = 0_u8;
+    let mut cequadrat_formatter_count = 0_u8;
     let mut previous_gap = None;
     for (index, item) in iso.layout.iter().enumerate() {
+        if item.as_path_table().is_some() {
+            previous_gap = None;
+            continue;
+        }
         if let FileLayoutItem::Path(file) = item {
             let path = file.path.as_str();
             ensure!(path != ROOT_PATH, "filesystem root cannot be a file");
@@ -2551,12 +3156,8 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 "unknown {volume:?} directory entry {path}"
             );
             ensure!(
-                !metadata_directory_groups.contains(&volume),
-                "directory group and individual placements cannot both place {volume:?} directories"
-            );
-            ensure!(
-                path != ROOT_PATH || !iso.supplementary_volumes.is_empty(),
-                "filesystem root placement is fixed without Joliet metadata layout"
+                path != ROOT_PATH || unified_layout || !iso.supplementary_volumes.is_empty(),
+                "filesystem root placement is fixed without a unified or Joliet metadata layout"
             );
             ensure!(
                 explicit_directories.insert((volume, path)),
@@ -2588,6 +3189,62 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             }
             previous_gap = None;
             continue;
+        }
+        match item {
+            FileLayoutItem::AppleHfs(item) => {
+                ensure!(
+                    !item.apple_hfs.path.is_empty() && item.block_count > 0,
+                    "Apple HFS asset path and block count must be nonempty"
+                );
+                apple_hfs_count += 1;
+                ensure!(
+                    apple_hfs_count == 1,
+                    "layout supports exactly one Apple HFS partition"
+                );
+                previous_gap = None;
+                continue;
+            }
+            FileLayoutItem::DuplicateBlock(item) => {
+                ensure!(
+                    paths.contains(item.duplicate_block.path.as_str())
+                        && !referenced_paths.contains(item.duplicate_block.path.as_str()),
+                    "duplicate_block references an unknown or fixed-reference file: {}",
+                    item.duplicate_block.path
+                );
+                previous_gap = None;
+                continue;
+            }
+            FileLayoutItem::CeQuadratJolietLinks(item) => {
+                ensure!(
+                    item.cequadrat_joliet_links,
+                    "cequadrat_joliet_links must be true"
+                );
+                ensure!(
+                    !iso.supplementary_volumes.is_empty(),
+                    "CeQuadrat Joliet links require a supplementary volume"
+                );
+                cequadrat_links_count += 1;
+                ensure!(
+                    cequadrat_links_count == 1,
+                    "duplicate CeQuadrat Joliet link table"
+                );
+                previous_gap = None;
+                continue;
+            }
+            FileLayoutItem::CeQuadratFormatter(item) => {
+                ensure!(
+                    !item.cequadrat_formatter.path.is_empty(),
+                    "CeQuadrat formatter asset path must not be empty"
+                );
+                cequadrat_formatter_count += 1;
+                ensure!(
+                    cequadrat_formatter_count == 1,
+                    "duplicate CeQuadrat formatter block"
+                );
+                previous_gap = None;
+                continue;
+            }
+            _ => {}
         }
         {
             let sectors = item.gap_sectors().expect("file layout item kind");
@@ -2628,11 +3285,45 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             continue;
         }
     }
+    ensure!(
+        cequadrat_links_count == cequadrat_formatter_count,
+        "CeQuadrat link-table and formatter-block items must appear together"
+    );
     let file_paths = authored_file_paths
         .union(&referenced_paths)
         .copied()
         .collect::<HashSet<_>>();
     let directory_paths: HashSet<_> = paths.difference(&file_paths).copied().collect();
+    if unified_layout {
+        let primary_expected = directory_paths
+            .difference(&directory_reference_paths)
+            .copied()
+            .collect::<HashSet<_>>();
+        let primary_placed = explicit_directories
+            .iter()
+            .filter_map(|(volume, path)| (*volume == MetadataVolume::Primary).then_some(*path))
+            .collect::<HashSet<_>>();
+        ensure!(
+            primary_placed == primary_expected,
+            "layout must place every primary directory exactly once"
+        );
+        if let Some(volume) = iso.supplementary_volumes.first() {
+            let expected = volume
+                .entries
+                .iter()
+                .filter(|entry| entry.source.is_none())
+                .map(|entry| entry.path.as_str())
+                .collect::<HashSet<_>>();
+            let placed = explicit_directories
+                .iter()
+                .filter_map(|(kind, path)| (*kind == MetadataVolume::Joliet).then_some(*path))
+                .collect::<HashSet<_>>();
+            ensure!(
+                placed == expected,
+                "layout must place every Joliet directory exactly once"
+            );
+        }
+    }
     for (volume, path) in explicit_directories {
         let is_directory = match volume {
             MetadataVolume::Primary => directory_paths.contains(path),
@@ -2710,6 +3401,32 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
                 "omit_version is supported only for Joliet files: {}",
                 entry.path
             );
+            for (field, value) in [
+                ("system_use_hex", entry.system_use_hex.as_ref()),
+                (
+                    "directory_self_system_use_hex",
+                    entry.directory_self_system_use_hex.as_ref(),
+                ),
+                (
+                    "directory_parent_system_use_hex",
+                    entry.directory_parent_system_use_hex.as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    ensure!(
+                        !value.is_empty() && hex::decode(value).is_ok(),
+                        "invalid Joliet {field} for {}",
+                        entry.path
+                    );
+                }
+            }
+            ensure!(
+                directory
+                    || (entry.directory_self_system_use_hex.is_none()
+                        && entry.directory_parent_system_use_hex.is_none()),
+                "Joliet directory-local System Use fields require a directory: {}",
+                entry.path
+            );
             if volume.xa_system_use {
                 serialize_xa_system_use_parts(&entry.path, entry.xa.as_ref(), directory)?;
             } else {
@@ -2781,11 +3498,10 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             ),
             Some(EntryReference {
                 kind: EntryReferenceKind::RecordOnly,
-                length,
                 ..
             }) => ensure!(
-                is_file && length > 0 && !cdda,
-                "record_only reference requires a nonempty non-CDDA file: {}",
+                is_file && !cdda,
+                "record_only reference requires a non-CDDA file: {}",
                 entry.path
             ),
             Some(EntryReference {
@@ -2842,6 +3558,11 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             entry.path
         );
         ensure!(
+            is_file || !entry.omit_version,
+            "omit_version is supported only for files: {}",
+            entry.path
+        );
+        ensure!(
             is_file || entry.allocation_padding_hex.is_none(),
             "allocation_padding_hex is supported only for files: {}",
             entry.path
@@ -2873,6 +3594,46 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             !is_file,
             entry_uses_xa_system_use(iso, entry),
         )?;
+        for (name, value) in [
+            (
+                "directory_self_system_use_hex",
+                &entry.directory_self_system_use_hex,
+            ),
+            (
+                "directory_parent_system_use_hex",
+                &entry.directory_parent_system_use_hex,
+            ),
+        ] {
+            if let Some(value) = value {
+                ensure!(
+                    !is_file,
+                    "{name} is supported only for directories: {}",
+                    entry.path
+                );
+                hex::decode(value)
+                    .with_context(|| format!("decoding {name} for {}", entry.path))?;
+            }
+        }
+        for (name, value) in [
+            (
+                "directory_self_recording_time",
+                &entry.directory_self_recording_time,
+            ),
+            (
+                "directory_parent_recording_time",
+                &entry.directory_parent_recording_time,
+            ),
+        ] {
+            if let Some(value) = value {
+                ensure!(
+                    !is_file,
+                    "{name} is supported only for directories: {}",
+                    entry.path
+                );
+                serialize_recording_time(value)
+                    .with_context(|| format!("validating {name} for {}", entry.path))?;
+            }
+        }
         ensure!(
             entry.xa.as_ref().is_none_or(|xa| {
                 xa.framing_subheader.is_none_or(|subheader| {
@@ -3111,11 +3872,27 @@ fn entry_uses_xa_system_use(iso: &Iso9660, entry: &Entry) -> bool {
     entry.xa_system_use.unwrap_or(iso.xa_system_use)
 }
 
+fn system_use_hex_len(value: Option<&String>) -> usize {
+    value.map_or(0, |hex| hex.len() / 2)
+}
+
 fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str>) -> Vec<usize> {
     let system_use_size = usize::from(iso.xa_system_use) * XA_SYSTEM_USE_SIZE;
+    let directory = iso
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .expect("validated directory entry");
     let mut lengths = vec![
-        record_size(1, system_use_size),
-        record_size(1, system_use_size),
+        record_size(
+            1,
+            system_use_size + system_use_hex_len(directory.directory_self_system_use_hex.as_ref()),
+        ),
+        record_size(
+            1,
+            system_use_size
+                + system_use_hex_len(directory.directory_parent_system_use_hex.as_ref()),
+        ),
     ];
     for entry in iso
         .entries
@@ -3123,8 +3900,9 @@ fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str
         .filter(|entry| entry.path != ROOT_PATH && parent_path(&entry.path) == path)
     {
         let name = identifier(entry, file_paths.contains(entry.path.as_str()));
-        let entry_system_use_size =
-            usize::from(entry_uses_xa_system_use(iso, entry)) * XA_SYSTEM_USE_SIZE;
+        let entry_system_use_size = usize::from(entry_uses_xa_system_use(iso, entry))
+            * XA_SYSTEM_USE_SIZE
+            + system_use_hex_len(entry.system_use_hex.as_ref());
         lengths.push(record_size(name.len(), entry_system_use_size));
     }
     lengths
@@ -3132,9 +3910,21 @@ fn directory_record_lengths(path: &str, iso: &Iso9660, file_paths: &HashSet<&str
 
 fn joliet_directory_record_lengths(path: &str, volume: &JolietVolume) -> Result<Vec<usize>> {
     let system_use_size = usize::from(volume.xa_system_use) * XA_SYSTEM_USE_SIZE;
+    let directory = volume
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .expect("validated Joliet directory entry");
     let mut lengths = vec![
-        record_size(1, system_use_size),
-        record_size(1, system_use_size),
+        record_size(
+            1,
+            system_use_size + system_use_hex_len(directory.directory_self_system_use_hex.as_ref()),
+        ),
+        record_size(
+            1,
+            system_use_size
+                + system_use_hex_len(directory.directory_parent_system_use_hex.as_ref()),
+        ),
     ];
     for entry in volume
         .entries
@@ -3145,7 +3935,10 @@ fn joliet_directory_record_lengths(path: &str, volume: &JolietVolume) -> Result<
         if entry.source.is_some() && !entry.omit_version {
             identifier.extend_from_slice(&encode_joliet_identifier(";1")?);
         }
-        lengths.push(record_size(identifier.len(), system_use_size));
+        lengths.push(record_size(
+            identifier.len(),
+            system_use_size + system_use_hex_len(entry.system_use_hex.as_ref()),
+        ));
     }
     Ok(lengths)
 }
@@ -3194,8 +3987,18 @@ fn serialize_pvd(
     if let Some(level) = pvd.escape_sequence {
         block[88..91].copy_from_slice(&joliet_escape_sequence(level));
     }
-    write_pvd_u16(&mut block, 120, VOLUME_SET_SIZE, pvd.u16_encoding);
-    write_pvd_u16(&mut block, 124, VOLUME_SEQUENCE_NUMBER, pvd.u16_encoding);
+    write_pvd_u16(
+        &mut block,
+        120,
+        pvd.volume_set_size.unwrap_or(VOLUME_SET_SIZE),
+        pvd.u16_encoding,
+    );
+    write_pvd_u16(
+        &mut block,
+        124,
+        pvd.volume_sequence_number.unwrap_or(VOLUME_SEQUENCE_NUMBER),
+        pvd.u16_encoding,
+    );
     write_pvd_u16(&mut block, 128, ISO_LOGICAL_BLOCK_SIZE, pvd.u16_encoding);
     write_both_u32(&mut block, 132, path_table_size);
     block[140..144].copy_from_slice(&pointers[0].to_le_bytes());
@@ -3215,11 +4018,13 @@ fn serialize_pvd(
             | (u8::from(root.associated) * ASSOCIATED_FLAG),
         file_unit_size: 0,
         interleave_gap_size: 0,
-        volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
-        name: vec![match pvd.root_directory_identifier {
-            RootDirectoryIdentifier::Current => 0,
-            RootDirectoryIdentifier::Parent => 1,
-        }],
+        volume_sequence_number: pvd.volume_sequence_number.unwrap_or(VOLUME_SEQUENCE_NUMBER),
+        name: match pvd.root_directory_identifier {
+            RootDirectoryIdentifier::Current => vec![0],
+            RootDirectoryIdentifier::Parent => vec![1],
+            RootDirectoryIdentifier::Empty => Vec::new(),
+        },
+        identifier_padding: 0,
         system_use: Vec::new(),
         trailing_system_use_padding: false,
     })?;
@@ -3317,11 +4122,21 @@ fn serialize_joliet_svd(
         descriptor.volume_space_size.unwrap_or(volume_blocks),
     );
     block[88..91].copy_from_slice(&joliet_escape_sequence(volume.level));
-    write_pvd_u16(&mut block, 120, VOLUME_SET_SIZE, descriptor.u16_encoding);
+    if volume.space_pad_escape_sequence {
+        block[91..120].fill(b' ');
+    }
+    write_pvd_u16(
+        &mut block,
+        120,
+        descriptor.volume_set_size.unwrap_or(VOLUME_SET_SIZE),
+        descriptor.u16_encoding,
+    );
     write_pvd_u16(
         &mut block,
         124,
-        VOLUME_SEQUENCE_NUMBER,
+        descriptor
+            .volume_sequence_number
+            .unwrap_or(VOLUME_SEQUENCE_NUMBER),
         descriptor.u16_encoding,
     );
     write_pvd_u16(
@@ -3332,9 +4147,23 @@ fn serialize_joliet_svd(
     );
     write_both_u32(&mut block, 132, joliet.path_table_size);
     block[140..144].copy_from_slice(&joliet.pointers[0].to_le_bytes());
-    block[144..148].copy_from_slice(&joliet.pointers[1].to_le_bytes());
+    block[144..148].copy_from_slice(
+        &if volume.aliased_path_table_pointers {
+            joliet.pointers[0]
+        } else {
+            joliet.pointers[1]
+        }
+        .to_le_bytes(),
+    );
     block[148..152].copy_from_slice(&joliet.pointers[2].to_be_bytes());
-    block[152..156].copy_from_slice(&joliet.pointers[3].to_be_bytes());
+    block[152..156].copy_from_slice(
+        &if volume.aliased_path_table_pointers {
+            joliet.pointers[2]
+        } else {
+            joliet.pointers[3]
+        }
+        .to_be_bytes(),
+    );
     let root_record = serialize_record(&Record {
         extent: root_placement.extent,
         length: root_placement.length,
@@ -3349,11 +4178,15 @@ fn serialize_joliet_svd(
             | (u8::from(root.associated) * ASSOCIATED_FLAG),
         file_unit_size: 0,
         interleave_gap_size: 0,
-        volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
-        name: vec![match descriptor.root_directory_identifier {
-            RootDirectoryIdentifier::Current => 0,
-            RootDirectoryIdentifier::Parent => 1,
-        }],
+        volume_sequence_number: descriptor
+            .volume_sequence_number
+            .unwrap_or(VOLUME_SEQUENCE_NUMBER),
+        name: match descriptor.root_directory_identifier {
+            RootDirectoryIdentifier::Current => vec![0],
+            RootDirectoryIdentifier::Parent => vec![1],
+            RootDirectoryIdentifier::Empty => Vec::new(),
+        },
+        identifier_padding: 0,
         system_use: Vec::new(),
         trailing_system_use_padding: false,
     })?;
@@ -3443,6 +4276,37 @@ fn serialize_joliet_svd(
         volume.zero_pad_strings,
         Some(odd_bytes[2]),
     )?;
+    if volume.nul_terminated_space_padded_strings {
+        ensure!(
+            !volume.zero_fill_empty_strings
+                && !volume.zero_pad_strings
+                && volume.volume_set_identifier_raw_hex.is_none(),
+            "nul_terminated_space_padded_strings cannot be combined with other Joliet string padding policies"
+        );
+        for (offset, length, value) in [
+            (8, 32, descriptor.system_identifier.as_str()),
+            (40, 32, descriptor.volume_identifier.as_str()),
+            (190, 128, descriptor.volume_set_identifier.as_str()),
+            (318, 128, descriptor.publisher_identifier.as_str()),
+            (446, 128, descriptor.data_preparer_identifier.as_str()),
+            (574, 128, descriptor.application_identifier.as_str()),
+        ] {
+            if offset == 40 && volume.volume_identifier_nul_terminated && !value.is_empty() {
+                let end = offset + encode_joliet_identifier(value)?.len();
+                ensure!(
+                    end + 2 <= offset + length,
+                    "Joliet string has no NUL terminator space"
+                );
+                block[end..end + 2].fill(0);
+            }
+            block[offset + length - 2..offset + length].fill(0);
+        }
+    } else {
+        ensure!(
+            !volume.volume_identifier_nul_terminated,
+            "volume_identifier_nul_terminated requires nul_terminated_space_padded_strings"
+        );
+    }
     block[813..830].copy_from_slice(&serialize_volume_time(descriptor.creation_time.as_deref())?);
     block[830..847].copy_from_slice(&serialize_volume_time(
         descriptor.modification_time.as_deref(),
@@ -3686,27 +4550,33 @@ fn serialize_directory(
     let parent_entry = entry_by_path[parent.path.as_str()];
     let mut records = Vec::new();
     let mut dot_metadata = metadata.clone();
+    dot_metadata.system_use_hex = metadata.directory_self_system_use_hex.clone();
+    dot_metadata.hidden = metadata.directory_self_hidden.unwrap_or(metadata.hidden);
     if let Some(xa) = &metadata.directory_self_xa {
         dot_metadata.xa = Some(xa.clone());
     }
     records.push(make_record_with_padding(
         &dot_metadata,
         directory.extent,
-        directory.length,
+        metadata.directory_self_length.unwrap_or(directory.length),
         vec![0],
         true,
         trailing_system_use_padding,
         iso.xa_system_use,
     )?);
     let mut parent_metadata = (*parent_entry).clone();
+    parent_metadata.hidden = metadata
+        .directory_parent_hidden
+        .unwrap_or(parent_entry.hidden);
     parent_metadata.xa = metadata
         .directory_parent_xa
         .clone()
         .or_else(|| parent_entry.xa.clone());
+    parent_metadata.system_use_hex = metadata.directory_parent_system_use_hex.clone();
     let mut parent_record = make_record_with_padding(
         &parent_metadata,
         parent.extent,
-        parent.length,
+        metadata.directory_parent_length.unwrap_or(parent.length),
         vec![1],
         true,
         trailing_system_use_padding,
@@ -3714,6 +4584,12 @@ fn serialize_directory(
     )?;
     if iso.directory_parent_recording_time == DirectoryParentRecordingTime::Current {
         parent_record[18..25].copy_from_slice(&serialize_recording_time(&metadata.recording_time)?);
+    }
+    if let Some(recording_time) = &metadata.directory_parent_recording_time {
+        parent_record[18..25].copy_from_slice(&serialize_recording_time(recording_time)?);
+    }
+    if let Some(recording_time) = &metadata.directory_self_recording_time {
+        records[0][18..25].copy_from_slice(&serialize_recording_time(recording_time)?);
     }
     records.push(parent_record);
     for entry in iso
@@ -3738,6 +4614,11 @@ fn serialize_directory(
             trailing_system_use_padding,
             entry_uses_xa_system_use(iso, entry),
         )?);
+    }
+    if let Some(sequence) = iso.directory_record_volume_sequence_number {
+        for record in &mut records {
+            write_both_u16(record, 28, sequence);
+        }
     }
     let mut result = vec![0_u8; usize::try_from(directory.blocks)? * LOGICAL_BLOCK_SIZE];
     let mut offset = 0;
@@ -3804,19 +4685,28 @@ fn serialize_joliet_directory(
     let parent_entry = entry_by_path[parent.path.as_str()];
     let mut records = Vec::new();
     let mut dot_metadata = metadata.clone();
+    dot_metadata.system_use_hex = metadata.directory_self_system_use_hex.clone();
+    dot_metadata.hidden = metadata.directory_self_hidden.unwrap_or(metadata.hidden);
     if let Some(xa) = &metadata.directory_self_xa {
         dot_metadata.xa = Some(xa.clone());
     }
     records.push(make_joliet_record(
         &dot_metadata,
         directory.extent,
-        directory.length,
+        metadata.directory_self_length.unwrap_or(directory.length),
         vec![0],
         true,
         trailing_system_use_padding,
         volume.xa_system_use,
     )?);
+    if let Some(recording_time) = &metadata.directory_self_recording_time {
+        records[0][18..25].copy_from_slice(&serialize_recording_time(recording_time)?);
+    }
     let mut parent_metadata = parent_entry.clone();
+    parent_metadata.hidden = metadata
+        .directory_parent_hidden
+        .unwrap_or(parent_entry.hidden);
+    parent_metadata.system_use_hex = metadata.directory_parent_system_use_hex.clone();
     parent_metadata.xa = metadata
         .directory_parent_xa
         .clone()
@@ -3824,7 +4714,7 @@ fn serialize_joliet_directory(
     let mut parent_record = make_joliet_record(
         &parent_metadata,
         parent.extent,
-        parent.length,
+        metadata.directory_parent_length.unwrap_or(parent.length),
         vec![1],
         true,
         trailing_system_use_padding,
@@ -3832,6 +4722,9 @@ fn serialize_joliet_directory(
     )?;
     if iso.directory_parent_recording_time == DirectoryParentRecordingTime::Current {
         parent_record[18..25].copy_from_slice(&serialize_recording_time(&metadata.recording_time)?);
+    }
+    if let Some(recording_time) = &metadata.directory_parent_recording_time {
+        parent_record[18..25].copy_from_slice(&serialize_recording_time(recording_time)?);
     }
     records.push(parent_record);
     for entry in volume
@@ -3863,6 +4756,11 @@ fn serialize_joliet_directory(
             trailing_system_use_padding,
             volume.xa_system_use,
         )?);
+    }
+    if let Some(sequence) = iso.directory_record_volume_sequence_number {
+        for record in &mut records {
+            write_both_u16(record, 28, sequence);
+        }
     }
     let mut result = vec![0_u8; usize::try_from(directory.blocks)? * LOGICAL_BLOCK_SIZE];
     let mut offset = 0;
@@ -3924,10 +4822,23 @@ fn make_joliet_record(
         interleave_gap_size: 0,
         volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
         name,
-        system_use: if xa_system_use {
-            serialize_xa_system_use_parts(&entry.path, entry.xa.as_ref(), directory)?
-        } else {
-            Vec::new()
+        identifier_padding: entry.identifier_padding.unwrap_or(0),
+        system_use: {
+            let mut value = entry
+                .system_use_hex
+                .as_deref()
+                .map(hex::decode)
+                .transpose()
+                .with_context(|| format!("decoding Joliet system_use_hex for {}", entry.path))?
+                .unwrap_or_default();
+            if xa_system_use {
+                value.extend_from_slice(&serialize_xa_system_use_parts(
+                    &entry.path,
+                    entry.xa.as_ref(),
+                    directory,
+                )?);
+            }
+            value
         },
         trailing_system_use_padding,
     })
@@ -3964,6 +4875,7 @@ fn make_record_with_padding(
         interleave_gap_size: 0,
         volume_sequence_number: VOLUME_SEQUENCE_NUMBER,
         name,
+        identifier_padding: entry.identifier_padding.unwrap_or(0),
         system_use: serialize_directory_record_system_use(entry, directory, xa_system_use)?,
         trailing_system_use_padding,
     })
@@ -3983,6 +4895,9 @@ fn serialize_record(record: &Record) -> Result<Vec<u8>> {
     write_both_u16(&mut bytes, 28, record.volume_sequence_number);
     bytes[32] = u8::try_from(record.name.len())?;
     bytes[33..33 + record.name.len()].copy_from_slice(&record.name);
+    if record.name.len().is_multiple_of(2) && !record.trailing_system_use_padding {
+        bytes[33 + record.name.len()] = record.identifier_padding;
+    }
     let system_use_start = 33
         + record.name.len()
         + usize::from(record.name.len().is_multiple_of(2) && !record.trailing_system_use_padding);
@@ -3993,7 +4908,7 @@ fn serialize_record(record: &Record) -> Result<Vec<u8>> {
 
 fn identifier(entry: &Entry, is_file: bool) -> String {
     let name = file_name(&entry.path);
-    if is_file {
+    if is_file && !entry.omit_version {
         format!("{name};{FILE_VERSION}")
     } else {
         name.to_owned()
@@ -4423,15 +5338,27 @@ mod tests {
     fn test_entry(path: &str) -> Entry {
         Entry {
             path: path.to_owned(),
+            omit_version: false,
             recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
             hidden: false,
             associated: false,
             reference: None,
             xa_system_use: None,
             directory_slack: None,
+            directory_length_policy: None,
             allocation_padding_hex: None,
             directory_self_xa: None,
             directory_parent_xa: None,
+            system_use_hex: None,
+            identifier_padding: None,
+            directory_self_system_use_hex: None,
+            directory_parent_system_use_hex: None,
+            directory_self_recording_time: None,
+            directory_parent_recording_time: None,
+            directory_self_length: None,
+            directory_parent_length: None,
+            directory_self_hidden: None,
+            directory_parent_hidden: None,
             sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
             xa: None,
         }
@@ -4442,13 +5369,13 @@ mod tests {
             primary_volume: parse_pvd(&standard_pvd_block()).unwrap(),
             primary_volume_copies: 1,
             supplementary_volumes: Vec::new(),
-            metadata_layout: Vec::new(),
             xa_system_use: true,
             metadata_subheader: MetadataSubheader::default(),
             volume_terminator_subheader: VolumeTerminatorSubheader::Metadata,
             directory_record_packing: DirectoryRecordPacking::Fill,
             directory_parent_recording_time: DirectoryParentRecordingTime::Parent,
             directory_length_policy: DirectoryLengthPolicy::Allocated,
+            directory_record_volume_sequence_number: None,
             path_table_size: None,
             path_table_padding: 0,
             path_table_little_hex: None,
@@ -4459,6 +5386,12 @@ mod tests {
             entries,
             layout: files.into_iter().map(FileLayoutItem::path).collect(),
         }
+    }
+
+    fn validate_test(iso: &Iso9660) -> Result<()> {
+        let mut iso = iso.clone();
+        complete_test_layout(&mut iso)?;
+        validate(&iso)
     }
 
     #[test]
@@ -4530,7 +5463,7 @@ mod tests {
                 &test_iso(vec![test_entry(ROOT_PATH), entry], vec![]),
                 &HashMap::new()
             )
-            .is_err()
+            .is_ok()
         );
 
         let mut entry = test_entry("AUDIO.BIN");
@@ -4559,56 +5492,6 @@ mod tests {
                 &HashMap::new()
             )
             .is_err()
-        );
-    }
-
-    #[test]
-    fn metadata_derivation_allows_interleaved_primary_and_joliet_directories() {
-        let mut blocks = vec![[0_u8; LOGICAL_BLOCK_SIZE]; 32];
-        blocks[26][0] = 1;
-        let primary_tables = ParsedPathTables {
-            extents: [20, 0, 22, 0],
-            blocks: 1,
-        };
-        let joliet_tables = ParsedPathTables {
-            extents: [21, 0, 23, 0],
-            blocks: 1,
-        };
-        let primary_directories = vec![
-            ParsedDirectory {
-                path: ROOT_PATH.to_owned(),
-                extent: 24,
-                length: LOGICAL_BLOCK_SIZE as u32,
-            },
-            ParsedDirectory {
-                path: "DATA".to_owned(),
-                extent: 30,
-                length: LOGICAL_BLOCK_SIZE as u32,
-            },
-        ];
-        let joliet_directories = vec![
-            ParsedDirectory {
-                path: ROOT_PATH.to_owned(),
-                extent: 25,
-                length: LOGICAL_BLOCK_SIZE as u32,
-            },
-            ParsedDirectory {
-                path: "DATA".to_owned(),
-                extent: 31,
-                length: LOGICAL_BLOCK_SIZE as u32,
-            },
-        ];
-
-        assert!(
-            derive_metadata_layout(
-                &blocks,
-                20,
-                &primary_tables,
-                &primary_directories,
-                &joliet_tables,
-                &joliet_directories,
-            )
-            .is_ok()
         );
     }
 
@@ -4979,39 +5862,19 @@ mod tests {
     }
 
     #[test]
-    fn path_table_copies_can_have_structured_xa_gap_padding() {
+    fn aliased_path_table_pointers_share_required_table_sectors() {
         let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
-        iso.path_table_copies = PathTableCopies::Single;
-        iso.path_table_padding = 1;
+        iso.path_table_copies = PathTableCopies::Aliased;
 
-        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let mut authored = layout(&iso, &HashMap::new()).unwrap();
+        authored.blocks.resize(23, [0; LOGICAL_BLOCK_SIZE]);
         let pvd = &authored.blocks[16];
 
-        assert_eq!(u32::from_le_bytes(pvd[140..144].try_into().unwrap()), 18);
-        assert_eq!(u32::from_be_bytes(pvd[148..152].try_into().unwrap()), 20);
-        assert_eq!(read_both_u32(pvd, 158).unwrap(), 22);
+        assert_eq!(pvd[140..144], pvd[144..148]);
+        assert_eq!(pvd[148..152], pvd[152..156]);
         assert_eq!(
-            authored.gaps,
-            vec![
-                GapPlacement {
-                    start: 19,
-                    sectors: 1,
-                    kind: GapKind::Xa,
-                    subheader: None,
-                    form2_edc: None,
-                },
-                GapPlacement {
-                    start: 21,
-                    sectors: 1,
-                    kind: GapKind::Xa,
-                    subheader: None,
-                    form2_edc: None,
-                },
-            ]
-        );
-        assert_eq!(
-            parse(&authored.blocks).unwrap().manifest.path_table_padding,
-            1
+            parse(&authored.blocks).unwrap().manifest.path_table_copies,
+            PathTableCopies::Aliased
         );
     }
 
@@ -5025,12 +5888,17 @@ mod tests {
             flags: 0,
             zero_fill_empty_strings: false,
             zero_pad_strings: false,
+            nul_terminated_space_padded_strings: false,
+            volume_identifier_nul_terminated: false,
+            space_pad_escape_sequence: false,
+            aliased_path_table_pointers: false,
             volume_set_identifier_raw_hex: None,
             descriptor: iso.primary_volume.clone(),
             xa_system_use: true,
             path_table_size: None,
             path_table_little_hex: None,
             path_table_big_hex: None,
+            path_table_subheader: PathTableSubheader::default(),
             file_identifier_odd_bytes_hex: None,
             entries: vec![
                 crate::manifest::JolietEntry {
@@ -5040,6 +5908,17 @@ mod tests {
                     recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
                     hidden: false,
                     associated: false,
+                    system_use_hex: None,
+                    identifier_padding: None,
+                    directory_self_system_use_hex: None,
+                    directory_parent_system_use_hex: None,
+                    directory_self_recording_time: None,
+                    directory_parent_recording_time: None,
+                    directory_self_length: None,
+                    directory_parent_length: None,
+                    directory_self_hidden: None,
+                    directory_parent_hidden: None,
+                    sector_subheader: EntrySectorSubheader::Canonical,
                     xa: None,
                     directory_self_xa: None,
                     directory_parent_xa: None,
@@ -5051,63 +5930,43 @@ mod tests {
                     recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
                     hidden: false,
                     associated: false,
+                    system_use_hex: None,
+                    identifier_padding: None,
+                    directory_self_system_use_hex: None,
+                    directory_parent_system_use_hex: None,
+                    directory_self_recording_time: None,
+                    directory_parent_recording_time: None,
+                    directory_self_length: None,
+                    directory_parent_length: None,
+                    directory_self_hidden: None,
+                    directory_parent_hidden: None,
+                    sector_subheader: EntrySectorSubheader::Canonical,
                     xa: None,
                     directory_self_xa: None,
                     directory_parent_xa: None,
                 },
             ],
         }];
-        iso.metadata_layout = vec![
-            crate::manifest::MetadataLayoutItem::path_table(
-                crate::manifest::MetadataPathTable::PrimaryLittle,
-            ),
-            crate::manifest::MetadataLayoutItem::path_table(
-                crate::manifest::MetadataPathTable::PrimaryBig,
-            ),
-            crate::manifest::MetadataLayoutItem::path_table(
-                crate::manifest::MetadataPathTable::JolietLittle,
-            ),
-            crate::manifest::MetadataLayoutItem::path_table(
-                crate::manifest::MetadataPathTable::JolietBig,
-            ),
-            crate::manifest::MetadataLayoutItem::directories(
-                crate::manifest::MetadataVolume::Primary,
-            ),
-            crate::manifest::MetadataLayoutItem::directories(
-                crate::manifest::MetadataVolume::Joliet,
-            ),
+        iso.layout = vec![
+            FileLayoutItem::path_table(MetadataPathTable::PrimaryLittle),
+            FileLayoutItem::path_table(MetadataPathTable::PrimaryBig),
+            FileLayoutItem::path_table(MetadataPathTable::JolietLittle),
+            FileLayoutItem::path_table(MetadataPathTable::JolietBig),
+            FileLayoutItem::directory(ROOT_PATH),
+            FileLayoutItem::volume_directory(MetadataVolume::Joliet, ROOT_PATH),
+            FileLayoutItem::path("FILE.BIN"),
         ];
         iso
     }
 
     #[test]
-    fn metadata_gap_physical_kind_comes_from_the_track() {
-        let mut iso = test_joliet_iso();
-        iso.metadata_layout.insert(1, MetadataLayoutItem::gap(2));
-        let lengths = HashMap::from([("FILE.BIN".to_owned(), 17_u64)]);
-
-        let mode1 = layout_with_metadata_gap_kind(&iso, &lengths, GapKind::Mode1).unwrap();
-        assert!(
-            mode1
-                .gaps
-                .iter()
-                .any(|gap| gap.sectors == 2 && gap.kind == GapKind::Mode1)
-        );
-
-        let mode2_xa = layout(&iso, &lengths).unwrap();
-        assert!(
-            mode2_xa
-                .gaps
-                .iter()
-                .any(|gap| gap.sectors == 2 && gap.kind == GapKind::Xa)
-        );
-    }
-
-    #[test]
     fn joliet_directories_can_use_the_ordered_file_layout() {
         let mut iso = test_joliet_iso();
-        iso.metadata_layout.truncate(4);
         iso.layout = vec![
+            FileLayoutItem::path_table(MetadataPathTable::PrimaryLittle),
+            FileLayoutItem::path_table(MetadataPathTable::PrimaryBig),
+            FileLayoutItem::path_table(MetadataPathTable::JolietLittle),
+            FileLayoutItem::path_table(MetadataPathTable::JolietBig),
             FileLayoutItem::directory(ROOT_PATH),
             FileLayoutItem::volume_directory(MetadataVolume::Joliet, ROOT_PATH),
             FileLayoutItem::path("FILE.BIN"),
@@ -5165,6 +6024,29 @@ mod tests {
     }
 
     #[test]
+    fn joliet_nul_terminated_space_padding_and_escape_spaces_round_trip() {
+        let mut iso = test_joliet_iso();
+        let volume = &mut iso.supplementary_volumes[0];
+        volume.descriptor.volume_identifier = "TEST".to_owned();
+        volume.nul_terminated_space_padded_strings = true;
+        volume.volume_identifier_nul_terminated = true;
+        volume.space_pad_escape_sequence = true;
+        let lengths = HashMap::from([("FILE.BIN".to_owned(), 17_u64)]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+        let parsed_volume = &parsed.manifest.supplementary_volumes[0];
+
+        assert!(parsed_volume.nul_terminated_space_padded_strings);
+        assert!(parsed_volume.volume_identifier_nul_terminated);
+        assert!(parsed_volume.space_pad_escape_sequence);
+        assert_eq!(
+            layout(&parsed.manifest, &lengths).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
     fn overlong_joliet_root_record_length_round_trips_in_memory() {
         let iso = test_joliet_iso();
         let lengths = HashMap::from([("FILE.BIN".to_owned(), 17_u64)]);
@@ -5206,6 +6088,17 @@ mod tests {
                 recording_time: "2000-01-01T00:00:00+00:00".to_owned(),
                 hidden: false,
                 associated: false,
+                system_use_hex: None,
+                identifier_padding: None,
+                directory_self_system_use_hex: None,
+                directory_parent_system_use_hex: None,
+                directory_self_recording_time: None,
+                directory_parent_recording_time: None,
+                directory_self_length: None,
+                directory_parent_length: None,
+                directory_self_hidden: None,
+                directory_parent_hidden: None,
+                sector_subheader: EntrySectorSubheader::Canonical,
                 xa: None,
                 directory_self_xa: None,
                 directory_parent_xa: None,
@@ -5346,24 +6239,115 @@ mod tests {
     }
 
     #[test]
-    fn fixed_primary_volume_values_are_validated() {
+    fn primary_file_identifier_can_omit_its_version() {
+        let mut file = test_entry("README.TXT");
+        file.omit_version = true;
+        let iso = test_iso(vec![test_entry(ROOT_PATH), file], vec!["README.TXT"]);
+        let lengths = HashMap::from([("README.TXT".to_owned(), 1)]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+
+        assert!(parsed.manifest.entries[1].omit_version);
+        assert_eq!(
+            layout(&parsed.manifest, &lengths).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
+    fn directory_record_system_use_prefixes_round_trip_with_and_without_xa() {
+        for xa_system_use in [false, true] {
+            let mut file = test_entry("FILE.BIN");
+            file.system_use_hex = Some("0000000041410e02".to_owned());
+            let mut iso = test_iso(vec![test_entry(ROOT_PATH), file], vec!["FILE.BIN"]);
+            iso.xa_system_use = xa_system_use;
+            let lengths = HashMap::from([("FILE.BIN".to_owned(), 1)]);
+
+            let authored = layout(&iso, &lengths).unwrap();
+            let parsed = parse(&authored.blocks).unwrap();
+
+            assert_eq!(
+                parsed.manifest.entries[1].system_use_hex.as_deref(),
+                Some("0000000041410e02")
+            );
+            assert_eq!(
+                layout(&parsed.manifest, &lengths).unwrap().blocks,
+                authored.blocks
+            );
+        }
+    }
+
+    #[test]
+    fn directory_dot_and_parent_recording_time_overrides_round_trip() {
+        let root = test_entry(ROOT_PATH);
+        let mut directory = test_entry("DIR");
+        directory.recording_time = "2001-02-03T04:05:06+00:00".to_owned();
+        directory.directory_self_recording_time = Some("hex:000000000000e0".to_owned());
+        directory.directory_parent_recording_time = Some("hex:000000000000e0".to_owned());
+        let iso = test_iso(vec![root, directory], vec![]);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+        let parsed_directory = &parsed.manifest.entries[1];
+
+        assert_eq!(
+            parsed_directory.directory_self_recording_time.as_deref(),
+            Some("hex:000000000000e0")
+        );
+        assert_eq!(
+            parsed_directory.directory_parent_recording_time.as_deref(),
+            Some("hex:000000000000e0")
+        );
+        assert_eq!(
+            layout(&parsed.manifest, &HashMap::new()).unwrap().blocks,
+            authored.blocks
+        );
+    }
+
+    #[test]
+    fn primary_volume_sequence_values_are_preserved_and_block_size_is_validated() {
         parse_pvd(&standard_pvd_block()).unwrap();
 
-        for (offset, value, expected) in [
-            (120, 2, "unsupported volume set size"),
-            (124, 2, "unsupported volume sequence number"),
-            (128, 1024, "unsupported logical block size"),
-        ] {
-            let mut block = standard_pvd_block();
-            write_both_u16(&mut block, offset, value);
-            assert_eq!(parse_pvd(&block).unwrap_err().to_string(), expected);
-        }
+        let mut block = standard_pvd_block();
+        write_both_u16(&mut block, 120, 0);
+        write_both_u16(&mut block, 124, 2);
+        let parsed = parse_pvd(&block).unwrap();
+        assert_eq!(parsed.volume_set_size, Some(0));
+        assert_eq!(parsed.volume_sequence_number, Some(2));
+
+        write_both_u16(&mut block, 128, 1024);
+        assert_eq!(
+            parse_pvd(&block).unwrap_err().to_string(),
+            "unsupported logical block size"
+        );
 
         let mut block = standard_pvd_block();
         block[881] = 2;
         assert_eq!(
             parse_pvd(&block).unwrap_err().to_string(),
             "unsupported file structure version"
+        );
+    }
+
+    #[test]
+    fn zero_volume_sequence_values_round_trip_through_descriptors_and_directories() {
+        let mut iso = test_iso(vec![test_entry(ROOT_PATH)], vec![]);
+        iso.primary_volume.volume_set_size = Some(0);
+        iso.primary_volume.volume_sequence_number = Some(0);
+        iso.directory_record_volume_sequence_number = Some(0);
+
+        let authored = layout(&iso, &HashMap::new()).unwrap();
+        let parsed = parse(&authored.blocks).unwrap();
+
+        assert_eq!(parsed.manifest.primary_volume.volume_set_size, Some(0));
+        assert_eq!(
+            parsed.manifest.directory_record_volume_sequence_number,
+            Some(0)
+        );
+        assert_eq!(
+            layout(&parsed.manifest, &HashMap::new()).unwrap().blocks,
+            authored.blocks
         );
     }
 
@@ -5478,7 +6462,7 @@ mod tests {
         );
         explicit_true.entries[1].xa_system_use = Some(true);
         assert!(
-            validate(&explicit_true)
+            validate_test(&explicit_true)
                 .unwrap_err()
                 .to_string()
                 .contains("supports only false")
@@ -5487,7 +6471,7 @@ mod tests {
         let mut directory = test_iso(vec![test_entry(ROOT_PATH), test_entry("DIR")], vec![]);
         directory.entries[1].xa_system_use = Some(false);
         assert!(
-            validate(&directory)
+            validate_test(&directory)
                 .unwrap_err()
                 .to_string()
                 .contains("requires global XA system use and a file entry")
@@ -5500,7 +6484,7 @@ mod tests {
         global_false.xa_system_use = false;
         global_false.entries[1].xa_system_use = Some(false);
         assert!(
-            validate(&global_false)
+            validate_test(&global_false)
                 .unwrap_err()
                 .to_string()
                 .contains("requires global XA system use and a file entry")
@@ -5515,7 +6499,7 @@ mod tests {
             file_number: 7,
             ..EntryXa::default()
         });
-        validate(&with_xa).unwrap();
+        validate_test(&with_xa).unwrap();
     }
 
     #[test]
@@ -5688,11 +6672,9 @@ mod tests {
     fn layout_declares_kind_and_physical_order() {
         let root = test_entry(".");
         let file = test_entry("FILE.BIN");
-        validate_entries(&test_iso(
-            vec![root.clone(), file.clone()],
-            vec!["FILE.BIN"],
-        ))
-        .unwrap();
+        let mut valid = test_iso(vec![root.clone(), file.clone()], vec!["FILE.BIN"]);
+        complete_test_layout(&mut valid).unwrap();
+        validate_entries(&valid).unwrap();
 
         assert!(validate_entries(&test_iso(vec![file.clone()], vec!["FILE.BIN"])).is_err());
         assert!(
@@ -6029,7 +7011,7 @@ mod tests {
             "MOVIE.STR",
             xa_assets("MOVIE.STR.F1S", "MOVIE.STR.F2S", "MOVIE.STR.I"),
         );
-        validate(&iso).unwrap();
+        validate_test(&iso).unwrap();
     }
 
     #[test]
@@ -6147,6 +7129,7 @@ mod tests {
             interleave_gap_size: 0,
             volume_sequence_number: 1,
             name: b"FILE.BIN;1".to_vec(),
+            identifier_padding: 0,
             system_use: serialize_xa_system_use(&test_entry("FILE.BIN"), false).unwrap(),
             trailing_system_use_padding: false,
         };
@@ -6166,7 +7149,7 @@ mod tests {
         assert!(validate_standard_record_fields(&record, false, true).is_err());
         record.interleave_gap_size = 0;
         record.volume_sequence_number = 2;
-        assert!(validate_standard_record_fields(&record, false, true).is_err());
+        validate_standard_record_fields(&record, false, true).unwrap();
 
         assert_eq!(identifier(&test_entry("FILE.BIN"), true), "FILE.BIN;1");
     }
@@ -6216,6 +7199,7 @@ mod tests {
             interleave_gap_size: 0,
             volume_sequence_number: 1,
             name: b"DIR".to_vec(),
+            identifier_padding: 0,
             system_use: [0, 0, 0, 0, 0, 0x88, b'X', b'A', 0, 0, 0, 0, 0, 0].to_vec(),
             trailing_system_use_padding: false,
         };
@@ -6237,6 +7221,7 @@ mod tests {
                     directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
+                    ..test_entry("UNUSED")
                 },
                 true,
             )
@@ -6256,6 +7241,7 @@ mod tests {
             interleave_gap_size: 0,
             volume_sequence_number: 1,
             name: b"PETEXA0.STR;1".to_vec(),
+            identifier_padding: 0,
             system_use: [0, 0, 0, 0, 0x25, 0x55, b'X', b'A', 1, 0, 0, 0, 0, 0].to_vec(),
             trailing_system_use_padding: false,
         };
@@ -6278,6 +7264,7 @@ mod tests {
                     directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
+                    ..test_entry("UNUSED")
                 },
                 false,
             )
@@ -6297,6 +7284,7 @@ mod tests {
             interleave_gap_size: 0,
             volume_sequence_number: 1,
             name: b"SYSTEM.CNF;1".to_vec(),
+            identifier_padding: 0,
             system_use: [0, 0, 0, 0, 0x09, 0x11, b'X', b'A', 0, 0, 0, 0, 0, 0].to_vec(),
             trailing_system_use_padding: false,
         };
@@ -6318,6 +7306,7 @@ mod tests {
                     directory_parent_xa: None,
                     sector_subheader: crate::manifest::EntrySectorSubheader::Canonical,
                     xa: Some(xa),
+                    ..test_entry("UNUSED")
                 },
                 false,
             )

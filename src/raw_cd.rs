@@ -322,8 +322,9 @@ fn classify_sector(
         });
     }
     ensure!(chunk[..12] == SYNC, "invalid sync at sector {index}");
+    let sector_mode = chunk[15];
     ensure!(
-        chunk[15] == track_mode,
+        sector_mode == track_mode || (track_mode == 2 && sector_mode == 1),
         "mixed or unsupported sector mode at sector {index}"
     );
     let expected = frame_to_msf(start_frame + u32::try_from(index)?)?;
@@ -331,11 +332,7 @@ fn classify_sector(
         chunk[12..15] == expected,
         "non-monotonic MSF at sector {index}"
     );
-    if track_mode == 1 {
-        ensure!(
-            chunk[2068..2076].iter().all(|byte| *byte == 0),
-            "nonzero Mode 1 reserved bytes are unsupported at sector {index}"
-        );
+    if sector_mode == 1 {
         ensure!(
             edc_matches(&chunk[..2064], &chunk[2064..2068]),
             "invalid Mode 1 EDC at sector {index}"
@@ -349,6 +346,10 @@ fn classify_sector(
         } else {
             Kind::Mode1
         };
+        ensure!(
+            track_mode == 1 || kind == Kind::Mode1Gap,
+            "non-gap Mode 1 sector in Mode 2 track at sector {index}"
+        );
         return Ok(SectorClassification {
             kind,
             subheader: XaSubheader::default(),
@@ -1213,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn mode1_and_form1_protection_errors_are_rejected() {
+    fn mode1_reserved_bytes_are_preserved_while_protection_errors_are_rejected() {
         let mode1 = SectorWriter::new()
             .mode1(150, &[0x5a; LOGICAL_BLOCK_SIZE])
             .unwrap();
@@ -1236,12 +1237,8 @@ mod tests {
         let mut reserved = mode1;
         reserved[2068] = 1;
         write_ecc(&mut reserved, frame_header(150, 1).unwrap());
-        assert!(
-            parse_image(&reserved)
-                .unwrap_err()
-                .to_string()
-                .contains("nonzero Mode 1 reserved bytes are unsupported at sector 0")
-        );
+        let parsed = parse_image(&reserved).unwrap().1;
+        assert_eq!(parsed[0].bytes[2068..2076], [1, 0, 0, 0, 0, 0, 0, 0]);
 
         let form1 = SectorWriter::new()
             .form1(150, [0, 0, 0x08, 0].into(), &[0x5a; LOGICAL_BLOCK_SIZE])
@@ -1262,5 +1259,20 @@ mod tests {
                 .to_string()
                 .contains("unsupported or invalid Mode 2 sector at sector 0")
         );
+    }
+
+    #[test]
+    fn mode2_track_can_contain_a_protected_zero_mode1_gap() {
+        let mut writer = SectorWriter::new();
+        let raw = [
+            writer
+                .form1(150, [0, 0, 0x08, 0].into(), &[1; LOGICAL_BLOCK_SIZE])
+                .unwrap(),
+            writer.mode1(151, &[0; LOGICAL_BLOCK_SIZE]).unwrap(),
+            writer.xa_gap(152, XaSubheader::default()).unwrap(),
+        ]
+        .concat();
+        let parsed = parse_image(&raw).unwrap().1;
+        assert_eq!(parsed[1].kind, Kind::Mode1Gap);
     }
 }

@@ -104,6 +104,8 @@ pub struct Track {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redump_0x55: Vec<Redump0x55Run>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mode1_reserved: Vec<Mode1ReservedRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<SectorPatch>,
 }
 
@@ -112,6 +114,14 @@ pub struct Track {
 pub struct Redump0x55Run {
     pub lba: i32,
     pub sectors: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mode1ReservedRun {
+    pub lba: i32,
+    pub sectors: u32,
+    pub hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +165,7 @@ impl Default for Track {
             form2_edc: default_form2_edc(),
             noncompliant_trailing_ecc: false,
             redump_0x55: Vec::new(),
+            mode1_reserved: Vec::new(),
             patches: Vec::new(),
         }
     }
@@ -356,8 +367,6 @@ pub struct Iso9660 {
     pub primary_volume_copies: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supplementary_volumes: Vec<JolietVolume>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metadata_layout: Vec<MetadataLayoutItem>,
     #[serde(default = "default_xa_system_use", skip_serializing_if = "is_true")]
     pub xa_system_use: bool,
     #[serde(default, skip_serializing_if = "MetadataSubheader::is_default")]
@@ -373,6 +382,8 @@ pub struct Iso9660 {
     pub directory_parent_recording_time: DirectoryParentRecordingTime,
     #[serde(default, skip_serializing_if = "DirectoryLengthPolicy::is_default")]
     pub directory_length_policy: DirectoryLengthPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_record_volume_sequence_number: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_table_size: Option<u32>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -473,6 +484,14 @@ pub struct JolietVolume {
     pub zero_fill_empty_strings: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub zero_pad_strings: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nul_terminated_space_padded_strings: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub volume_identifier_nul_terminated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub space_pad_escape_sequence: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aliased_path_table_pointers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_set_identifier_raw_hex: Option<String>,
     pub descriptor: PrimaryVolume,
@@ -484,6 +503,8 @@ pub struct JolietVolume {
     pub path_table_little_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_table_big_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "PathTableSubheader::is_default")]
+    pub path_table_subheader: PathTableSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_identifier_odd_bytes_hex: Option<String>,
     pub entries: Vec<JolietEntry>,
@@ -503,19 +524,33 @@ pub struct JolietEntry {
     #[serde(default, skip_serializing_if = "is_false")]
     pub associated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_padding: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_recording_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_recording_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
+    pub sector_subheader: EntrySectorSubheader,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_self_xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_parent_xa: Option<EntryXa>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum MetadataLayoutItem {
-    PathTable(MetadataPathTableItem),
-    Directories(MetadataDirectoriesItem),
-    Gap(MetadataGapItem),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -528,15 +563,11 @@ pub struct MetadataPathTableItem {
 #[serde(rename_all = "snake_case")]
 pub enum MetadataPathTable {
     PrimaryLittle,
+    PrimaryLittleCopy,
     PrimaryBig,
+    PrimaryBigCopy,
     JolietLittle,
     JolietBig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MetadataDirectoriesItem {
-    pub directories: MetadataVolume,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -553,26 +584,6 @@ impl MetadataVolume {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MetadataGapItem {
-    pub gap: u32,
-}
-
-impl MetadataLayoutItem {
-    pub const fn path_table(path_table: MetadataPathTable) -> Self {
-        Self::PathTable(MetadataPathTableItem { path_table })
-    }
-
-    pub const fn directories(directories: MetadataVolume) -> Self {
-        Self::Directories(MetadataDirectoriesItem { directories })
-    }
-
-    pub const fn gap(sectors: u32) -> Self {
-        Self::Gap(MetadataGapItem { gap: sectors })
-    }
-}
-
 impl DirectoryParentRecordingTime {
     const fn is_default(&self) -> bool {
         matches!(self, Self::Parent)
@@ -585,6 +596,7 @@ pub enum PathTableCopies {
     #[default]
     Duplicate,
     Single,
+    Aliased,
 }
 
 impl PathTableCopies {
@@ -674,6 +686,11 @@ impl PathTableSubheader {
 pub enum FileLayoutItem {
     Path(FilePathItem),
     Directory(FileDirectoryItem),
+    PathTable(MetadataPathTableItem),
+    AppleHfs(FileAppleHfsItem),
+    DuplicateBlock(FileDuplicateBlockItem),
+    CeQuadratJolietLinks(FileCeQuadratJolietLinksItem),
+    CeQuadratFormatter(FileCeQuadratFormatterItem),
     XaExtent(FileXaExtentItem),
     Gap(FileGapItem),
 }
@@ -696,6 +713,39 @@ pub struct FileDirectoryItem {
     pub directory: String,
     #[serde(default, skip_serializing_if = "MetadataVolume::is_primary")]
     pub volume: MetadataVolume,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileAppleHfsItem {
+    pub apple_hfs: HostAsset,
+    pub start_block: u32,
+    pub block_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileDuplicateBlockItem {
+    pub duplicate_block: DuplicateBlock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DuplicateBlock {
+    pub path: String,
+    pub block: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileCeQuadratJolietLinksItem {
+    pub cequadrat_joliet_links: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileCeQuadratFormatterItem {
+    pub cequadrat_formatter: HostAsset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -989,6 +1039,35 @@ impl FileLayoutItem {
         })
     }
 
+    pub fn apple_hfs(asset: HostAsset, start_block: u32, block_count: u32) -> Self {
+        Self::AppleHfs(FileAppleHfsItem {
+            apple_hfs: asset,
+            start_block,
+            block_count,
+        })
+    }
+
+    pub fn duplicate_block(path: impl Into<String>, block: u32) -> Self {
+        Self::DuplicateBlock(FileDuplicateBlockItem {
+            duplicate_block: DuplicateBlock {
+                path: path.into(),
+                block,
+            },
+        })
+    }
+
+    pub const fn cequadrat_joliet_links() -> Self {
+        Self::CeQuadratJolietLinks(FileCeQuadratJolietLinksItem {
+            cequadrat_joliet_links: true,
+        })
+    }
+
+    pub fn cequadrat_formatter(asset: HostAsset) -> Self {
+        Self::CeQuadratFormatter(FileCeQuadratFormatterItem {
+            cequadrat_formatter: asset,
+        })
+    }
+
     pub fn xa_extent(assets: XaAssets) -> Self {
         Self::XaExtent(FileXaExtentItem { xa_extent: assets })
     }
@@ -1050,55 +1129,129 @@ impl FileLayoutItem {
     pub fn as_path(&self) -> Option<&str> {
         match self {
             Self::Path(item) => Some(&item.path),
-            Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
+            Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_)
+            | Self::Gap(_) => None,
         }
     }
 
     pub const fn as_path_item(&self) -> Option<&FilePathItem> {
         match self {
             Self::Path(item) => Some(item),
-            Self::Directory(_) | Self::XaExtent(_) | Self::Gap(_) => None,
+            Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_)
+            | Self::Gap(_) => None,
         }
     }
 
     pub const fn as_directory_placement(&self) -> Option<(MetadataVolume, &str)> {
         match self {
             Self::Directory(item) => Some((item.volume, item.directory.as_str())),
-            Self::Path(_) | Self::XaExtent(_) | Self::Gap(_) => None,
+            Self::Path(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_)
+            | Self::Gap(_) => None,
+        }
+    }
+
+    pub const fn path_table(path_table: MetadataPathTable) -> Self {
+        Self::PathTable(MetadataPathTableItem { path_table })
+    }
+
+    pub const fn as_path_table(&self) -> Option<MetadataPathTable> {
+        match self {
+            Self::PathTable(item) => Some(item.path_table),
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_)
+            | Self::Gap(_) => None,
         }
     }
 
     pub const fn as_xa_extent(&self) -> Option<&XaAssets> {
         match self {
             Self::XaExtent(item) => Some(&item.xa_extent),
-            Self::Path(_) | Self::Directory(_) | Self::Gap(_) => None,
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::Gap(_) => None,
         }
     }
 
     pub const fn gap_sectors(&self) -> Option<u32> {
         match self {
-            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_) => None,
             Self::Gap(item) => Some(item.gap),
         }
     }
 
     pub const fn gap_kind(&self) -> Option<GapKind> {
         match self {
-            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_) => None,
             Self::Gap(item) => Some(item.kind),
         }
     }
 
     pub const fn gap_subheader(&self) -> Option<XaSubheader> {
         match self {
-            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_) => None,
             Self::Gap(item) => item.subheader,
         }
     }
 
     pub const fn gap_form2_edc(&self) -> Option<bool> {
         match self {
-            Self::Path(_) | Self::Directory(_) | Self::XaExtent(_) => None,
+            Self::Path(_)
+            | Self::Directory(_)
+            | Self::PathTable(_)
+            | Self::AppleHfs(_)
+            | Self::DuplicateBlock(_)
+            | Self::CeQuadratJolietLinks(_)
+            | Self::CeQuadratFormatter(_)
+            | Self::XaExtent(_) => None,
             Self::Gap(item) => item.form2_edc,
         }
     }
@@ -1109,6 +1262,10 @@ impl FileLayoutItem {
 pub struct PrimaryVolume {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_space_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_set_size: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_sequence_number: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_structure_version: Option<u8>,
     #[serde(default, skip_serializing_if = "PvdU16Encoding::is_default")]
@@ -1178,6 +1335,7 @@ pub enum RootDirectoryIdentifier {
     #[default]
     Current,
     Parent,
+    Empty,
 }
 
 impl RootDirectoryIdentifier {
@@ -1207,6 +1365,8 @@ impl PrimaryVolumeApplicationUse {
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omit_version: bool,
     pub recording_time: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
@@ -1219,11 +1379,33 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_slack: Option<DirectorySlack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_length_policy: Option<DirectoryLengthPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_padding_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_self_xa: Option<EntryXa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_parent_xa: Option<EntryXa>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_padding: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_system_use_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_recording_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_recording_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_self_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent_hidden: Option<bool>,
     #[serde(default, skip_serializing_if = "EntrySectorSubheader::is_default")]
     pub sector_subheader: EntrySectorSubheader,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1525,6 +1707,7 @@ mod tests {
             form2_edc: true,
             noncompliant_trailing_ecc: false,
             redump_0x55: Vec::new(),
+            mode1_reserved: Vec::new(),
             patches: Vec::new(),
         }
     }
@@ -1562,6 +1745,23 @@ mod tests {
         assert!(yaml.contains("redump_0x55:\n- lba: 145707\n  sectors: 2"));
         let parsed = yaml_serde::from_str::<Track>(&yaml).unwrap();
         assert_eq!(parsed.redump_0x55, value.redump_0x55);
+    }
+
+    #[test]
+    fn mode1_reserved_runs_roundtrip_at_track_level() {
+        let mut value = track(TrackMode::Mode1, "00:02:00");
+        value.mode1_reserved = vec![Mode1ReservedRun {
+            lba: 33,
+            sectors: 5,
+            hex: "ffffffffffffffff".to_owned(),
+        }];
+
+        let yaml = yaml_serde::to_string(&value).unwrap();
+        assert!(yaml.contains("mode1_reserved:\n- lba: 33\n  sectors: 5\n  hex: ffffffffffffffff"));
+        assert_eq!(
+            yaml_serde::from_str::<Track>(&yaml).unwrap().mode1_reserved,
+            value.mode1_reserved
+        );
     }
 
     #[test]
@@ -1643,12 +1843,37 @@ mod tests {
     }
 
     #[test]
-    fn metadata_gap_kind_is_not_manifest_state() {
-        let yaml = "gap: 3\n";
-        let gap: MetadataLayoutItem = yaml_serde::from_str(yaml).unwrap();
-        assert_eq!(gap, MetadataLayoutItem::gap(3));
-        assert_eq!(yaml_serde::to_string(&gap).unwrap(), yaml);
-        assert!(yaml_serde::from_str::<MetadataLayoutItem>("gap: 3\nkind: xa\n").is_err());
+    fn typed_non_file_layout_items_round_trip_without_opaque_data() {
+        let items = vec![
+            FileLayoutItem::apple_hfs(
+                HostAsset {
+                    path: "disc.hfs".to_owned(),
+                    sha1: Some("1".repeat(40)),
+                },
+                225_867,
+                229_275,
+            ),
+            FileLayoutItem::duplicate_block("MWREGI~1.EXE", 330),
+            FileLayoutItem::cequadrat_joliet_links(),
+            FileLayoutItem::cequadrat_formatter(HostAsset {
+                path: "disc.cequadrat".to_owned(),
+                sha1: Some("2".repeat(40)),
+            }),
+        ];
+        let yaml = yaml_serde::to_string(&items).unwrap();
+        assert_eq!(
+            yaml_serde::from_str::<Vec<FileLayoutItem>>(&yaml).unwrap(),
+            items
+        );
+        assert!(yaml.contains("start_block: 225867"));
+        assert!(yaml.contains("duplicate_block:"));
+        assert!(yaml.contains("cequadrat_joliet_links: true"));
+    }
+
+    #[test]
+    fn removed_metadata_layout_field_is_rejected() {
+        let yaml = "primary_volume: {}\nmetadata_layout: []\nentries: []\nlayout: []\n";
+        assert!(yaml_serde::from_str::<Iso9660>(yaml).is_err());
     }
 
     #[test]
