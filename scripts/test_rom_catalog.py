@@ -410,7 +410,10 @@ def run_round_trip(
             reason=f"input: data track path is not a regular file: {image}",
         )
 
-    with tempfile.TemporaryDirectory(prefix="gcdgold-catalog-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix=".gcdgold-catalog-",
+        dir=extracted_projects,
+    ) as temporary:
         project = Path(temporary)
         manifest = project / f"{track_name(image)}.yaml"
         rebuilt = project / "rebuilt.bin"
@@ -421,9 +424,8 @@ def run_round_trip(
             retained_project = None
             staging_project = None
         else:
-            data_dir = Path(
-                tempfile.mkdtemp(prefix=".gcdgold-project-", dir=extracted_projects)
-            )
+            data_dir = project / "assets"
+            data_dir.mkdir()
             retained_project = project_destination(extracted_projects, image)
             retained_manifest = retained_project / f"{track_name(image)}.yaml"
             staging_project = data_dir

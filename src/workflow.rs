@@ -1957,13 +1957,21 @@ fn generate_framing(
             let stride = resolved
                 .shared_stride
                 .context("channel_segment_end EOF requires shared interleave")?;
+            let form_positions = positions.iter().copied().collect::<HashSet<_>>();
             for (index, position) in positions.iter().enumerate() {
-                let identity = resolved.identities.get(position);
-                let continues = position
-                    .checked_add(stride)
-                    .and_then(|next| resolved.identities.get(&next))
-                    == identity;
-                if identity.is_some() && !continues {
+                let segment_end = if form2 {
+                    let identity = resolved.identities.get(position);
+                    let continues = position
+                        .checked_add(stride)
+                        .and_then(|next| resolved.identities.get(&next))
+                        == identity;
+                    identity.is_some() && !continues
+                } else {
+                    position
+                        .checked_add(stride)
+                        .is_none_or(|next| !form_positions.contains(&next))
+                };
+                if segment_end {
                     generated[index].submode =
                         generated[index].submode.union(XaSubmode::END_OF_FILE);
                 }
@@ -7863,6 +7871,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rebuilt.len(), sectors.len());
+    }
+
+    #[test]
+    fn form1_channel_segment_eof_round_trips_structurally() {
+        let mut sectors = (0..16)
+            .map(|position| {
+                if position % 4 == 0 {
+                    clean_xa_sector(true, 1, 2, position)
+                } else {
+                    clean_xa_sector(false, 0, 0, position)
+                }
+            })
+            .collect::<Vec<_>>();
+        for position in [13, 14, 15] {
+            sectors[position].subheader.submode = sectors[position]
+                .subheader
+                .submode
+                .union(XaSubmode::END_OF_FILE);
+            sectors[position].subheader_copy = sectors[position].subheader;
+        }
+
+        let assets = demultiplex_xa_extent(&sectors, true).unwrap();
+        assert!(matches!(
+            &assets.form1_framing,
+            Some(XaFraming::Detailed(XaFramingSettings {
+                policy: XaFramingPolicy::Phase,
+                eof: XaEofPolicy::ChannelSegmentEnd,
+                ..
+            }))
+        ));
+        let manifest = name_xa_assets("FORM1-EOF", &assets);
+        let rebuilt = multiplex_xa_extent(
+            &manifest,
+            &assets.form1,
+            &assets.form2,
+            assets.index.as_deref(),
+        )
+        .unwrap();
+        for (source, rebuilt) in sectors.iter().zip(rebuilt) {
+            match rebuilt {
+                XaExtentSector::Form1(rebuilt) => {
+                    assert_eq!(rebuilt.subheader, source.subheader);
+                    assert_eq!(rebuilt.subheader_copy, source.subheader_copy);
+                }
+                XaExtentSector::Form2(_) => assert_eq!(source.kind, Kind::Form2),
+                XaExtentSector::XaGap => panic!("unexpected XA gap"),
+            }
+        }
     }
 
     #[test]
