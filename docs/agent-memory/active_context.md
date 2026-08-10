@@ -4,7 +4,10 @@ The repository now has a user-facing `README.md` describing gcdgold's
 preservation purpose and four main use cases: content exploration, controlled
 modification, exact image reconstruction, and romset compression. It documents
 the long-term compression path as either a standalone executable or a reusable
-library integrated into ROM managers. It also documents
+library integrated into ROM managers. A Final Fantasy VII example documents
+multi-disc shared-directory extraction: SHA-1-identical same-path assets are
+reused, while differing assets receive deterministic numeric suffixes referenced
+by the relevant manifest. It also documents
 the current PSX reconstruction result, supported and unsupported format scope,
 the extract/edit/build workflow, exact-version binding through
 `gcdgold.version`, optional SHA-1 behavior, support route, author, and GPLv3

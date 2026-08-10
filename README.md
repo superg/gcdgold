@@ -81,6 +81,26 @@ for this approach, whether delivered through a standalone executable or as a
 compression library integrated into ROM managers, to become one of the most
 effective ways to store optical data-track romsets.
 
+#### Multi-disc games
+
+Multi-disc games benefit especially from filesystem-level extraction because
+their discs often share a large amount of identical content. All discs can be
+extracted into one data directory while keeping a separate manifest for each
+image. For example, the three Final Fantasy VII discs can share one project:
+
+```console
+gcdgold extract --image "Final Fantasy VII (USA) (Disc 1).bin" --manifest "Final Fantasy VII (USA)/Disc 1.yaml" --data-dir "Final Fantasy VII (USA)"
+gcdgold extract --image "Final Fantasy VII (USA) (Disc 2).bin" --manifest "Final Fantasy VII (USA)/Disc 2.yaml" --data-dir "Final Fantasy VII (USA)"
+gcdgold extract --image "Final Fantasy VII (USA) (Disc 3).bin" --manifest "Final Fantasy VII (USA)/Disc 3.yaml" --data-dir "Final Fantasy VII (USA)"
+```
+
+When a later disc extracts an asset with the same path and identical SHA-1,
+gcdgold reuses the existing file. If the path is the same but the content hash
+differs, gcdgold assigns a deterministic numeric suffix and updates that disc's
+manifest to reference the renamed asset. Shared content is therefore stored
+once, distinct content remains unambiguous, and a general-purpose compressor
+can take further advantage of common data across the complete multi-disc set.
+
 ## Goal and current status
 
 The ultimate goal is 1:1 reconstruction of every data track in the
