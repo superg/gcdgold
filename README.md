@@ -108,6 +108,53 @@ The ultimate goal is 1:1 reconstruction of every data track in the
 complete Redump PlayStation romset is 100% byte-for-byte reconstructible with
 gcdgold.
 
+## Testing a ROM catalog
+
+[`scripts/test_rom_catalog.py`](scripts/test_rom_catalog.py) automates exact
+round-trip testing across a complete system romset. This is useful for anyone
+who wants to measure gcdgold's current coverage for a particular console or
+catalog rather than testing images one at a time.
+
+The runner scans the configured ROM directory for CUE sheets, discovers each
+isolated raw `/2352` data-track file, extracts it, rebuilds it, and requires the
+result to match the source track SHA-1. It prints progress and a live pass rate,
+then finishes with counts for passed, failed, skipped, and discovery-error
+items. Audio tracks are ignored. A BIN shared by multiple CUE `TRACK`
+declarations is reported as a discovery error because the runner does not guess
+track boundaries within a shared file.
+
+Create a TOML configuration based on
+[`scripts/test_rom_catalog.toml.example`](scripts/test_rom_catalog.toml.example):
+
+```toml
+gcdgold = "target/release/gcdgold"
+roms = "/path/to/psx-romset"
+failures = "catalog/psx-failures.csv"
+passed = "catalog/psx-passed.txt"
+manifests = "catalog/psx-manifests"
+# extracted_projects = "catalog/psx-extracted-projects"
+```
+
+All relative paths are resolved from the configuration file's directory. The
+four required settings select the gcdgold executable, ROM directory, failure
+CSV, and passed-track list. `manifests` optionally retains extracted YAML files.
+`extracted_projects` optionally retains complete projects and can require
+substantial storage, but it is valuable when investigating an unsupported or
+incorrectly reconstructed image.
+
+Run the catalog test with:
+
+```console
+python3 scripts/test_rom_catalog.py --config test_rom_catalog.toml
+```
+
+Each successful relative track path is appended to the passed list and skipped
+on later runs, so an interrupted catalog test can resume without repeating
+known passes. Failures are appended to CSV with the stage, exit status, and
+diagnostic. The process exits unsuccessfully if any round trip fails or any CUE
+discovery error is found. Keep the configured gcdgold executable unchanged
+during a run so every result measures the same version.
+
 ## Current format support
 
 Supported today:
