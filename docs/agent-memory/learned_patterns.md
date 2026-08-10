@@ -209,3 +209,4 @@
 - Keep README basic-usage commands minimal by relying on the default current data directory and derived manifest path. Still name a distinct build output when the derived `.bin` would target the original source image; demonstrating defaults must not encourage accidental replacement.
 - Use Monster Rancher 2 (USA) as the compact end-to-end extraction example. Its named `DATA/MOVIE.STR` stream produces nonempty `.F1` and `.F2` assets with no `.F1S`, `.F2S`, or `.I`; unlike smaller candidates, it is neither an unreferenced physical extent nor an empty Form 2 stream. Show the complete actual manifest with optional hashes removed and the real extracted tree.
 - Describe dummy or placeholder files as non-owning ISO directory records, and describe files pointing at audio sectors outside the authored data track as external CD-DA extent references.
+- Use `redump.info` rather than `redump.org` for every public README reference and link.

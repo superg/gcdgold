@@ -84,7 +84,7 @@ effective ways to store optical data-track romsets.
 ## Goal and current status
 
 The ultimate goal is 1:1 reconstruction of every data track in the
-[Redump](https://redump.org/) system library. As of August 9, 2026, the
+[Redump](https://redump.info/) system library. As of August 9, 2026, the
 complete Redump PlayStation romset is 100% byte-for-byte reconstructible with
 gcdgold.
 
