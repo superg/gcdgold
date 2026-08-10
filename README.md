@@ -101,63 +101,16 @@ manifest to reference the renamed asset. Shared content is therefore stored
 once, distinct content remains unambiguous, and a general-purpose compressor
 can take further advantage of common data across the complete multi-disc set.
 
-## Goal and current status
+## Current format support
+
+### Goal and current status
 
 The ultimate goal is 1:1 reconstruction of every data track in the
 [Redump](https://redump.info/) system library. As of August 9, 2026, the
 complete Redump PlayStation romset is 100% byte-for-byte reconstructible with
 gcdgold.
 
-## Testing a ROM catalog
-
-[`scripts/test_rom_catalog.py`](scripts/test_rom_catalog.py) automates exact
-round-trip testing across a complete system romset. This is useful for anyone
-who wants to measure gcdgold's current coverage for a particular console or
-catalog rather than testing images one at a time.
-
-The runner scans the configured ROM directory for CUE sheets, discovers each
-isolated raw `/2352` data-track file, extracts it, rebuilds it, and requires the
-result to match the source track SHA-1. It prints progress and a live pass rate,
-then finishes with counts for passed, failed, skipped, and discovery-error
-items. Audio tracks are ignored. A BIN shared by multiple CUE `TRACK`
-declarations is reported as a discovery error because the runner does not guess
-track boundaries within a shared file.
-
-Create a TOML configuration based on
-[`scripts/test_rom_catalog.toml.example`](scripts/test_rom_catalog.toml.example):
-
-```toml
-gcdgold = "target/release/gcdgold"
-roms = "/path/to/psx-romset"
-failures = "catalog/psx-failures.csv"
-passed = "catalog/psx-passed.txt"
-manifests = "catalog/psx-manifests"
-# extracted_projects = "catalog/psx-extracted-projects"
-```
-
-All relative paths are resolved from the configuration file's directory. The
-four required settings select the gcdgold executable, ROM directory, failure
-CSV, and passed-track list. `manifests` optionally retains extracted YAML files.
-`extracted_projects` optionally retains complete projects and can require
-substantial storage, but it is valuable when investigating an unsupported or
-incorrectly reconstructed image.
-
-Run the catalog test with:
-
-```console
-python3 scripts/test_rom_catalog.py --config test_rom_catalog.toml
-```
-
-Each successful relative track path is appended to the passed list and skipped
-on later runs, so an interrupted catalog test can resume without repeating
-known passes. Failures are appended to CSV with the stage, exit status, and
-diagnostic. The process exits unsuccessfully if any round trip fails or any CUE
-discovery error is found. Keep the configured gcdgold executable unchanged
-during a run so every result measures the same version.
-
-## Current format support
-
-Supported today:
+### Supported today
 
 - Raw 2352-byte `.bin` data tracks.
 - CD-ROM Mode 1 and Mode 2 XA tracks.
@@ -184,7 +137,7 @@ Supported today:
   plus boundary raw-zero gaps, Mode 1 reserved-byte variants, and supported
   noncompliant trailing ECC.
 
-Not currently supported:
+### Not currently supported
 
 - `.iso` data-track images stored as 2048 bytes per sector, including DVD and
   Blu-ray images.
@@ -234,6 +187,14 @@ For deliberate modifications, any `sha1` fields that are no longer useful can
 be safely deleted. Remove `track.sha1` as well when the output is intentionally
 different from the source, or the CLI will report the final track mismatch as
 a failure after creating the image.
+
+For all options, run:
+
+```console
+gcdgold --help
+gcdgold extract --help
+gcdgold build --help
+```
 
 ## End-to-end extraction example
 
@@ -353,13 +314,52 @@ Monster Rancher 2 (USA)/
 ordinary host file. The manifest records how gcdgold must remultiplex them into
 the original XA stream during a build.
 
-For all options, run:
+## Testing a ROM catalog
+
+[`scripts/test_rom_catalog.py`](scripts/test_rom_catalog.py) automates exact
+round-trip testing across a complete system romset. This is useful for anyone
+who wants to measure gcdgold's current coverage for a particular console or
+catalog rather than testing images one at a time.
+
+The runner scans the configured ROM directory for CUE sheets, discovers each
+isolated raw `/2352` data-track file, extracts it, rebuilds it, and requires the
+result to match the source track SHA-1. It prints progress and a live pass rate,
+then finishes with counts for passed, failed, skipped, and discovery-error
+items. Audio tracks are ignored. A BIN shared by multiple CUE `TRACK`
+declarations is reported as a discovery error because the runner does not guess
+track boundaries within a shared file.
+
+Create a TOML configuration based on
+[`scripts/test_rom_catalog.toml.example`](scripts/test_rom_catalog.toml.example):
+
+```toml
+gcdgold = "target/release/gcdgold"
+roms = "/path/to/psx-romset"
+failures = "catalog/psx-failures.csv"
+passed = "catalog/psx-passed.txt"
+manifests = "catalog/psx-manifests"
+# extracted_projects = "catalog/psx-extracted-projects"
+```
+
+All relative paths are resolved from the configuration file's directory. The
+four required settings select the gcdgold executable, ROM directory, failure
+CSV, and passed-track list. `manifests` optionally retains extracted YAML files.
+`extracted_projects` optionally retains complete projects and can require
+substantial storage, but it is valuable when investigating an unsupported or
+incorrectly reconstructed image.
+
+Run the catalog test with:
 
 ```console
-gcdgold --help
-gcdgold extract --help
-gcdgold build --help
+python3 scripts/test_rom_catalog.py --config test_rom_catalog.toml
 ```
+
+Each successful relative track path is appended to the passed list and skipped
+on later runs, so an interrupted catalog test can resume without repeating
+known passes. Failures are appended to CSV with the stage, exit status, and
+diagnostic. The process exits unsuccessfully if any round trip fails or any CUE
+discovery error is found. Keep the configured gcdgold executable unchanged
+during a run so every result measures the same version.
 
 ## Author
 

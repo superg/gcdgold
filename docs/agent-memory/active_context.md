@@ -29,7 +29,9 @@ The README has a catalog-testing chapter for `scripts/test_rom_catalog.py`. It
 documents CUE discovery, exact extract/build/hash verification, live and final
 coverage reporting, incremental passed-track skipping, failure CSV diagnostics,
 optional manifest/project retention, configuration-relative paths, shared-BIN
-discovery errors, and keeping one configured executable fixed for a run.
+discovery errors, and keeping one configured executable fixed for a run. In the
+README order, `Goal and current status` is nested beneath `Current format
+support`, while catalog testing follows the end-to-end extraction example.
 
 Milestone 1 is implemented as a Rust 2024 library and CLI. `gcdgold extract` reads canonical raw `MODE1/2352` and `MODE2/2352` BINs directly into a version-bound YAML manifest, a compact `.system` asset, ordinary ISO 9660 payload files, and, for Mode 2 XA, explicit indexed assets for mixed Form 1/Form 2 extents. `gcdgold build` regenerates ISO layout, raw sector framing, MSF, EDC, and ECC. A project extracted and rebuilt without edits must reproduce its source BIN byte-for-byte.
 
