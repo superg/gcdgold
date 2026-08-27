@@ -105,6 +105,8 @@ pub struct Track {
     pub redump_0x55: Vec<Redump0x55Run>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mode1_reserved: Vec<Mode1ReservedRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode1_protection: Option<Mode1Protection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<SectorPatch>,
 }
@@ -122,6 +124,24 @@ pub struct Mode1ReservedRun {
     pub lba: i32,
     pub sectors: u32,
     pub hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mode1Protection {
+    pub edc_xor: String,
+    pub reserved: String,
+    pub ecc_xor: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub payload_inverted: bool,
+    pub runs: Vec<Mode1ProtectionRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mode1ProtectionRun {
+    pub lba: i32,
+    pub sectors: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +186,7 @@ impl Default for Track {
             noncompliant_trailing_ecc: false,
             redump_0x55: Vec::new(),
             mode1_reserved: Vec::new(),
+            mode1_protection: None,
             patches: Vec::new(),
         }
     }
@@ -687,6 +708,7 @@ pub enum FileLayoutItem {
     Path(FilePathItem),
     Directory(FileDirectoryItem),
     PathTable(MetadataPathTableItem),
+    Mode1Extent(FileMode1ExtentItem),
     AppleHfs(FileAppleHfsItem),
     DuplicateBlock(FileDuplicateBlockItem),
     CeQuadratJolietLinks(FileCeQuadratJolietLinksItem),
@@ -721,6 +743,12 @@ pub struct FileAppleHfsItem {
     pub apple_hfs: HostAsset,
     pub start_block: u32,
     pub block_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileMode1ExtentItem {
+    pub mode1_extent: HostAsset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1047,6 +1075,12 @@ impl FileLayoutItem {
         })
     }
 
+    pub fn mode1_extent(asset: HostAsset) -> Self {
+        Self::Mode1Extent(FileMode1ExtentItem {
+            mode1_extent: asset,
+        })
+    }
+
     pub fn duplicate_block(path: impl Into<String>, block: u32) -> Self {
         Self::DuplicateBlock(FileDuplicateBlockItem {
             duplicate_block: DuplicateBlock {
@@ -1131,6 +1165,7 @@ impl FileLayoutItem {
             Self::Path(item) => Some(&item.path),
             Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1145,6 +1180,7 @@ impl FileLayoutItem {
             Self::Path(item) => Some(item),
             Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1159,6 +1195,7 @@ impl FileLayoutItem {
             Self::Directory(item) => Some((item.volume, item.directory.as_str())),
             Self::Path(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1177,6 +1214,7 @@ impl FileLayoutItem {
             Self::PathTable(item) => Some(item.path_table),
             Self::Path(_)
             | Self::Directory(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1192,6 +1230,7 @@ impl FileLayoutItem {
             Self::Path(_)
             | Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1205,6 +1244,7 @@ impl FileLayoutItem {
             Self::Path(_)
             | Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1219,6 +1259,7 @@ impl FileLayoutItem {
             Self::Path(_)
             | Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1233,6 +1274,7 @@ impl FileLayoutItem {
             Self::Path(_)
             | Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1247,6 +1289,7 @@ impl FileLayoutItem {
             Self::Path(_)
             | Self::Directory(_)
             | Self::PathTable(_)
+            | Self::Mode1Extent(_)
             | Self::AppleHfs(_)
             | Self::DuplicateBlock(_)
             | Self::CeQuadratJolietLinks(_)
@@ -1708,6 +1751,7 @@ mod tests {
             noncompliant_trailing_ecc: false,
             redump_0x55: Vec::new(),
             mode1_reserved: Vec::new(),
+            mode1_protection: None,
             patches: Vec::new(),
         }
     }
@@ -1761,6 +1805,38 @@ mod tests {
         assert_eq!(
             yaml_serde::from_str::<Track>(&yaml).unwrap().mode1_reserved,
             value.mode1_reserved
+        );
+    }
+
+    #[test]
+    fn mode1_protection_roundtrips_as_one_policy_with_sparse_runs() {
+        let value = Track {
+            mode1_protection: Some(Mode1Protection {
+                edc_xor: "014f8e03".to_owned(),
+                reserved: "ffffffffffffffff".to_owned(),
+                ecc_xor: "55".repeat(276),
+                payload_inverted: true,
+                runs: vec![
+                    Mode1ProtectionRun {
+                        lba: 33,
+                        sectors: 5,
+                    },
+                    Mode1ProtectionRun {
+                        lba: 46,
+                        sectors: 4,
+                    },
+                ],
+            }),
+            ..Track::default()
+        };
+        let yaml = yaml_serde::to_string(&value).unwrap();
+        assert!(yaml.contains("mode1_protection:\n  edc_xor: 014f8e03"));
+        assert!(yaml.contains("payload_inverted: true"));
+        assert_eq!(
+            yaml_serde::from_str::<Track>(&yaml)
+                .unwrap()
+                .mode1_protection,
+            value.mode1_protection
         );
     }
 

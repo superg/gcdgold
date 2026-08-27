@@ -14,18 +14,18 @@ use crate::manifest::{
     DirectorySlack, EntryReference, EntryReferenceKind, EntrySectorSubheader, FileGapItem,
     FileLayoutItem, Form1Asset, Form1LayoutItem, Form1Project, Form1Sectors, GCDGOLD_VERSION,
     GapKind, GcdgoldMetadata, HostAsset, IsoMetadataSubheader, Manifest, MetadataPathTable,
-    MetadataSubheader, MetadataVolume, Mode1ReservedRun, PathTableSubheader, Redump0x55Run,
-    SYSTEM_AREA_SECTORS, SectorPatch, SystemArea, SystemAreaFinalSubheader, SystemAreaForm1Framing,
-    SystemAreaSectorKind, SystemAreaSectorRun, Track, TrackMode, VolumeTerminatorSubheader,
-    XaAssetSubheader, XaAssets, XaAttributeFlag, XaChannelState, XaCycleSegment, XaEofPolicy,
-    XaFormAsset, XaFraming, XaFramingPolicy, XaFramingRun, XaFramingSettings, XaInterleave,
-    XaInterleaveChannel, XaLengthEncoding, XaPadding, XaPositionSpan, decode_sector_patch,
-    serialize_manifest,
+    MetadataSubheader, MetadataVolume, Mode1Protection, Mode1ProtectionRun, Mode1ReservedRun,
+    PathTableSubheader, Redump0x55Run, SYSTEM_AREA_SECTORS, SectorPatch, SystemArea,
+    SystemAreaFinalSubheader, SystemAreaForm1Framing, SystemAreaSectorKind, SystemAreaSectorRun,
+    Track, TrackMode, VolumeTerminatorSubheader, XaAssetSubheader, XaAssets, XaAttributeFlag,
+    XaChannelState, XaCycleSegment, XaEofPolicy, XaFormAsset, XaFraming, XaFramingPolicy,
+    XaFramingRun, XaFramingSettings, XaInterleave, XaInterleaveChannel, XaLengthEncoding,
+    XaPadding, XaPositionSpan, decode_sector_patch, serialize_manifest,
 };
 use crate::raw_cd::{
     Kind, LOGICAL_BLOCK_SIZE, MODE2_DATA_SIZE, RAW_SECTOR_SIZE, SYNC, SectorProtection,
-    SectorWriter, XaSubheader, XaSubmode, finalize_sector_protection, format_msf, frame_to_msf,
-    parse_image, parse_msf,
+    SectorWriter, XaSubheader, XaSubmode, customize_mode1_protection, finalize_sector_protection,
+    format_msf, frame_to_msf, mode1_edc, parse_image, parse_msf,
 };
 
 #[derive(Debug, Clone)]
@@ -229,6 +229,217 @@ fn detect_mode1_reserved(
         });
     }
     runs
+}
+
+const GEG_MODE1_EDC_XOR: [u8; 4] = [0x01, 0x4f, 0x8e, 0x03];
+const GEG_MODE1_RESERVED: [u8; 8] = [0xff; 8];
+
+fn detect_and_normalize_mode1_protection(raw: &mut [u8]) -> Result<Option<Mode1Protection>> {
+    if raw.len() < RAW_SECTOR_SIZE || !raw.len().is_multiple_of(RAW_SECTOR_SIZE) {
+        return Ok(None);
+    }
+    let start_frame = raw_track_start_frame(raw)?;
+    let mut indices = Vec::new();
+    let mut payload_inverted = None;
+    let mut ecc_xor: Option<[u8; 276]> = None;
+    for (index, sector) in raw.chunks_exact(RAW_SECTOR_SIZE).enumerate() {
+        if sector[..12] != SYNC || sector[15] != 1 || sector[2068..2076] != GEG_MODE1_RESERVED {
+            continue;
+        }
+        let stored: [u8; 4] = sector[2064..2068].try_into()?;
+        let physical_edc = mode1_edc(sector)?;
+        let physical_xor = std::array::from_fn(|offset| stored[offset] ^ physical_edc[offset]);
+        let inverted = if physical_xor == GEG_MODE1_EDC_XOR {
+            false
+        } else if physical_xor == [0xff; 4] {
+            let mut semantic = sector.to_vec();
+            for byte in &mut semantic[16..2064] {
+                *byte ^= 0xff;
+            }
+            let semantic_edc = mode1_edc(&semantic)?;
+            ensure!(
+                std::array::from_fn::<_, 4, _>(|offset| stored[offset] ^ semantic_edc[offset])
+                    == GEG_MODE1_EDC_XOR,
+                "marked Mode 1 sector {index} does not have the supported inverted-payload EDC relation"
+            );
+            true
+        } else {
+            continue;
+        };
+        ensure!(
+            payload_inverted.is_none_or(|expected| expected == inverted),
+            "marked Mode 1 sectors mix normal and inverted payload policies"
+        );
+        payload_inverted = Some(inverted);
+        let mut canonical = sector.to_vec();
+        if inverted {
+            for byte in &mut canonical[16..2064] {
+                *byte ^= 0xff;
+            }
+        }
+        canonical[2068..2076].fill(0);
+        finalize_sector_protection(&mut canonical, SectorProtection::Mode1)?;
+        let candidate_ecc_xor: [u8; 276] =
+            std::array::from_fn(|offset| sector[2076 + offset] ^ canonical[2076 + offset]);
+        ensure!(
+            ecc_xor.is_none_or(|expected| expected == candidate_ecc_xor),
+            "marked Mode 1 sectors use inconsistent ECC transformations"
+        );
+        ecc_xor = Some(candidate_ecc_xor);
+        indices.push(index);
+    }
+    let Some(payload_inverted) = payload_inverted else {
+        return Ok(None);
+    };
+
+    for index in &indices {
+        let sector = &mut raw[index * RAW_SECTOR_SIZE..(index + 1) * RAW_SECTOR_SIZE];
+        if payload_inverted {
+            for byte in &mut sector[16..2064] {
+                *byte ^= 0xff;
+            }
+        }
+        sector[2068..2076].fill(0);
+        finalize_sector_protection(sector, SectorProtection::Mode1)?;
+    }
+
+    let track_start_lba = i64::from(start_frame) - 150;
+    let mut runs = Vec::new();
+    let mut start = indices[0];
+    let mut previous = start;
+    for index in indices.iter().copied().skip(1) {
+        if index == previous + 1 {
+            previous = index;
+            continue;
+        }
+        runs.push(Mode1ProtectionRun {
+            lba: i32::try_from(track_start_lba + i64::try_from(start)?)?,
+            sectors: u32::try_from(previous - start + 1)?,
+        });
+        start = index;
+        previous = index;
+    }
+    runs.push(Mode1ProtectionRun {
+        lba: i32::try_from(track_start_lba + i64::try_from(start)?)?,
+        sectors: u32::try_from(previous - start + 1)?,
+    });
+    Ok(Some(Mode1Protection {
+        edc_xor: hex::encode(GEG_MODE1_EDC_XOR),
+        reserved: hex::encode(GEG_MODE1_RESERVED),
+        ecc_xor: hex::encode(ecc_xor.expect("marked sectors have an ECC mask")),
+        payload_inverted,
+        runs,
+    }))
+}
+
+fn validate_mode1_protection(
+    policy: Option<&Mode1Protection>,
+    mode: TrackMode,
+    reserved_runs: &[Mode1ReservedRun],
+    redump_runs: &[Redump0x55Run],
+) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    ensure!(
+        mode == TrackMode::Mode1,
+        "mode1_protection requires a Mode 1 track"
+    );
+    let edc_xor = hex::decode(&policy.edc_xor).context("decoding mode1_protection edc_xor")?;
+    let reserved = hex::decode(&policy.reserved).context("decoding mode1_protection reserved")?;
+    let ecc_xor = hex::decode(&policy.ecc_xor).context("decoding mode1_protection ecc_xor")?;
+    ensure!(
+        edc_xor.len() == 4,
+        "mode1_protection edc_xor must contain exactly 4 bytes"
+    );
+    ensure!(
+        reserved.len() == 8,
+        "mode1_protection reserved must contain exactly 8 bytes"
+    );
+    ensure!(
+        ecc_xor.len() == 276,
+        "mode1_protection ecc_xor must contain exactly 276 bytes"
+    );
+    ensure!(
+        edc_xor.iter().any(|byte| *byte != 0)
+            || reserved.iter().any(|byte| *byte != 0)
+            || policy.payload_inverted,
+        "mode1_protection must change the canonical sector"
+    );
+    ensure!(
+        !policy.runs.is_empty(),
+        "mode1_protection runs must not be empty"
+    );
+    let mut previous_end = None;
+    for run in &policy.runs {
+        ensure!(run.sectors > 0, "Mode 1 protection run must not be empty");
+        let end = i64::from(run.lba) + i64::from(run.sectors);
+        if let Some(previous_end) = previous_end {
+            ensure!(
+                i64::from(run.lba) >= previous_end,
+                "Mode 1 protection runs must be ordered and nonoverlapping"
+            );
+        }
+        ensure!(
+            !reserved_runs.iter().any(|reserved| {
+                i64::from(run.lba) < i64::from(reserved.lba) + i64::from(reserved.sectors)
+                    && i64::from(reserved.lba) < end
+            }),
+            "Mode 1 protection run at LBA {} overlaps a mode1_reserved run",
+            run.lba
+        );
+        ensure!(
+            !redump_runs.iter().any(|redump| {
+                i64::from(run.lba) < i64::from(redump.lba) + i64::from(redump.sectors)
+                    && i64::from(redump.lba) < end
+            }),
+            "Mode 1 protection run at LBA {} overlaps a Redump 0x55 run",
+            run.lba
+        );
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+fn apply_custom_mode1_protection(
+    raw: &mut [u8],
+    track_start_frame: u32,
+    policy: Option<&Mode1Protection>,
+) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let edc_xor: [u8; 4] = hex::decode(&policy.edc_xor)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("mode1_protection edc_xor must contain exactly 4 bytes"))?;
+    let reserved: [u8; 8] = hex::decode(&policy.reserved)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("mode1_protection reserved must contain exactly 8 bytes"))?;
+    let ecc_xor: [u8; 276] = hex::decode(&policy.ecc_xor)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("mode1_protection ecc_xor must contain exactly 276 bytes"))?;
+    let track_start_lba = i64::from(track_start_frame) - 150;
+    for run in &policy.runs {
+        let start = i64::from(run.lba) - track_start_lba;
+        ensure!(start >= 0, "Mode 1 protection run precedes the track");
+        let start = usize::try_from(start)?;
+        let end = start + usize::try_from(run.sectors)?;
+        ensure!(
+            end <= raw.len() / RAW_SECTOR_SIZE,
+            "Mode 1 protection run at LBA {} extends outside the track",
+            run.lba
+        );
+        for index in start..end {
+            customize_mode1_protection(
+                &mut raw[index * RAW_SECTOR_SIZE..(index + 1) * RAW_SECTOR_SIZE],
+                edc_xor,
+                reserved,
+                &ecc_xor,
+                policy.payload_inverted,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_mode1_reserved_runs(
@@ -688,7 +899,6 @@ fn known_recovery_source(source_sha1: &str) -> bool {
             | "0ec8e3b093291ac7ce3af2bb62beda5228f09435"
             | "6bbfe335bc7be562f9f712f6a5ebfdf0e0b6d28b"
             | "b4d0f2628dc070a56f9651f22663efe07e854e6f"
-            | "0c48a60a88644dee7a4c706655eff99028ffbda3"
     )
 }
 
@@ -699,42 +909,6 @@ fn recover_known_corruption<'a>(source_sha1: &str, source: &'a [u8]) -> Result<R
     let start_frame = raw_track_start_frame(source)?;
     let mut semantic = source.to_vec();
     let mut affected = BTreeSet::new();
-
-    if source_sha1 == "0c48a60a88644dee7a4c706655eff99028ffbda3" {
-        let indices = source
-            .chunks_exact(RAW_SECTOR_SIZE)
-            .enumerate()
-            .filter(|(_, sector)| sector[2068..2076] == [0xff; 8])
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        ensure!(
-            indices.len() == 52,
-            "approved Mode 1 protection recovery found an unexpected sector count"
-        );
-        let mut writer = SectorWriter::new();
-        for index in indices {
-            let source_sector = sector_bytes(source, index)?;
-            ensure!(
-                source_sector[..12] == SYNC && source_sector[15] == 1,
-                "approved Mode 1 protection recovery found invalid framing at sector {index}"
-            );
-            let replacement = writer.mode1(
-                start_frame + u32::try_from(index)?,
-                &source_sector[16..2064],
-            )?;
-            install_sector(&mut semantic, index, &replacement)?;
-            affected.insert(index);
-        }
-        return finish_recovery(
-            source,
-            semantic,
-            start_frame,
-            affected,
-            RecoveryCategory::InternalRawDamage,
-            None,
-            "normalized 52 sectors with a consistent invalid Mode 1 protection pattern while retaining every logical payload byte",
-        );
-    }
 
     let missing_prefix = match source_sha1 {
         "aad68c8551ef04f30ea7f4c7f495fb78d0f378c5"
@@ -3365,6 +3539,40 @@ struct DetectedFileLayout {
     items: Vec<FileLayoutItem>,
     assets: HashMap<String, Vec<u8>>,
     xa_extent_ranges: Vec<Range<usize>>,
+    mode1_extent_count: usize,
+}
+
+fn append_mode1_extent(
+    detected: &mut DetectedFileLayout,
+    sectors: &[crate::raw_cd::ParsedSector],
+    start: usize,
+    end: usize,
+    manifest_stem: &str,
+) -> Result<()> {
+    ensure!(
+        start < end
+            && sectors[start..end]
+                .iter()
+                .all(|sector| sector.kind == Kind::Mode1),
+        "unreferenced Mode 1 extent must contain nonempty Mode 1 sectors"
+    );
+    let path = format!(
+        "{manifest_stem}.unreferenced.{:03}.mode1",
+        detected.mode1_extent_count
+    );
+    let mut bytes = Vec::with_capacity((end - start) * LOGICAL_BLOCK_SIZE);
+    for sector in &sectors[start..end] {
+        bytes.extend_from_slice(sector.payload());
+    }
+    ensure!(
+        detected.assets.insert(path.clone(), bytes).is_none(),
+        "duplicate unreferenced Mode 1 asset path"
+    );
+    detected
+        .items
+        .push(FileLayoutItem::mode1_extent(HostAsset { path, sha1: None }));
+    detected.mode1_extent_count += 1;
+    Ok(())
 }
 
 fn append_detected_gap(
@@ -3381,7 +3589,7 @@ fn append_detected_gap(
     }
     if sectors[start..end]
         .iter()
-        .any(|sector| sector.kind == Kind::Mode1Gap)
+        .any(|sector| matches!(sector.kind, Kind::Mode1 | Kind::Mode1Gap))
     {
         let mut cursor = start;
         while cursor < end {
@@ -3397,9 +3605,15 @@ fn append_detected_gap(
                     .items
                     .push(FileLayoutItem::mode1_gap(u32::try_from(run_end - cursor)?));
                 cursor = run_end;
+            } else if sectors[cursor].kind == Kind::Mode1 {
+                let run_end = (cursor + 1..end)
+                    .find(|index| sectors[*index].kind != Kind::Mode1)
+                    .unwrap_or(end);
+                append_mode1_extent(detected, sectors, cursor, run_end, manifest_stem)?;
+                cursor = run_end;
             } else {
                 let run_end = (cursor + 1..end)
-                    .find(|index| sectors[*index].kind == Kind::Mode1Gap)
+                    .find(|index| matches!(sectors[*index].kind, Kind::Mode1 | Kind::Mode1Gap))
                     .unwrap_or(end);
                 append_detected_gap(detected, sectors, cursor, run_end, form2_edc, manifest_stem)?;
                 cursor = run_end;
@@ -3407,13 +3621,6 @@ fn append_detected_gap(
         }
         return Ok(());
     }
-    ensure!(
-        sectors[start..end]
-            .iter()
-            .all(|sector| !matches!(sector.kind, Kind::Mode1 | Kind::Mode1Gap)),
-        "unreferenced Mode 1 sectors contain nonzero data"
-    );
-
     let ordinal = detected.xa_extent_ranges.len();
     let base = format!("{manifest_stem}.unreferenced.{ordinal:03}");
     let assets = demultiplex_xa_extent(&sectors[start..end], form2_edc)
@@ -3520,6 +3727,7 @@ fn detect_complete_iso_layout(input: CompleteIsoLayoutInput<'_>) -> Result<Detec
         items: Vec::new(),
         assets: HashMap::new(),
         xa_extent_ranges: Vec::new(),
+        mode1_extent_count: 0,
     };
     for placement in placements {
         let extent = usize::try_from(placement.extent)?;
@@ -3853,6 +4061,7 @@ fn extract_form1_project(
             noncompliant_trailing_ecc,
             redump_0x55: metadata.redump_0x55,
             mode1_reserved: Vec::new(),
+            mode1_protection: None,
             patches: metadata.patches,
         },
         system_area: None,
@@ -3914,10 +4123,12 @@ pub fn extract_with_options(
     options: ExtractOptions,
 ) -> Result<ExtractReport> {
     validate_output_file(manifest_path, options.overwrite, "manifest output")?;
-    let image = fs::read(image_path)
+    let mut image = fs::read(image_path)
         .with_context(|| format!("reading raw image {}", image_path.display()))?;
     let source_sha1 = sha1_hex(&image);
     let redump_0x55 = detect_redump_0x55(&image);
+    let mode1_protection = detect_and_normalize_mode1_protection(&mut image)
+        .context("recognizing structured Mode 1 protection")?;
     let mut recovery = recover_known_corruption(&source_sha1, &image)
         .context("applying approved corruption recovery")?;
     validate_redump_0x55_runs(&redump_0x55, &recovery.patches)?;
@@ -4188,6 +4399,7 @@ pub fn extract_with_options(
             noncompliant_trailing_ecc,
             redump_0x55,
             mode1_reserved,
+            mode1_protection,
             patches: recovery.patches,
         },
         system_area: Some(SystemArea {
@@ -4511,6 +4723,12 @@ fn validate_track_structure(
         manifest.track.mode,
         &manifest.track.redump_0x55,
     )?;
+    validate_mode1_protection(
+        manifest.track.mode1_protection.as_ref(),
+        manifest.track.mode,
+        &manifest.track.mode1_reserved,
+        &manifest.track.redump_0x55,
+    )?;
     let system_area = manifest
         .system_area
         .as_ref()
@@ -4577,7 +4795,12 @@ fn validate_track_structure(
                 "Mode 1 tracks may contain only Mode 1 or terminal raw-zero gaps"
             );
         }
-        TrackMode::Mode2Xa => {}
+        TrackMode::Mode2Xa => ensure!(
+            iso.layout
+                .iter()
+                .all(|item| !matches!(item, FileLayoutItem::Mode1Extent(_))),
+            "Mode 1 extents require a Mode 1 track"
+        ),
         TrackMode::Mode2 => anyhow::bail!("unsupported track mode 2"),
     }
     Ok(())
@@ -5238,6 +5461,12 @@ fn validate_manifest_content(manifest: &Manifest) -> Result<()> {
         manifest.track.mode,
         &manifest.track.redump_0x55,
     )?;
+    validate_mode1_protection(
+        manifest.track.mode1_protection.as_ref(),
+        manifest.track.mode,
+        &manifest.track.mode1_reserved,
+        &manifest.track.redump_0x55,
+    )?;
     match (&manifest.system_area, &manifest.iso9660, &manifest.form1) {
         (Some(_), Some(_), None) => Ok(()),
         (None, None, Some(form1)) => {
@@ -5613,6 +5842,7 @@ pub fn build_with_options(
     }
     for item in &iso.layout {
         let asset = match item {
+            FileLayoutItem::Mode1Extent(item) => Some((&item.mode1_extent, "Mode 1 extent")),
             FileLayoutItem::AppleHfs(item) => Some((&item.apple_hfs, "Apple HFS")),
             FileLayoutItem::CeQuadratFormatter(item) => {
                 Some((&item.cequadrat_formatter, "CeQuadrat formatter"))
@@ -5639,6 +5869,14 @@ pub fn build_with_options(
             "duplicate auxiliary asset path {}",
             asset.path
         );
+        if matches!(item, FileLayoutItem::Mode1Extent(_)) {
+            let length = u64::try_from(auxiliary_data[&asset.path].len())?;
+            ensure!(
+                file_lengths.insert(asset.path.clone(), length).is_none(),
+                "duplicate layout data key {}",
+                asset.path
+            );
+        }
     }
     if let Some((map_start, map_count)) = apple_hfs_partition(&system, usize::MAX / 4)? {
         let hfs = iso.layout.iter().find_map(|item| match item {
@@ -5685,6 +5923,17 @@ pub fn build_with_options(
             "auxiliary placement must not be empty"
         );
         match &placement.kind {
+            iso9660::AuxiliaryKind::Mode1Extent { asset } => {
+                let data = &auxiliary_data[asset];
+                ensure!(
+                    data.len() == usize::try_from(placement.sectors)? * LOGICAL_BLOCK_SIZE,
+                    "Mode 1 extent asset must contain exactly its placed whole sectors"
+                );
+                for (block, source) in data.chunks_exact(LOGICAL_BLOCK_SIZE).enumerate() {
+                    layout.blocks[usize::try_from(placement.start)? + block]
+                        .copy_from_slice(source);
+                }
+            }
             iso9660::AuxiliaryKind::AppleHfs {
                 asset,
                 byte_offset,
@@ -6033,6 +6282,12 @@ pub fn build_with_options(
 
     finalize_track_protection(&mut raw, &protections)?;
 
+    apply_custom_mode1_protection(
+        &mut raw,
+        start_frame,
+        manifest.track.mode1_protection.as_ref(),
+    )?;
+
     apply_redump_0x55(&mut raw, start_frame, &manifest.track.redump_0x55)
         .context("applying structural Redump 0x55 runs")?;
 
@@ -6150,6 +6405,7 @@ fn extraction_asset_paths(manifest: &Manifest) -> Result<Vec<String>> {
                 paths.extend([xa.form1.path.clone(), xa.form2.path.clone()]);
                 paths.extend(xa.index.iter().map(|asset| asset.path.clone()));
             }
+            FileLayoutItem::Mode1Extent(item) => paths.push(item.mode1_extent.path.clone()),
             FileLayoutItem::AppleHfs(item) => paths.push(item.apple_hfs.path.clone()),
             FileLayoutItem::CeQuadratFormatter(item) => {
                 paths.push(item.cequadrat_formatter.path.clone())
@@ -6455,8 +6711,11 @@ fn plan_extraction_outputs(
                     )?;
                 }
             }
-            FileLayoutItem::AppleHfs(_) | FileLayoutItem::CeQuadratFormatter(_) => {
+            FileLayoutItem::Mode1Extent(_)
+            | FileLayoutItem::AppleHfs(_)
+            | FileLayoutItem::CeQuadratFormatter(_) => {
                 let asset = match &mut iso.layout[item_index] {
+                    FileLayoutItem::Mode1Extent(item) => &mut item.mode1_extent,
                     FileLayoutItem::AppleHfs(item) => &mut item.apple_hfs,
                     FileLayoutItem::CeQuadratFormatter(item) => &mut item.cequadrat_formatter,
                     _ => unreachable!("snapshot preserves auxiliary asset kind"),
@@ -6666,6 +6925,10 @@ fn validate_manifest_hashes(manifest: &Manifest) -> Result<()> {
             FileLayoutItem::XaExtent(item) => {
                 validate_xa_asset_hashes(&item.xa_extent, "unreferenced XA extent")?;
             }
+            FileLayoutItem::Mode1Extent(item) => validate_optional_sha1(
+                item.mode1_extent.sha1.as_deref(),
+                &format!("Mode 1 extent asset {} sha1", item.mode1_extent.path),
+            )?,
             FileLayoutItem::AppleHfs(item) => validate_optional_sha1(
                 item.apple_hfs.sha1.as_deref(),
                 &format!("Apple HFS asset {} sha1", item.apple_hfs.path),
@@ -6738,6 +7001,9 @@ fn validate_manifest_asset_paths(manifest: &Manifest) -> Result<()> {
                 if let Some(asset) = &xa.index {
                     register(&asset.path, "unreferenced I")?;
                 }
+            }
+            FileLayoutItem::Mode1Extent(item) => {
+                register(&item.mode1_extent.path, "Mode 1 extent")?
             }
             FileLayoutItem::AppleHfs(item) => register(&item.apple_hfs.path, "Apple HFS")?,
             FileLayoutItem::CeQuadratFormatter(item) => {
@@ -6845,6 +7111,9 @@ fn add_extracted_hashes(
                 if let Some(asset) = &mut xa.index {
                     set_host_asset_sha1(asset, assets, &mut hashed_paths)?;
                 }
+            }
+            FileLayoutItem::Mode1Extent(item) => {
+                set_host_asset_sha1(&mut item.mode1_extent, assets, &mut hashed_paths)?
             }
             FileLayoutItem::AppleHfs(item) => {
                 set_host_asset_sha1(&mut item.apple_hfs, assets, &mut hashed_paths)?
@@ -7473,6 +7742,48 @@ mod tests {
         let recovered = recover_known_corruption(&sha1_hex(&unknown), &unknown).unwrap();
         assert!(recovered.patches.is_empty());
         assert!(parse_image(&recovered.semantic).is_err());
+    }
+
+    #[test]
+    fn marked_mode1_protection_normalizes_normal_and_inverted_payloads() {
+        for payload_inverted in [false, true] {
+            let mut writer = SectorWriter::new();
+            let mut canonical = Vec::new();
+            for index in 0..3 {
+                canonical.extend_from_slice(
+                    &writer
+                        .mode1(150 + index, &[index as u8 + 1; LOGICAL_BLOCK_SIZE])
+                        .unwrap(),
+                );
+            }
+            let mut protected = canonical.clone();
+            for index in [0, 2] {
+                customize_mode1_protection(
+                    &mut protected[index * RAW_SECTOR_SIZE..(index + 1) * RAW_SECTOR_SIZE],
+                    GEG_MODE1_EDC_XOR,
+                    GEG_MODE1_RESERVED,
+                    &[0x55; 276],
+                    payload_inverted,
+                )
+                .unwrap();
+            }
+            let mut semantic = protected;
+            let policy = detect_and_normalize_mode1_protection(&mut semantic)
+                .unwrap()
+                .unwrap();
+            assert_eq!(semantic, canonical);
+            assert_eq!(policy.edc_xor, "014f8e03");
+            assert_eq!(policy.reserved, "ffffffffffffffff");
+            assert_eq!(policy.ecc_xor, "55".repeat(276));
+            assert_eq!(policy.payload_inverted, payload_inverted);
+            assert_eq!(
+                policy.runs,
+                vec![
+                    Mode1ProtectionRun { lba: 0, sectors: 1 },
+                    Mode1ProtectionRun { lba: 2, sectors: 1 },
+                ]
+            );
+        }
     }
 
     #[test]
@@ -8373,6 +8684,48 @@ mod tests {
 
         let layout = detect_file_layout(&sectors, &files, &[], &[], true, "test").unwrap();
         assert!(layout.items[1].as_xa_extent().is_some());
+    }
+
+    #[test]
+    fn file_layout_detects_unreferenced_mode1_extent_in_memory() {
+        let mut writer = SectorWriter::new();
+        let mut raw = Vec::new();
+        for marker in [1_u8, 0x5a, 2] {
+            raw.extend_from_slice(
+                &writer
+                    .mode1(
+                        150 + u32::try_from(raw.len() / RAW_SECTOR_SIZE).unwrap(),
+                        &[marker; LOGICAL_BLOCK_SIZE],
+                    )
+                    .unwrap(),
+            );
+        }
+        let sectors = parse_image(&raw).unwrap().1;
+        let files = vec![
+            iso9660::ParsedFile {
+                path: "A.BIN".to_owned(),
+                extent: 0,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+            iso9660::ParsedFile {
+                path: "B.BIN".to_owned(),
+                extent: 2,
+                length: LOGICAL_BLOCK_SIZE as u32,
+            },
+        ];
+
+        let layout = detect_file_layout(&sectors, &files, &[], &[], true, "test").unwrap();
+        assert_eq!(
+            layout.items[1],
+            FileLayoutItem::mode1_extent(HostAsset {
+                path: "test.unreferenced.000.mode1".to_owned(),
+                sha1: None,
+            })
+        );
+        assert_eq!(
+            layout.assets["test.unreferenced.000.mode1"],
+            vec![0x5a; LOGICAL_BLOCK_SIZE]
+        );
     }
 
     #[test]

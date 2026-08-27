@@ -633,6 +633,49 @@ fn edc_matches(data: &[u8], stored: &[u8]) -> bool {
     generate_edc(data).to_le_bytes() == stored
 }
 
+pub(crate) fn mode1_edc(sector: &[u8]) -> Result<[u8; 4]> {
+    ensure!(
+        sector.len() == RAW_SECTOR_SIZE && sector[15] == 1,
+        "Mode 1 EDC requires one Mode 1 sector"
+    );
+    Ok(generate_edc(&sector[..2064]).to_le_bytes())
+}
+
+pub(crate) fn customize_mode1_protection(
+    sector: &mut [u8],
+    edc_xor: [u8; 4],
+    reserved: [u8; 8],
+    ecc_xor: &[u8; 276],
+    payload_inverted: bool,
+) -> Result<()> {
+    ensure!(
+        sector.len() == RAW_SECTOR_SIZE && sector[15] == 1,
+        "custom Mode 1 protection requires one Mode 1 sector"
+    );
+    ensure!(
+        edc_matches(&sector[..2064], &sector[2064..2068]) && sector[2068..2076] == [0; 8],
+        "custom Mode 1 protection requires canonical input"
+    );
+    let canonical_ecc: [u8; 276] = sector[2076..2352].try_into()?;
+    for (stored, mask) in sector[2064..2068].iter_mut().zip(edc_xor) {
+        *stored ^= mask;
+    }
+    sector[2068..2076].copy_from_slice(&reserved);
+    if payload_inverted {
+        for byte in &mut sector[16..2064] {
+            *byte ^= 0xff;
+        }
+    }
+    for ((stored, canonical), mask) in sector[2076..2352]
+        .iter_mut()
+        .zip(canonical_ecc)
+        .zip(ecc_xor)
+    {
+        *stored = canonical ^ mask;
+    }
+    Ok(())
+}
+
 fn write_standard_form1_ecc(sector: &mut [u8]) {
     write_ecc(sector, [0; 4]);
 }

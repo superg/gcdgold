@@ -1758,6 +1758,9 @@ pub struct AuxiliaryPlacement {
 
 #[derive(Debug, Clone)]
 pub enum AuxiliaryKind {
+    Mode1Extent {
+        asset: String,
+    },
     AppleHfs {
         asset: String,
         byte_offset: usize,
@@ -2392,6 +2395,22 @@ pub(crate) fn layout_with_metadata_gap_kind(
             continue;
         }
         let auxiliary = match item {
+            FileLayoutItem::Mode1Extent(item) => {
+                let path = &item.mode1_extent.path;
+                let length = *file_lengths
+                    .get(path)
+                    .with_context(|| format!("missing Mode 1 extent data for {path}"))?;
+                ensure!(
+                    length > 0 && length.is_multiple_of(LOGICAL_BLOCK_SIZE as u64),
+                    "Mode 1 extent must contain whole nonempty sectors"
+                );
+                Some((
+                    u32::try_from(length / LOGICAL_BLOCK_SIZE as u64)?,
+                    AuxiliaryKind::Mode1Extent {
+                        asset: path.clone(),
+                    },
+                ))
+            }
             FileLayoutItem::AppleHfs(item) => {
                 ensure!(
                     item.block_count > 0,
@@ -3191,6 +3210,14 @@ fn validate_entries(iso: &Iso9660) -> Result<HashSet<&str>> {
             continue;
         }
         match item {
+            FileLayoutItem::Mode1Extent(item) => {
+                ensure!(
+                    !item.mode1_extent.path.is_empty(),
+                    "Mode 1 extent asset path must not be empty"
+                );
+                previous_gap = None;
+                continue;
+            }
             FileLayoutItem::AppleHfs(item) => {
                 ensure!(
                     !item.apple_hfs.path.is_empty() && item.block_count > 0,
@@ -6831,6 +6858,39 @@ mod tests {
         assert_eq!(authored.xa_extents[0].index, assets.form1.path);
         assert_eq!(authored.xa_extents[0].start, 24);
         assert_eq!(authored.xa_extents[0].sectors, 2);
+    }
+
+    #[test]
+    fn unreferenced_mode1_extent_occupies_its_physical_position() {
+        let mut iso = test_iso(
+            vec![
+                test_entry(ROOT_PATH),
+                test_entry("A.BIN"),
+                test_entry("B.BIN"),
+            ],
+            vec!["A.BIN", "B.BIN"],
+        );
+        let asset = HostAsset {
+            path: "disc.unreferenced.000.mode1".to_owned(),
+            sha1: None,
+        };
+        iso.layout
+            .insert(1, FileLayoutItem::mode1_extent(asset.clone()));
+        let lengths = HashMap::from([
+            ("A.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
+            ("B.BIN".to_owned(), LOGICAL_BLOCK_SIZE as u64),
+            (asset.path.clone(), LOGICAL_BLOCK_SIZE as u64),
+        ]);
+
+        let authored = layout(&iso, &lengths).unwrap();
+
+        assert_eq!(authored.auxiliaries.len(), 1);
+        assert_eq!(authored.auxiliaries[0].start, 24);
+        assert!(matches!(
+            &authored.auxiliaries[0].kind,
+            AuxiliaryKind::Mode1Extent { asset: path } if path == &asset.path
+        ));
+        assert_eq!(authored.files[1].extent, 25);
     }
 
     #[test]
